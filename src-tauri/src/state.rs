@@ -9,13 +9,14 @@ use crate::audit::AuditLogger;
 use crate::connections::ConnectionStore;
 use crate::mcp;
 use crate::models::{
-    ApprovalDecision, ApprovalRequest, AuditEntry, AuditSource, CommandOutcome, CommandRequest,
-    CommandResult, Connection, ConnectionInput, McpServerInfo, PolicyAction, PolicyDecision,
-    RiskLevel, SessionInfo,
+    ApprovalDecision, ApprovalRequest, AuditEntry, AuditSource, AuthKind, CommandOutcome,
+    CommandRequest, CommandResult, Connection, ConnectionInput, McpServerInfo, PolicyAction,
+    PolicyDecision, RiskLevel, SessionInfo,
 };
 use crate::policy::PolicyEngine;
 use crate::redaction::Redactor;
 use crate::sessions::SessionManager;
+use crate::ssh::{self, ConnectParams, Credential};
 use crate::vault::SecretVault;
 
 struct PendingApproval {
@@ -26,6 +27,7 @@ struct PendingApproval {
 
 /// Core services shared by the Tauri commands and the (future) MCP transport.
 pub struct AppState {
+    data_dir: PathBuf,
     connections: Mutex<ConnectionStore>,
     sessions: Mutex<SessionManager>,
     approvals: Mutex<HashMap<String, PendingApproval>>,
@@ -43,6 +45,7 @@ impl AppState {
     pub fn load(data_dir: PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
         let state = Self {
+            data_dir: data_dir.clone(),
             connections: Mutex::new(ConnectionStore::load(&data_dir)),
             sessions: Mutex::new(SessionManager::default()),
             approvals: Mutex::new(HashMap::new()),
@@ -281,6 +284,57 @@ impl AppState {
         })
     }
 
+    /// Our own known_hosts file, deliberately separate from
+    /// `~/.ssh/known_hosts` so ShellX never rewrites OpenSSH's trust state
+    /// behind the user's back.
+    pub fn known_hosts_path(&self) -> PathBuf {
+        self.data_dir.join("known_hosts")
+    }
+
+    /// Everything the SSH transport needs to open a real interactive shell.
+    pub fn pty_params(
+        &self,
+        connection_id: &str,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(String, ConnectParams), String> {
+        let connection = self.get_connection(connection_id)?;
+        let credential = match connection.auth.kind {
+            AuthKind::Password => {
+                let secret = self.vault.get(&vault_key(&connection.id)).ok_or_else(|| {
+                    "该连接还没有保存口令（凭据只存在内存里，重启后需要重新填写）".to_string()
+                })?;
+                Credential::Password(secret)
+            }
+            AuthKind::PrivateKey => {
+                let path = connection
+                    .auth
+                    .private_key_path
+                    .clone()
+                    .ok_or_else(|| "该连接未配置私钥文件路径".to_string())?;
+                Credential::PrivateKey {
+                    path: PathBuf::from(path),
+                    passphrase: self.vault.get(&passphrase_key(&connection.id)),
+                }
+            }
+            AuthKind::Agent => Credential::Agent,
+        };
+
+        Ok((
+            connection.alias.clone(),
+            ConnectParams {
+                host: connection.host.clone(),
+                port: connection.port,
+                username: connection.username.clone(),
+                credential,
+                known_hosts_path: self.known_hosts_path(),
+                term: ssh::DEFAULT_TERM.to_string(),
+                cols: cols.max(1),
+                rows: rows.max(1),
+            },
+        ))
+    }
+
     fn get_connection(&self, id: &str) -> Result<Connection, String> {
         lock(&self.connections)?
             .get(id)
@@ -350,6 +404,10 @@ impl AppState {
 
 fn vault_key(connection_id: &str) -> String {
     format!("connection:{connection_id}:password")
+}
+
+fn passphrase_key(connection_id: &str) -> String {
+    format!("connection:{connection_id}:passphrase")
 }
 
 #[allow(clippy::too_many_arguments)]

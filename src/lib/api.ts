@@ -10,6 +10,7 @@ import type {
   McpServerInfo,
   PolicyAction,
   PolicyDecision,
+  PtyOpened,
   RiskLevel,
 } from "./types";
 
@@ -55,6 +56,36 @@ export const api = {
 
   mcpServerInfo: (): Promise<McpServerInfo> =>
     isTauri() ? invoke<McpServerInfo>("mcp_server_info") : mock.mcpServerInfo(),
+
+  /* ---- interactive PTY (real SSH shell, desktop build only) ---- */
+
+  ptyOpen: (connectionId: string, cols: number, rows: number): Promise<PtyOpened> =>
+    isTauri()
+      ? invoke<PtyOpened>("pty_open", { connectionId, cols, rows })
+      : Promise.reject(new Error("浏览器 Mock 模式不提供真实 SSH 会话，请使用桌面版")),
+
+  ptyWrite: (sessionId: string, data: string): Promise<void> =>
+    isTauri()
+      ? invoke<void>("pty_write", { sessionId, data })
+      : Promise.reject(new Error("浏览器 Mock 模式不提供真实 SSH 会话")),
+
+  ptyResize: (sessionId: string, cols: number, rows: number): Promise<void> =>
+    isTauri()
+      ? invoke<void>("pty_resize", { sessionId, cols, rows })
+      : Promise.reject(new Error("浏览器 Mock 模式不提供真实 SSH 会话")),
+
+  ptySignal: (sessionId: string, signal: string): Promise<void> =>
+    isTauri()
+      ? invoke<void>("pty_signal", { sessionId, signal })
+      : Promise.reject(new Error("浏览器 Mock 模式不提供真实 SSH 会话")),
+
+  ptyClose: (sessionId: string): Promise<boolean> =>
+    isTauri()
+      ? invoke<boolean>("pty_close", { sessionId })
+      : Promise.resolve(false),
+
+  ptyActiveSessions: (): Promise<number> =>
+    isTauri() ? invoke<number>("pty_active_sessions") : Promise.resolve(0),
 };
 
 /* ------------------------------------------------------------------ */

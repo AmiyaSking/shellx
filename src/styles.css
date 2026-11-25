@@ -659,6 +659,65 @@ pre {
   box-shadow: 0 0 7px rgba(251, 191, 36, 0.6);
 }
 
+/* ---------- real SSH PTY status ---------- */
+
+.pty-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.pty-status::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+.pty-status.pty-connecting {
+  color: #fcd34d;
+  border-color: rgba(251, 191, 36, 0.35);
+}
+.pty-status.pty-connecting::before {
+  background: var(--warning);
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.6);
+}
+.pty-status.pty-live {
+  color: #6ee7b7;
+  border-color: rgba(52, 211, 153, 0.3);
+}
+.pty-status.pty-live::before {
+  background: var(--accent);
+  box-shadow: 0 0 7px rgba(94, 234, 212, 0.6);
+}
+.pty-status.pty-error {
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.35);
+}
+.pty-status.pty-error::before {
+  background: #f87171;
+}
+
+.pty-error-banner {
+  flex: 0 0 auto;
+  margin: 8px 12px 0;
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  background: rgba(248, 113, 113, 0.08);
+  color: #fca5a5;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .xterm-host {
   flex: 1;
   min-height: 0;

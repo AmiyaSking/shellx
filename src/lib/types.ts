@@ -143,6 +143,42 @@ export interface McpServerInfo {
   activeSessions: number;
 }
 
+/* ------------------------------------------------------------------ */
+/* Interactive PTY (real SSH shell)                                    */
+/* ------------------------------------------------------------------ */
+
+export interface HostKey {
+  /** e.g. `ssh-ed25519` */
+  algorithm: string;
+  /** `SHA256:...`, the same form OpenSSH prints. */
+  fingerprint: string;
+  /** `true` when the key was already trusted in our known_hosts file. */
+  known: boolean;
+}
+
+export interface PtyOpened {
+  sessionId: string;
+  alias: string;
+  hostKey: HostKey;
+}
+
+/** Payload of the `pty:output` Tauri event (raw bytes, base64). */
+export interface PtyOutputEvent {
+  sessionId: string;
+  data: string;
+}
+
+export interface PtyExitEvent {
+  sessionId: string;
+  exitCode: number | null;
+}
+
+export interface PtyClosedEvent {
+  sessionId: string;
+  reason: string;
+}
+
+
 export const ENV_LABELS: Record<Environment, string> = {
   dev: "开发",
   staging: "预发",

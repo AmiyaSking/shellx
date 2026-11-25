@@ -1,11 +1,15 @@
 mod audit;
 mod commands;
 mod connections;
+mod encoding;
 mod mcp;
 mod models;
 mod policy;
+mod pty;
 mod redaction;
 mod sessions;
+mod shell;
+mod ssh;
 mod state;
 mod vault;
 
@@ -20,6 +24,7 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             let state = AppState::load(data_dir)?;
             app.manage(state);
+            app.manage(pty::PtyManager::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -33,6 +38,13 @@ pub fn run() {
             commands::list_sessions,
             commands::close_session,
             commands::mcp_server_info,
+            commands::pty_open,
+            commands::pty_write,
+            commands::pty_resize,
+            commands::pty_signal,
+            commands::pty_close,
+            commands::pty_close_all,
+            commands::pty_active_sessions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ShellX");
