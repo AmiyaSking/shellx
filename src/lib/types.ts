@@ -1,0 +1,169 @@
+// Shared types mirroring `src-tauri/src/models.rs` (serde camelCase).
+
+export type Environment = "dev" | "staging" | "prod";
+
+export type McpAccessMode = "disabled" | "read_only" | "standard_controlled";
+
+export type AuthKind = "password" | "private_key" | "agent";
+
+export interface AuthMethod {
+  kind: AuthKind;
+  secretRef?: string | null;
+  privateKeyPath?: string | null;
+}
+
+export interface Connection {
+  id: string;
+  alias: string;
+  host: string;
+  port: number;
+  username: string;
+  group: string;
+  tags: string[];
+  environment: Environment;
+  auth: AuthMethod;
+  mcpAccess: McpAccessMode;
+  jumpHost?: string | null;
+  remark: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ConnectionInput {
+  id?: string | null;
+  alias: string;
+  host: string;
+  port: number;
+  username: string;
+  group: string;
+  tags: string[];
+  environment: Environment;
+  auth: AuthMethod;
+  mcpAccess: McpAccessMode;
+  jumpHost?: string | null;
+  remark: string;
+  password?: string | null;
+}
+
+export type AuditSource = "user" | "agent" | "system";
+
+export type RiskLevel = "low" | "medium" | "high" | "critical";
+
+export type PolicyAction = "allow" | "require_approval" | "block";
+
+export interface PolicyDecision {
+  action: PolicyAction;
+  risk: RiskLevel;
+  reasons: string[];
+  ruleId?: string | null;
+}
+
+export interface CommandRequest {
+  connectionId: string;
+  command: string;
+  source: AuditSource;
+  timeoutSecs?: number | null;
+}
+
+export interface CommandResult {
+  id: string;
+  sessionId: string;
+  connectionId: string;
+  connectionAlias: string;
+  environment: Environment;
+  command: string;
+  exitCode: number | null;
+  output: string;
+  truncated: boolean;
+  risk: RiskLevel;
+  policyAction: PolicyAction;
+  decisionReasons: string[];
+  durationMs: number;
+  simulated: boolean;
+}
+
+export interface ApprovalRequest {
+  id: string;
+  connectionId: string;
+  connectionAlias: string;
+  environment: Environment;
+  command: string;
+  risk: RiskLevel;
+  reasons: string[];
+  source: AuditSource;
+  requestedAt: string;
+}
+
+export type CommandOutcome =
+  | { status: "completed"; result: CommandResult }
+  | { status: "pending_approval"; approval: ApprovalRequest }
+  | { status: "blocked"; decision: PolicyDecision; auditId: string; message: string };
+
+export type ApprovalDecision = "approved" | "rejected";
+
+export interface AuditEntry {
+  id: string;
+  timestamp: string;
+  source: AuditSource;
+  connectionId?: string | null;
+  connectionAlias?: string | null;
+  environment?: Environment | null;
+  command?: string | null;
+  risk?: RiskLevel | null;
+  action: PolicyAction;
+  approval?: ApprovalDecision | null;
+  exitCode?: number | null;
+  durationMs?: number | null;
+  detail: string;
+}
+
+export interface SessionInfo {
+  id: string;
+  connectionId: string;
+  connectionAlias: string;
+  createdAt: string;
+  lastActiveAt: string;
+  status: "active" | "closed";
+  outputLines: number;
+  outputBytes: number;
+}
+
+export interface McpToolInfo {
+  name: string;
+  description: string;
+  risk: RiskLevel;
+}
+
+export interface McpServerInfo {
+  transport: string;
+  command: string;
+  status: "scaffold" | "running" | "stopped";
+  tools: McpToolInfo[];
+  authorizedConnections: number;
+  activeSessions: number;
+}
+
+export const ENV_LABELS: Record<Environment, string> = {
+  dev: "开发",
+  staging: "预发",
+  prod: "生产",
+};
+
+export const MCP_ACCESS_LABELS: Record<McpAccessMode, string> = {
+  disabled: "未授权",
+  read_only: "只读",
+  standard_controlled: "受控",
+};
+
+export const RISK_LABELS: Record<RiskLevel, string> = {
+  low: "低风险",
+  medium: "中风险",
+  high: "高风险",
+  critical: "极高危",
+};
+
+export const ACTION_LABELS: Record<PolicyAction, string> = {
+  allow: "放行",
+  require_approval: "需审批",
+  block: "拦截",
+};
