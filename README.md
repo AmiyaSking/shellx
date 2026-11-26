@@ -1,5 +1,7 @@
 # ShellX
 
+![CI](https://github.com/AmiyaSking/shellx/actions/workflows/ci.yml/badge.svg)
+
 > 带本地 MCP 服务与纵深安全护栏的桌面终端客户端。基于 **Tauri 2 + React + TypeScript + xterm.js**，安全策略在 **Rust 核心**中执行。
 
 ShellX 面向两类使用者：
@@ -164,6 +166,7 @@ shellx/
 ```bash
 npm install          # 安装前端依赖
 npm run dev          # 浏览器预览（自动使用 Mock 后端）
+npm test             # 前端单元测试（Vitest + jsdom）
 npm run build        # TypeScript 类型检查 + 生产构建
 npm run tauri dev    # 启动 Tauri 桌面端（需要 Rust 工具链）
 npm run tauri build  # 打包安装包
@@ -175,6 +178,15 @@ Rust 侧测试（需要 Rust 工具链）：
 cd src-tauri
 cargo test
 ```
+
+### 测试与 CI
+
+- **前端**：Vitest + jsdom，覆盖设置持久化/默认值迁移与工作区序列化；`npm test`
+- **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法等单元测试；`cargo test`
+- **CI**：`.github/workflows/ci.yml` 在 Windows 上执行前端测试/构建 + `cargo test` / `cargo check`
+- 系统凭据存储的读写测试标记为 `#[ignore]`，需要手动运行：
+  `cargo test keyring_roundtrip -- --ignored`
+- 尚未包含真实 SSH 服务器的集成测试和前端 E2E；后续可用容器化 sshd 补齐
 
 ### 数据位置
 
@@ -206,7 +218,7 @@ stdio JSON-RPC 循环将以 `shellx --mcp-stdio` 形式接入；`src-tauri/src/m
 1. **第一阶段（连接可靠性）**：✅ 真实 SSH/PTY、SSH Agent、单级跳板机、系统钥匙串、主机密钥确认、连接超时/取消、PTY 会话审计。
 2. **第二阶段（终端体验）**：✅ 搜索、可点击链接、Unicode 宽度、GPU 渲染、快捷键、同主机多开、动态标题、响铃提示、设置页、右键菜单、多行粘贴确认、标签重命名/拖拽、多窗格分屏、可拖动分隔条、工作区恢复、终端输出日志；🚧 嵌套分屏。
 3. **第三阶段（专业能力）**：✅ OpenSSH config 导入、端口转发（-L / -R / -D）、SFTP 文件浏览/上传/下载、每连接 TERM/编码/启动命令、keyboard-interactive/2FA、旧算法兼容、SSH Agent 转发；🚧 X11 转发。
-4. **第四阶段（工程化）**：MCP stdio 传输、输出批处理与背压、集成测试/CI、规则配置界面。
+4. **第四阶段（工程化）**：✅ Windows CI（前端测试/构建 + Rust 测试）；🚧 SSH 集成测试、前端 E2E、MCP stdio 传输、输出批处理与背压、规则配置界面。
 
 ## 说明
 
