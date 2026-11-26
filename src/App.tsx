@@ -5,11 +5,16 @@ import AuditDrawer from "./components/AuditDrawer";
 import ConnectionModal from "./components/ConnectionModal";
 import SettingsDrawer from "./components/SettingsDrawer";
 import Sidebar from "./components/Sidebar";
-import TabBar, { type TerminalTab } from "./components/TabBar";
+import TabBar, {
+  type TerminalPaneState,
+  type TerminalTab,
+} from "./components/TabBar";
 import TerminalPane from "./components/TerminalPane";
 
 let tabSeq = 0;
+let paneSeq = 0;
 const newTabId = () => `tab_${Date.now().toString(36)}_${(++tabSeq).toString(36)}`;
+const newPaneId = () => `pane_${Date.now().toString(36)}_${(++paneSeq).toString(36)}`;
 
 export default function App() {
   const [connections, setConnections] = useState<Connection[]>([]);
@@ -61,8 +66,25 @@ export default function App() {
     );
   }, []);
 
+  const focusPane = useCallback((tabId: string, paneId: string) => {
+    setActiveTabId(tabId);
+    setTabs((current) =>
+      current.map((tab) =>
+        tab.id === tabId
+          ? { ...tab, activePaneId: paneId, attention: false }
+          : tab,
+      ),
+    );
+  }, []);
+
   const createTab = useCallback((connectionId: string) => {
-    const tab: TerminalTab = { id: newTabId(), connectionId };
+    const pane: TerminalPaneState = { id: newPaneId(), connectionId };
+    const tab: TerminalTab = {
+      id: newTabId(),
+      panes: [pane],
+      layout: "row",
+      activePaneId: pane.id,
+    };
     setTabs((current) => [...current, tab]);
     setActiveTabId(tab.id);
     return tab.id;
@@ -70,14 +92,19 @@ export default function App() {
 
   const openConnection = useCallback(
     (connection: Connection) => {
-      const existing = tabs.find((tab) => tab.connectionId === connection.id);
+      const existing = tabs.find((tab) =>
+        tab.panes.some((pane) => pane.connectionId === connection.id),
+      );
       if (existing) {
-        selectTab(existing.id);
+        const pane = existing.panes.find(
+          (item) => item.connectionId === connection.id,
+        );
+        focusPane(existing.id, pane?.id ?? existing.activePaneId);
         return;
       }
       createTab(connection.id);
     },
-    [createTab, selectTab, tabs],
+    [createTab, focusPane, tabs],
   );
 
   const closeTab = useCallback((tabId: string) => {
@@ -122,6 +149,61 @@ export default function App() {
     );
   }, []);
 
+  const closePane = useCallback(
+    (tabId: string, paneId: string) => {
+      const tab = tabs.find((item) => item.id === tabId);
+      if (!tab) return;
+      if (tab.panes.length <= 1) {
+        closeTab(tabId);
+        return;
+      }
+      setTabs((current) =>
+        current.map((item) => {
+          if (item.id !== tabId) return item;
+          const index = item.panes.findIndex((pane) => pane.id === paneId);
+          const panes = item.panes.filter((pane) => pane.id !== paneId);
+          if (panes.length === 0) return item;
+          const activePaneId =
+            item.activePaneId === paneId
+              ? panes[Math.max(0, index - 1)]?.id ?? panes[0].id
+              : item.activePaneId;
+          return { ...item, panes, activePaneId };
+        }),
+      );
+    },
+    [closeTab, tabs],
+  );
+
+  const splitPane = useCallback(
+    (tabId: string, paneId: string, direction: "row" | "column") => {
+      const tab = tabs.find((item) => item.id === tabId);
+      const source = tab?.panes.find((pane) => pane.id === paneId);
+      if (!tab || !source) return;
+      if (tab.panes.length >= 4) {
+        setError("每个标签最多支持 4 个终端窗格");
+        return;
+      }
+      const pane: TerminalPaneState = {
+        id: newPaneId(),
+        connectionId: source.connectionId,
+      };
+      setTabs((current) =>
+        current.map((item) =>
+          item.id === tabId
+            ? {
+                ...item,
+                panes: [...item.panes, pane],
+                layout: direction,
+                activePaneId: pane.id,
+              }
+            : item,
+        ),
+      );
+      setActiveTabId(tabId);
+    },
+    [tabs],
+  );
+
   const moveTab = useCallback((fromTabId: string, toTabId: string) => {
     if (fromTabId === toTabId) return;
     setTabs((current) => {
@@ -159,7 +241,18 @@ export default function App() {
       try {
         await api.deleteConnection(connection.id);
         setTabs((current) => {
-          const next = current.filter((tab) => tab.connectionId !== connection.id);
+          const next = current.flatMap((tab) => {
+            const panes = tab.panes.filter(
+              (pane) => pane.connectionId !== connection.id,
+            );
+            if (panes.length === 0) return [];
+            const activePaneId = panes.some(
+              (pane) => pane.id === tab.activePaneId,
+            )
+              ? tab.activePaneId
+              : panes[0].id;
+            return [{ ...tab, panes, activePaneId }];
+          });
           setActiveTabId((active) => {
             if (active && next.some((tab) => tab.id === active)) return active;
             return next[next.length - 1]?.id ?? null;
@@ -177,8 +270,13 @@ export default function App() {
   );
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? null;
-  const activeConnection = activeTab
-    ? connectionById.get(activeTab.connectionId) ?? null
+  const activePane = activeTab
+    ? (activeTab.panes.find((pane) => pane.id === activeTab.activePaneId) ??
+      activeTab.panes[0] ??
+      null)
+    : null;
+  const activeConnection = activePane
+    ? (connectionById.get(activePane.connectionId) ?? null)
     : null;
 
   const duplicateActiveTab = useCallback(() => {
@@ -188,6 +286,21 @@ export default function App() {
       setModal({ mode: "create" });
     }
   }, [activeConnection, createTab]);
+
+  const closeActivePane = useCallback(() => {
+    if (activeTab && activePane) {
+      closePane(activeTab.id, activePane.id);
+    }
+  }, [activePane, activeTab, closePane]);
+
+  const splitActivePane = useCallback(
+    (direction: "row" | "column") => {
+      if (activeTab && activePane) {
+        splitPane(activeTab.id, activePane.id, direction);
+      }
+    },
+    [activePane, activeTab, splitPane],
+  );
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -212,7 +325,19 @@ export default function App() {
       if (event.shiftKey && key === "w") {
         event.preventDefault();
         event.stopPropagation();
-        if (activeTabId) closeTab(activeTabId);
+        closeActivePane();
+        return;
+      }
+      if (event.shiftKey && key === "d") {
+        event.preventDefault();
+        event.stopPropagation();
+        splitActivePane("row");
+        return;
+      }
+      if (event.shiftKey && key === "e") {
+        event.preventDefault();
+        event.stopPropagation();
+        splitActivePane("column");
         return;
       }
       if (key === "tab" && tabs.length > 0) {
@@ -239,11 +364,12 @@ export default function App() {
   }, [
     activeTabId,
     auditOpen,
-    closeTab,
+    closeActivePane,
     duplicateActiveTab,
     modal,
     selectTab,
     settingsOpen,
+    splitActivePane,
     tabs,
   ]);
 
@@ -329,19 +455,39 @@ export default function App() {
               </div>
             )}
 
-            {tabs.map((tab) => {
-              const connection = connectionById.get(tab.connectionId);
-              if (!connection) return null;
-              return (
-                <TerminalPane
-                  key={tab.id}
-                  connection={connection}
-                  active={tab.id === activeTabId}
-                  onTitleChange={(title) => updateTabTitle(tab.id, title)}
-                  onBell={() => markTabAttention(tab.id)}
-                />
-              );
-            })}
+            {tabs.map((tab) => (
+              <div
+                key={tab.id}
+                className={`tab-panes tab-panes-${tab.layout} ${
+                  tab.id === activeTabId ? "is-active" : ""
+                }`}
+              >
+                {tab.panes.map((pane) => {
+                  const connection = connectionById.get(pane.connectionId);
+                  if (!connection) return null;
+                  return (
+                    <TerminalPane
+                      key={pane.id}
+                      connection={connection}
+                      visible={tab.id === activeTabId}
+                      focused={
+                        tab.id === activeTabId &&
+                        pane.id === tab.activePaneId
+                      }
+                      canSplit={tab.panes.length < 4}
+                      onFocus={() => focusPane(tab.id, pane.id)}
+                      onTitleChange={(title) => updateTabTitle(tab.id, title)}
+                      onBell={() => markTabAttention(tab.id)}
+                      onSplitRow={() => splitPane(tab.id, pane.id, "row")}
+                      onSplitColumn={() =>
+                        splitPane(tab.id, pane.id, "column")
+                      }
+                      onClosePane={() => closePane(tab.id, pane.id)}
+                    />
+                  );
+                })}
+              </div>
+            ))}
           </div>
         </main>
       </div>

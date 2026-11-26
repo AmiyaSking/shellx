@@ -36,9 +36,15 @@ import PasteConfirmDialog from "./PasteConfirmDialog";
 
 interface Props {
   connection: Connection;
-  active: boolean;
+  visible: boolean;
+  focused: boolean;
+  canSplit?: boolean;
+  onFocus?: () => void;
   onTitleChange?: (title: string) => void;
   onBell?: () => void;
+  onSplitRow?: () => void;
+  onSplitColumn?: () => void;
+  onClosePane?: () => void;
 }
 
 function openExternalUrl(uri: string) {
@@ -91,9 +97,15 @@ function base64ToBytes(data: string): Uint8Array {
 
 export default function TerminalPane({
   connection,
-  active,
+  visible,
+  focused,
+  canSplit = false,
+  onFocus,
   onTitleChange,
   onBell,
+  onSplitRow,
+  onSplitColumn,
+  onClosePane,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -694,17 +706,17 @@ export default function TerminalPane({
   }, [connection.id, attempt]);
 
   useEffect(() => {
-    if (!active) return;
+    if (!visible) return;
     const timer = window.setTimeout(() => {
       try {
         fitAddonRef.current?.fit();
       } catch {
         // ignore
       }
-      terminalRef.current?.focus();
+      if (focused) terminalRef.current?.focus();
     }, 30);
     return () => window.clearTimeout(timer);
-  }, [active]);
+  }, [focused, visible]);
 
   const toggleAgentMode = () => {
     const next = !agentMode;
@@ -807,7 +819,10 @@ export default function TerminalPane({
   };
 
   return (
-    <div className={`terminal-pane ${active ? "is-active" : ""}`}>
+    <div
+      className={`terminal-pane ${focused ? "is-focused" : ""}`}
+      onMouseDownCapture={() => onFocus?.()}
+    >
       <div className="terminal-toolbar">
         <div className="terminal-identity">
           <span className={`env-dot env-${connection.environment}`} />
@@ -829,6 +844,38 @@ export default function TerminalPane({
           >
             搜索
           </button>
+          {onSplitRow && (
+            <button
+              type="button"
+              className="icon-btn"
+              disabled={!canSplit}
+              title="左右分屏（Ctrl+Shift+D）"
+              onClick={onSplitRow}
+            >
+              ◫
+            </button>
+          )}
+          {onSplitColumn && (
+            <button
+              type="button"
+              className="icon-btn"
+              disabled={!canSplit}
+              title="上下分屏（Ctrl+Shift+E）"
+              onClick={onSplitColumn}
+            >
+              ⬒
+            </button>
+          )}
+          {onClosePane && (
+            <button
+              type="button"
+              className="icon-btn"
+              title="关闭窗格（Ctrl+Shift+W）"
+              onClick={onClosePane}
+            >
+              ×
+            </button>
+          )}
           {PTY_CAPABLE && (
             <span className={`pty-status pty-${status}`}>{STATUS_LABELS[status]}</span>
           )}

@@ -1,9 +1,17 @@
 import { useState } from "react";
 import type { Connection } from "../lib/types";
 
-export interface TerminalTab {
+export interface TerminalPaneState {
   id: string;
   connectionId: string;
+}
+
+export interface TerminalTab {
+  id: string;
+  panes: TerminalPaneState[];
+  /** Split direction for two or more panes. */
+  layout: "row" | "column";
+  activePaneId: string;
   /** Title reported by the remote shell via OSC 0/2, if any. */
   title?: string;
   /** User-provided title; takes precedence over the remote title. */
@@ -57,7 +65,11 @@ export default function TabBar({
   return (
     <div className="tabbar" role="tablist" aria-label="终端标签页">
       {tabs.map((tab) => {
-        const connection = connections.get(tab.connectionId);
+        const activePane =
+          tab.panes.find((pane) => pane.id === tab.activePaneId) ?? tab.panes[0];
+        const connection = activePane
+          ? connections.get(activePane.connectionId)
+          : undefined;
         const editing = editingTabId === tab.id;
         return (
           <div
@@ -119,6 +131,11 @@ export default function TabBar({
               />
             ) : (
               <span className="tab-title">{displayTitle(tab, connection)}</span>
+            )}
+            {tab.panes.length > 1 && (
+              <span className="tab-pane-count" title={`${tab.panes.length} 个窗格`}>
+                {tab.panes.length}
+              </span>
             )}
             {tab.attention && tab.id !== activeTabId && !editing && (
               <span className="tab-attention" title="终端响铃 / 有新输出" />

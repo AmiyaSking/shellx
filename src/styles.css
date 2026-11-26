@@ -223,6 +223,14 @@ pre {
   color: var(--text);
   background: var(--bg-hover);
 }
+.icon-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.icon-btn:disabled:hover {
+  color: var(--text-faint);
+  background: transparent;
+}
 
 /* ---------- sidebar ---------- */
 
@@ -569,6 +577,20 @@ pre {
   flex: 0 0 6px;
 }
 
+.tab-pane-count {
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  color: var(--text-faint);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+}
+
 .tabbar-fill {
   flex: 1;
 }
@@ -606,16 +628,35 @@ pre {
 
 /* ---------- terminal ---------- */
 
+.tab-panes {
+  display: none;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  gap: 1px;
+  background: var(--border);
+}
+.tab-panes.is-active {
+  display: flex;
+}
+.tab-panes-row {
+  flex-direction: row;
+}
+.tab-panes-column {
+  flex-direction: column;
+}
+
 .terminal-pane {
   position: relative;
-  display: none;
+  display: flex;
   flex-direction: column;
   flex: 1;
   min-height: 0;
   min-width: 0;
+  background: var(--bg);
 }
-.terminal-pane.is-active {
-  display: flex;
+.terminal-pane.is-focused .terminal-toolbar {
+  box-shadow: inset 0 -1px 0 rgba(94, 234, 212, 0.45);
 }
 
 .terminal-search {
@@ -651,7 +692,8 @@ pre {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
   padding: 8px 14px;
   border-bottom: 1px solid var(--border);
   background: rgba(13, 18, 25, 0.6);
