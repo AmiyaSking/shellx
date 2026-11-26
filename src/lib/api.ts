@@ -7,6 +7,7 @@ import type {
   CommandResult,
   Connection,
   ConnectionInput,
+  HostKeyTrust,
   McpServerInfo,
   PolicyAction,
   PolicyDecision,
@@ -59,10 +60,32 @@ export const api = {
 
   /* ---- interactive PTY (real SSH shell, desktop build only) ---- */
 
-  ptyOpen: (connectionId: string, cols: number, rows: number): Promise<PtyOpened> =>
+  ptyOpen: (
+    connectionId: string,
+    cols: number,
+    rows: number,
+    trustedHostKeys: HostKeyTrust[],
+    requestId: string,
+  ): Promise<PtyOpened> =>
     isTauri()
-      ? invoke<PtyOpened>("pty_open", { connectionId, cols, rows })
+      ? invoke<PtyOpened>("pty_open", {
+          connectionId,
+          cols,
+          rows,
+          requestId,
+          trustedHostKeys,
+        })
       : Promise.reject(new Error("浏览器 Mock 模式不提供真实 SSH 会话，请使用桌面版")),
+
+  ptyCancel: (requestId: string): Promise<boolean> =>
+    isTauri()
+      ? invoke<boolean>("pty_cancel", { requestId })
+      : Promise.resolve(false),
+
+  forgetHostKey: (host: string, port: number): Promise<boolean> =>
+    isTauri()
+      ? invoke<boolean>("forget_host_key", { host, port })
+      : Promise.resolve(false),
 
   ptyWrite: (sessionId: string, data: string): Promise<void> =>
     isTauri()

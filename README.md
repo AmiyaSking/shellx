@@ -11,35 +11,40 @@ ShellX 面向两类使用者：
 
 ---
 
-## 当前状态：脚手架（v0.1.0）
+## 当前状态（v0.1.0）
 
-本仓库目前是**可运行的产品骨架**，不是完整实现：
+真实 SSH 交互已经可用，终端基础体验仍在补齐：
 
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
 | GUI 布局、连接管理、分组、搜索 | ✅ 已实现 | 连接元数据持久化到应用数据目录 |
-| 多标签终端（xterm.js） | ✅ 已实现 | 每个连接一个终端页，支持切换/关闭 |
-| 策略引擎（风险分级 + 环境矩阵 + MCP 授权） | ✅ 已实现 | Rust 侧执行，含单元测试 |
-| 审批弹窗（批准 / 修改后执行 / 拒绝） | ✅ 已实现 | 挂起命令并等待用户决策 |
-| 输出脱敏（密码/Token/私钥/Bearer） | ✅ 已实现 | 正则规则位于 `redaction.rs` |
-| 审计日志（JSONL + GUI 查看） | ✅ 已实现 | 每日文件 + 内存最近 500 条 |
-| 会话注册表 / 输出环形缓冲 | ✅ 骨架 | 内存实现，供后续 SSH 通道挂载 |
-| 真实 SSH 通道 | 🚧 待接入 | 当前由**模拟执行器**返回演示输出 |
+| 多标签终端（xterm.js + 真实 PTY） | ✅ 已实现 | 每个连接一个终端页，支持切换/关闭、窗口自适应 |
+| 真实 SSH 通道 | ✅ 已实现 | `russh` + PTY，支持密码、私钥、SSH Agent |
+| SSH Agent | ✅ 已实现 | Windows OpenSSH Agent / Pageant，Unix `SSH_AUTH_SOCK` |
+| 单级跳板机 | ✅ 已实现 | 通过 `direct-tcpip` 建立 ProxyJump 链路 |
+| 凭据持久化 | ✅ 已实现 | Windows Credential Manager / macOS Keychain / Linux keyring |
+| 主机密钥校验 | ✅ 已实现 | 首次连接必须确认指纹；密钥变更直接拒绝；可移除旧密钥 |
+| 连接超时与取消 | ✅ 已实现 | 20 秒连接超时，连接中可取消 |
+| 策略引擎（风险分级 + 环境矩阵） | ✅ 已实现 | Rust 侧执行，含命令链/替换/启动器解析与单元测试 |
+| 审批弹窗、输出脱敏、审计日志 | ✅ 已实现 | 审批可修改命令；PTY 连接/断开/失败也写入审计 |
+| 终端搜索 / 链接 / Unicode / GPU 渲染 | 🚧 待补齐 | 见「后续终端体验」 |
+| 分屏、同主机多开、快捷键、设置页 | 🚧 待补齐 | |
+| 端口转发、SFTP、ssh_config 导入 | 🚧 待补齐 | |
+| 会话输出持久化 / 会话恢复 | 🚧 待补齐 | |
 | 本地 MCP stdio 传输 | 🚧 待接入 | 工具目录、JSON Schema、分发器已就绪 |
-| 凭据持久化（系统钥匙串） | 🚧 待接入 | 当前仅内存保存，重启即失效 |
 
-> 终端中的命令标注「模拟」表示未连接真实服务器；策略判定、审批与审计是真实生效的，可在浏览器 Mock 模式或 Tauri 窗口中完整演示。
+> 桌面版连接真实服务器；浏览器 `npm run dev` 会使用内置 Mock 后端，界面显示「浏览器 Mock 模式」。
 
-## 功能演示
+## 功能演示（桌面版）
 
-1. 左侧选择 `prod-web-01` 打开终端。
-2. 点击终端右上角 **手动模式** 切换为 **AI Agent 模式**。
-3. 执行 `ls -la`：命中只读白名单，直接放行。
-4. 执行 `systemctl restart nginx`：生产环境 + 高风险 → 弹出审批窗口，可批准、修改命令或拒绝。
-5. 执行 `rm -rf /`：极高危规则 → 直接拦截并记录审计。
-6. 点击顶部 **审计日志** 查看每次判定、审批结果、耗时与退出码。
+1. 左侧新建连接，选择密码、私钥或 SSH Agent 认证。
+2. 首次连接会弹出主机密钥指纹确认窗口；确认后才写入 ShellX 自己的 `known_hosts`。
+3. 连接成功后进入真实交互式 shell；窗口缩放会同步远端 PTY 尺寸。
+4. 连接中可点击 **取消**；断线后点击 **重新连接**。
+5. 密钥变更时会拒绝连接，并提供「移除该主机密钥并重试」入口。
+6. 点击顶部 **审计日志** 查看连接、断开、失败记录。
 
-浏览器直接 `npm run dev` 时使用内置 Mock 后端（界面会显示「浏览器 Mock 模式」）；在 Tauri 中运行时，所有判定与持久化由 Rust 核心完成。
+浏览器 Mock 模式主要用于预览 UI 和策略/审批流程，不建立任何网络连接。
 
 ## 架构
 
@@ -55,12 +60,16 @@ Tauri Backend / Local Core (Rust)
   ├─ redaction.rs      输出敏感信息脱敏
   ├─ audit.rs          JSONL 审计 + 内存环形缓冲
   ├─ connections.rs    连接配置持久化（不含凭据）
-  ├─ vault.rs          凭据保险库（当前为内存实现）
-  ├─ sessions.rs       会话注册表与输出缓冲
+  ├─ vault.rs          凭据保险库（系统凭据存储 + 内存缓存）
+  ├─ ssh.rs            russh 连接 / 主机密钥 / Agent / 跳板机 / PTY 通道
+  ├─ pty.rs            PTY 会话表 / 事件桥 / 超时与取消
+  ├─ shell.rs          命令链解析（策略引擎输入）
+  ├─ encoding.rs       PTY 字节 base64 传输
+  ├─ sessions.rs       命令型会话注册表与输出缓冲
   └─ mcp.rs            MCP 工具目录 / manifest / 分发器骨架
                                        │
                                        v
-                              SSH / SFTP（phase 1）
+                          SSH（russh + PTY + ProxyJump）
 ```
 
 ### 目录结构
@@ -68,12 +77,15 @@ Tauri Backend / Local Core (Rust)
 ```
 shellx/
 ├─ src/                      React 前端
-│  ├─ components/            Sidebar / TerminalPane / 审批 / 审计 / 连接弹窗
+│  ├─ components/            Sidebar / TerminalPane / HostKeyDialog / 审批 / 审计 / 连接弹窗
 │  ├─ lib/api.ts             Tauri 调用封装 + 浏览器 Mock 后端
 │  ├─ lib/types.ts           与 Rust serde 模型对应的类型
 │  └─ styles.css             暗色终端工作台样式
 ├─ src-tauri/                Rust 核心（Tauri 2）
 │  ├─ src/models.rs          领域模型（camelCase 序列化）
+│  ├─ src/ssh.rs             SSH/PTY 传输与主机密钥策略
+│  ├─ src/pty.rs             会话管理、事件桥、超时/取消
+│  ├─ src/shell.rs           命令链解析
 │  ├─ src/policy.rs          安全策略引擎（含单元测试）
 │  ├─ src/redaction.rs       输出脱敏（含单元测试）
 │  ├─ src/audit.rs           审计日志
@@ -135,9 +147,11 @@ cargo test
 Tauri 应用数据目录（标识符 `com.shellx.app`）下：
 
 - `connections.json`：连接元数据（不含密码/私钥内容）
+- `known_hosts`：ShellX 自己的主机密钥信任库（不修改 OpenSSH 的 `~/.ssh/known_hosts`）
 - `audit/audit-YYYY-MM-DD.jsonl`：结构化审计日志
 
-Windows 通常位于 `%APPDATA%\com.shellx.app`。
+密码与私钥口令存放在操作系统凭据存储中，不落盘到 JSON。Windows 通常位于
+`%APPDATA%\com.shellx.app`。
 
 ## MCP 工具（骨架已定义）
 
@@ -153,11 +167,13 @@ stdio JSON-RPC 循环将以 `shellx --mcp-stdio` 形式接入；`src-tauri/src/m
 
 ## 实施路线
 
-1. **第一阶段（MVP）**：接入 `russh` 真实 SSH 通道与 PTY；系统钥匙串保存凭据；实现 MCP stdio 传输；完成 `read_output` / `send_signal` / `close_session`。
-2. **第二阶段（终端体验）**：私钥/跳板机链路、分屏、快捷命令、SFTP 文件传输、大输出分页、审计检索。
-3. **第三阶段（安全与工程化）**：可视化规则配置、环境策略自定义、人机同屏接管提示、错误恢复与规则回归测试。
+1. **第一阶段（连接可靠性）**：✅ 真实 SSH/PTY、SSH Agent、单级跳板机、系统钥匙串、主机密钥确认、连接超时/取消、PTY 会话审计。
+2. **第二阶段（终端体验）**：搜索、可点击链接、Unicode 宽度、GPU 渲染、快捷键与设置页、分屏、同主机多开、标签拖拽/重命名、会话恢复、会话输出日志。
+3. **第三阶段（专业能力）**：ssh_config 导入、端口转发、SFTP、Agent/X11 转发、keyboard-interactive/2FA、旧算法兼容、每连接编码与启动命令。
+4. **第四阶段（工程化）**：MCP stdio 传输、输出批处理与背压、集成测试/CI、规则配置界面。
 
 ## 说明
 
-- 当前凭据仅保存在内存中，属于脚手架行为，请勿用于真实生产环境。
-- 模拟执行器不会建立任何网络连接；所有「执行成功」均为本地演示输出。
+- 凭据保存在系统凭据存储；Linux 当前使用内核 keyring，重启后可能需要重新输入，后续可切换到 Secret Service。
+- 浏览器 Mock 模式不会建立任何网络连接；桌面版才会连接真实服务器。
+- 当前暂不支持多级跳板机、SFTP、端口转发和分屏。

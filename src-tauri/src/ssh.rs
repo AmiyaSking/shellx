@@ -11,13 +11,18 @@
 //! we silently accept.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::client::{self, Msg};
+use russh::keys::agent::client::{AgentClient, AgentStream};
+use russh::keys::agent::AgentIdentity;
 use russh::keys::{self as rkeys, ssh_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Disconnect, Sig};
+
+use crate::models::HostKeyTrust;
 
 /// The terminal type we advertise to the server.
 pub const DEFAULT_TERM: &str = "xterm-256color";
@@ -30,9 +35,8 @@ pub enum Credential {
         path: PathBuf,
         passphrase: Option<String>,
     },
-    /// Not wired up yet: agent forwarding needs a named-pipe transport and a
-    /// signer handshake. Kept as an explicit variant so the UI can say so
-    /// instead of silently falling back to something weaker.
+    /// Local SSH agent (OpenSSH agent / Pageant). The agent signs the
+    /// authentication request; private key material never enters ShellX.
     Agent,
 }
 
@@ -51,12 +55,25 @@ impl fmt::Debug for Credential {
     }
 }
 
+/// Optional one-level jump host (ProxyJump equivalent).
+#[derive(Clone, Debug)]
+pub struct JumpHost {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub credential: Credential,
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectParams {
     pub host: String,
     pub port: u16,
     pub username: String,
     pub credential: Credential,
+    pub jump: Option<JumpHost>,
+    /// Fingerprints the user already confirmed in the host-key dialog. A first
+    /// connection without a matching entry fails with `HostKeyUnknown`.
+    pub trusted_host_keys: Vec<HostKeyTrust>,
     /// Where our own known_hosts file lives (not ~/.ssh/known_hosts: we keep a
     /// separate file so ShellX never silently rewrites the user's OpenSSH state).
     pub known_hosts_path: PathBuf,
@@ -66,18 +83,27 @@ pub struct ConnectParams {
 }
 
 impl ConnectParams {
+    #[allow(dead_code)] // convenience constructor used by the verification harness
     pub fn new(host: impl Into<String>, port: u16, username: impl Into<String>) -> Self {
         Self {
             host: host.into(),
             port,
             username: username.into(),
             credential: Credential::Agent,
+            jump: None,
+            trusted_host_keys: Vec::new(),
             known_hosts_path: PathBuf::from("known_hosts"),
             term: DEFAULT_TERM.to_string(),
             cols: 80,
             rows: 24,
         }
     }
+}
+
+fn trusted_fingerprint(trusted: &[HostKeyTrust], host: &str, port: u16) -> Option<String> {
+    trusted
+        .iter()
+        .find_map(|entry| entry.fingerprint_for(host, port).map(str::to_string))
 }
 
 /// What we learned about the server's key during the handshake.
@@ -97,8 +123,15 @@ pub enum SshError {
     HostKeyChanged {
         host: String,
         port: u16,
+        algorithm: String,
         fingerprint: String,
         detail: String,
+    },
+    HostKeyUnknown {
+        host: String,
+        port: u16,
+        algorithm: String,
+        fingerprint: String,
     },
     KnownHosts(String),
     KeyFile(String),
@@ -120,9 +153,19 @@ impl fmt::Display for SshError {
                 port,
                 fingerprint,
                 detail,
+                ..
             } => write!(
                 f,
                 "主机密钥已变更（{host}:{port}，当前指纹 {fingerprint}）：{detail}。为防中间人攻击已中止连接。"
+            ),
+            SshError::HostKeyUnknown {
+                host,
+                port,
+                algorithm,
+                fingerprint,
+            } => write!(
+                f,
+                "首次连接 {host}:{port}，主机密钥（{algorithm}，{fingerprint}）尚未被信任，请确认指纹后重试。"
             ),
             SshError::KnownHosts(detail) => write!(f, "读取 known_hosts 失败：{detail}"),
             SshError::KeyFile(detail) => write!(f, "读取私钥失败：{detail}"),
@@ -151,6 +194,8 @@ struct HostKeyState {
     host: String,
     port: u16,
     known_hosts_path: PathBuf,
+    /// Fingerprint the user confirmed for this attempt, if any.
+    expected_fingerprint: Option<String>,
     host_key: Option<HostKey>,
     /// Set when we refuse the server, so the real error survives `connect()`.
     rejection: Option<SshError>,
@@ -163,12 +208,18 @@ pub struct HostKeyHandler {
 }
 
 impl HostKeyHandler {
-    fn new(host: String, port: u16, known_hosts_path: PathBuf) -> Self {
+    fn new(
+        host: String,
+        port: u16,
+        known_hosts_path: PathBuf,
+        expected_fingerprint: Option<String>,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(HostKeyState {
                 host,
                 port,
                 known_hosts_path,
+                expected_fingerprint,
                 host_key: None,
                 rejection: None,
             })),
@@ -178,7 +229,10 @@ impl HostKeyHandler {
     fn snapshot(&self) -> (Option<HostKey>, Option<SshError>) {
         match self.state.lock() {
             Ok(guard) => (guard.host_key.clone(), guard.rejection.clone()),
-            Err(_) => (None, Some(SshError::KnownHosts("主机密钥状态锁已失效".into()))),
+            Err(_) => (
+                None,
+                Some(SshError::KnownHosts("主机密钥状态锁已失效".into())),
+            ),
         }
     }
 }
@@ -211,10 +265,12 @@ impl client::Handler for HostKeyHandler {
         ) {
             Ok(known) => known,
             Err(error) => {
-                // A recorded key with a different value: refuse, loudly.
+                // A recorded key with a different value: refuse, loudly. This
+                // path is never overridable from the fingerprint dialog.
                 state.rejection = Some(SshError::HostKeyChanged {
                     host: state.host.clone(),
                     port: state.port,
+                    algorithm: algorithm.clone(),
                     fingerprint: fingerprint.clone(),
                     detail: error.to_string(),
                 });
@@ -223,6 +279,18 @@ impl client::Handler for HostKeyHandler {
         };
 
         if !known {
+            // Trust-on-first-use is only allowed after the UI showed this exact
+            // fingerprint and the user confirmed it.
+            let confirmed = state.expected_fingerprint.as_deref() == Some(fingerprint.as_str());
+            if !confirmed {
+                state.rejection = Some(SshError::HostKeyUnknown {
+                    host: state.host.clone(),
+                    port: state.port,
+                    algorithm: algorithm.clone(),
+                    fingerprint: fingerprint.clone(),
+                });
+                return Ok(false);
+            }
             if let Err(error) = rkeys::known_hosts::learn_known_hosts_path(
                 &state.host,
                 state.port,
@@ -248,6 +316,9 @@ pub struct PtyConn {
     host_key: HostKey,
     write: ChannelWriteHalf<Msg>,
     session: Mutex<Option<client::Handle<HostKeyHandler>>>,
+    /// Keeps the jump-host transport (and its direct-tcpip channel) alive for
+    /// as long as the target session exists.
+    _jump_session: Option<client::Handle<HostKeyHandler>>,
 }
 
 /// Read side of an open PTY: owns the receive half, driven by one task.
@@ -264,37 +335,107 @@ impl PtyConn {
             nodelay: true,
             ..Default::default()
         });
-        let handler = HostKeyHandler::new(
+
+        let target_handler = HostKeyHandler::new(
             params.host.clone(),
             params.port,
             params.known_hosts_path.clone(),
+            trusted_fingerprint(&params.trusted_host_keys, &params.host, params.port),
         );
 
-        let connect_result = client::connect(
-            config,
-            (params.host.as_str(), params.port),
-            handler.clone(),
-        )
-        .await;
+        let mut jump_session: Option<client::Handle<HostKeyHandler>> = None;
+
+        let connect_result = if let Some(jump) = &params.jump {
+            let jump_handler = HostKeyHandler::new(
+                jump.host.clone(),
+                jump.port,
+                params.known_hosts_path.clone(),
+                trusted_fingerprint(&params.trusted_host_keys, &jump.host, jump.port),
+            );
+            let mut jump_handle = match client::connect(
+                config.clone(),
+                (jump.host.as_str(), jump.port),
+                jump_handler.clone(),
+            )
+            .await
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let (_, rejection) = jump_handler.snapshot();
+                    return Err(rejection.unwrap_or_else(|| {
+                        SshError::Connect(format!(
+                            "无法连接跳板机 {}:{}：{error}",
+                            jump.host, jump.port
+                        ))
+                    }));
+                }
+            };
+
+            let (_, rejection) = jump_handler.snapshot();
+            if let Some(error) = rejection {
+                return Err(error);
+            }
+
+            authenticate(
+                &mut jump_handle,
+                &jump.username,
+                &jump.host,
+                &jump.credential,
+            )
+            .await
+            .map_err(|error| match error {
+                SshError::Auth { detail, .. } => SshError::Auth {
+                    username: jump.username.clone(),
+                    host: jump.host.clone(),
+                    detail: format!("跳板机认证失败：{detail}"),
+                },
+                other => other,
+            })?;
+
+            let channel = jump_handle
+                .channel_open_direct_tcpip(params.host.clone(), params.port as u32, "127.0.0.1", 0)
+                .await
+                .map_err(|error| {
+                    SshError::Channel(format!(
+                        "无法通过跳板机打开到 {}:{} 的通道：{error}",
+                        params.host, params.port
+                    ))
+                })?;
+            let stream = channel.into_stream();
+            jump_session = Some(jump_handle);
+            client::connect_stream(config.clone(), stream, target_handler.clone()).await
+        } else {
+            client::connect(
+                config.clone(),
+                (params.host.as_str(), params.port),
+                target_handler.clone(),
+            )
+            .await
+        };
 
         let mut session = match connect_result {
             Ok(session) => session,
             Err(error) => {
                 // Prefer the reason we recorded over russh's generic version.
-                let (_, rejection) = handler.snapshot();
+                let (_, rejection) = target_handler.snapshot();
                 return Err(rejection.unwrap_or_else(|| SshError::Connect(error.to_string())));
             }
         };
 
-        let (host_key, rejection) = handler.snapshot();
+        let (host_key, rejection) = target_handler.snapshot();
         if let Some(error) = rejection {
             return Err(error);
         }
-        let host_key = host_key.ok_or_else(|| {
-            SshError::Connect("握手完成但没有收到主机公钥".to_string())
-        })?;
+        let host_key =
+            host_key.ok_or_else(|| SshError::Connect("握手完成但没有收到主机公钥".to_string()))?;
 
-        authenticate(&mut session, &params).await?;
+        authenticate(
+            &mut session,
+            &params.username,
+            &params.host,
+            &params.credential,
+        )
+        .await?;
 
         let channel = session
             .channel_open_session()
@@ -303,15 +444,7 @@ impl PtyConn {
         let (read, write) = channel.split();
 
         write
-            .request_pty(
-                false,
-                &params.term,
-                params.cols,
-                params.rows,
-                0,
-                0,
-                &[],
-            )
+            .request_pty(false, &params.term, params.cols, params.rows, 0, 0, &[])
             .await
             .map_err(|error| SshError::Channel(error.to_string()))?;
         write
@@ -324,6 +457,7 @@ impl PtyConn {
                 host_key,
                 write,
                 session: Mutex::new(Some(session)),
+                _jump_session: jump_session,
             },
             PtyReader { read },
         ))
@@ -391,9 +525,7 @@ impl PtyReader {
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => return PtyEvent::Exit(exit_status),
                 Some(ChannelMsg::ExitSignal { .. }) => return PtyEvent::Exit(1),
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                    return PtyEvent::Closed
-                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => return PtyEvent::Closed,
                 Some(_) => continue,
             }
         }
@@ -402,36 +534,45 @@ impl PtyReader {
 
 async fn authenticate(
     session: &mut client::Handle<HostKeyHandler>,
-    params: &ConnectParams,
+    username: &str,
+    host: &str,
+    credential: &Credential,
 ) -> Result<(), SshError> {
     let auth_failed = |detail: String| SshError::Auth {
-        username: params.username.clone(),
-        host: params.host.clone(),
+        username: username.to_string(),
+        host: host.to_string(),
         detail,
     };
 
-    let result = match &params.credential {
+    let result = match credential {
         Credential::Password(password) => session
-            .authenticate_password(params.username.clone(), password.clone())
+            .authenticate_password(username.to_string(), password.clone())
             .await
             .map_err(|error| auth_failed(error.to_string()))?,
         Credential::PrivateKey { path, passphrase } => {
-            let key = rkeys::load_secret_key(path, passphrase.as_deref()).map_err(|error| {
-                SshError::KeyFile(format!("{}: {error}", path.display()))
-            })?;
+            let key = rkeys::load_secret_key(path, passphrase.as_deref())
+                .map_err(|error| SshError::KeyFile(format!("{}: {error}", path.display())))?;
+            // RSA keys need a modern rsa-sha2-* signature; otherwise newer
+            // servers reject the legacy ssh-rsa (SHA-1) algorithm.
+            let hash_alg = if matches!(key.public_key().algorithm(), ssh_key::Algorithm::Rsa { .. })
+            {
+                session
+                    .best_supported_rsa_hash()
+                    .await
+                    .map_err(|error| auth_failed(format!("查询 RSA 签名算法失败：{error}")))?
+                    .flatten()
+            } else {
+                None
+            };
             session
                 .authenticate_publickey(
-                    params.username.clone(),
-                    PrivateKeyWithHashAlg::new(Arc::new(key), None),
+                    username.to_string(),
+                    PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
                 )
                 .await
                 .map_err(|error| auth_failed(error.to_string()))?
         }
-        Credential::Agent => {
-            return Err(SshError::Unsupported(
-                "SSH Agent 认证尚未接入，请先用口令或私钥文件".to_string(),
-            ))
-        }
+        Credential::Agent => return authenticate_agent(session, username, host).await,
     };
 
     if result.success() {
@@ -441,6 +582,181 @@ async fn authenticate(
             "服务器拒绝了该凭据（口令/私钥错误，或该用户不允许此认证方式）".to_string(),
         ))
     }
+}
+
+/// A boxed agent client so the named-pipe, Pageant and Unix-socket transports
+/// can share one authentication routine.
+type DynAgent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
+
+#[cfg(windows)]
+async fn connect_agent() -> Result<DynAgent, SshError> {
+    let pipe_error = match AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+        Ok(agent) => return Ok(agent.dynamic()),
+        Err(error) => error.to_string(),
+    };
+    match AgentClient::connect_pageant().await {
+        Ok(agent) => Ok(agent.dynamic()),
+        Err(error) => Err(SshError::Unsupported(format!(
+            "未检测到可用的 SSH Agent（OpenSSH Agent: {pipe_error}；Pageant: {error}）。\
+             请启动 Windows OpenSSH Authentication Agent 服务，或改用密码/私钥认证。"
+        ))),
+    }
+}
+
+#[cfg(unix)]
+async fn connect_agent() -> Result<DynAgent, SshError> {
+    match AgentClient::connect_env().await {
+        Ok(agent) => Ok(agent.dynamic()),
+        Err(error) => Err(SshError::Unsupported(format!(
+            "未检测到可用的 SSH Agent（SSH_AUTH_SOCK）：{error}。请启动 ssh-agent 或改用密码/私钥认证。"
+        ))),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn connect_agent() -> Result<DynAgent, SshError> {
+    Err(SshError::Unsupported(
+        "当前平台不支持 SSH Agent 认证".into(),
+    ))
+}
+
+async fn authenticate_agent(
+    session: &mut client::Handle<HostKeyHandler>,
+    username: &str,
+    host: &str,
+) -> Result<(), SshError> {
+    let auth_failed = |detail: String| SshError::Auth {
+        username: username.to_string(),
+        host: host.to_string(),
+        detail,
+    };
+
+    let mut agent = connect_agent().await?;
+
+    // OpenSSH agents with destination constraints need the session binding
+    // before they reveal or use keys. Older agents simply reject the extension,
+    // which is fine.
+    if let Some(binding) = session.agent_session_binding().cloned() {
+        let _ = agent.bind_session(&binding, false).await;
+    }
+
+    let identities = agent
+        .request_identities()
+        .await
+        .map_err(|error| auth_failed(format!("SSH Agent 读取身份失败：{error}")))?;
+    if identities.is_empty() {
+        return Err(auth_failed("SSH Agent 中没有可用身份".to_string()));
+    }
+
+    let mut last_error = "SSH Agent 中的身份均被服务器拒绝".to_string();
+    for identity in identities {
+        let result = match identity {
+            AgentIdentity::PublicKey { key, .. } => {
+                let hash_alg = if matches!(key.algorithm(), ssh_key::Algorithm::Rsa { .. }) {
+                    session
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(|error| auth_failed(format!("查询 RSA 签名算法失败：{error}")))?
+                        .flatten()
+                } else {
+                    None
+                };
+                session
+                    .authenticate_publickey_with(username.to_string(), key, hash_alg, &mut agent)
+                    .await
+                    .map(|result| result.success())
+                    .map_err(|error| error.to_string())
+            }
+            AgentIdentity::Certificate { certificate, .. } => {
+                let hash_alg = if matches!(
+                    certificate.public_key().algorithm(),
+                    ssh_key::Algorithm::Rsa { .. }
+                ) {
+                    session
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(|error| auth_failed(format!("查询 RSA 签名算法失败：{error}")))?
+                        .flatten()
+                } else {
+                    None
+                };
+                session
+                    .authenticate_certificate_with(
+                        username.to_string(),
+                        certificate,
+                        hash_alg,
+                        &mut agent,
+                    )
+                    .await
+                    .map(|result| result.success())
+                    .map_err(|error| error.to_string())
+            }
+        };
+
+        match result {
+            Ok(true) => return Ok(()),
+            Ok(false) => {
+                last_error = "SSH Agent 中的身份被服务器拒绝".to_string();
+            }
+            Err(error) => last_error = format!("SSH Agent 签名失败：{error}"),
+        }
+    }
+
+    Err(auth_failed(last_error))
+}
+
+/// Remove the stored key for `host:port` from ShellX's own known_hosts file.
+///
+/// Used by the "host key changed" UI so the user can forget an old key and
+/// reconnect deliberately. Hashed entries written by OpenSSH are left alone.
+pub fn forget_known_host(known_hosts_path: &Path, host: &str, port: u16) -> Result<bool, String> {
+    let content = match fs::read_to_string(known_hosts_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("读取 known_hosts 失败：{error}")),
+    };
+
+    let port22 = port == 22;
+    let bracketed = format!("[{host}]:{port}");
+    let mut removed = 0usize;
+    let mut kept = String::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            kept.push_str(line);
+            kept.push('\n');
+            continue;
+        }
+        let Some(patterns) = trimmed.split_whitespace().next() else {
+            continue;
+        };
+        let matches_host = patterns.split(',').any(|pattern| {
+            if pattern.starts_with("|1|") {
+                // Hashed OpenSSH entries cannot be matched without the salt
+                // hash; leave them untouched rather than risk deleting others.
+                return false;
+            }
+            let candidate = if port22 { host } else { bracketed.as_str() };
+            pattern.eq_ignore_ascii_case(candidate)
+        });
+        if matches_host {
+            removed += 1;
+        } else {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+
+    if removed == 0 {
+        return Ok(false);
+    }
+
+    let temp = known_hosts_path.with_extension("known_hosts.tmp");
+    fs::write(&temp, kept).map_err(|error| format!("写入 known_hosts 失败：{error}"))?;
+    fs::rename(&temp, known_hosts_path)
+        .map_err(|error| format!("替换 known_hosts 失败：{error}"))?;
+    Ok(true)
 }
 
 fn parse_signal(name: &str) -> Result<Sig, SshError> {
@@ -484,14 +800,18 @@ mod tests {
 
     #[test]
     fn signals_are_parsed_in_both_spellings() {
-        assert_eq!(parse_signal("INT").unwrap(), Sig::INT);
-        assert_eq!(parse_signal("sigterm").unwrap(), Sig::TERM);
-        assert_eq!(parse_signal("9").unwrap(), Sig::KILL);
+        // `russh::Sig` does not implement PartialEq; compare its Debug form.
+        assert_eq!(format!("{:?}", parse_signal("INT").unwrap()), "INT");
+        assert_eq!(format!("{:?}", parse_signal("sigterm").unwrap()), "TERM");
+        assert_eq!(format!("{:?}", parse_signal("9").unwrap()), "KILL");
         // Not in the RFC 4254 enumeration: forwarded as a custom name.
-        assert_eq!(parse_signal("USR2").unwrap(), Sig::Custom("USR2".to_string()));
         assert_eq!(
-            parse_signal("sigstop").unwrap(),
-            Sig::Custom("STOP".to_string())
+            format!("{:?}", parse_signal("USR2").unwrap()),
+            "Custom(\"USR2\")"
+        );
+        assert_eq!(
+            format!("{:?}", parse_signal("sigstop").unwrap()),
+            "Custom(\"STOP\")"
         );
     }
 
@@ -500,6 +820,7 @@ mod tests {
         let error = SshError::HostKeyChanged {
             host: "example.com".into(),
             port: 22,
+            algorithm: "ssh-ed25519".into(),
             fingerprint: "SHA256:abc".into(),
             detail: "key changed at line 3".into(),
         };
@@ -514,5 +835,57 @@ mod tests {
         assert_eq!(params.cols, 80);
         assert_eq!(params.rows, 24);
         assert_eq!(params.term, DEFAULT_TERM);
+        assert!(params.jump.is_none());
+        assert!(params.trusted_host_keys.is_empty());
+    }
+
+    #[test]
+    fn trusted_fingerprint_is_scoped_by_host_and_port() {
+        let trusted = vec![HostKeyTrust {
+            host: "example.com".into(),
+            port: 22,
+            fingerprint: "SHA256:abc".into(),
+        }];
+        assert_eq!(
+            trusted_fingerprint(&trusted, "EXAMPLE.com", 22).as_deref(),
+            Some("SHA256:abc")
+        );
+        assert!(trusted_fingerprint(&trusted, "example.com", 2222).is_none());
+        assert!(trusted_fingerprint(&trusted, "other.com", 22).is_none());
+    }
+
+    #[test]
+    fn forget_known_host_removes_only_the_requested_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "shellx-known-hosts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        std::fs::write(
+            &path,
+            "example.com ssh-ed25519 AAAA\n\
+             [example.com]:2222 ssh-rsa BBBB\n\
+             other.com ssh-ed25519 CCCC\n",
+        )
+        .unwrap();
+
+        assert!(forget_known_host(&path, "example.com", 22).unwrap());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("AAAA"));
+        assert!(content.contains("BBBB"));
+        assert!(content.contains("CCCC"));
+
+        assert!(forget_known_host(&path, "example.com", 2222).unwrap());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("BBBB"));
+        assert!(content.contains("CCCC"));
+        assert!(!forget_known_host(&path, "example.com", 22).unwrap());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

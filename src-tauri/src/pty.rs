@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use tokio::runtime::{Builder, Runtime};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use crate::encoding::base64_encode;
@@ -25,6 +25,9 @@ use crate::ssh::{ConnectParams, HostKey, PtyConn, PtyEvent, SshError};
 pub const EVENT_OUTPUT: &str = "pty:output";
 pub const EVENT_EXIT: &str = "pty:exit";
 pub const EVENT_CLOSED: &str = "pty:closed";
+
+/// How long a TCP connect + handshake + auth may take before we give up.
+pub const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,15 +60,87 @@ pub struct PtyOpened {
     pub host_key: HostKey,
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMeta {
+    pub connection_id: String,
+    pub connection_alias: String,
+}
+
+/// The fingerprint dialog needs structured data, not a formatted error string.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostKeyPrompt {
+    pub host: String,
+    pub port: u16,
+    pub algorithm: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyOpenError {
+    /// `host_key_unknown`, `host_key_changed` or `other`.
+    pub kind: String,
+    pub message: String,
+    pub host_key: Option<HostKeyPrompt>,
+}
+
+impl PtyOpenError {
+    pub fn from_ssh(error: &SshError) -> Self {
+        match error {
+            SshError::HostKeyUnknown {
+                host,
+                port,
+                algorithm,
+                fingerprint,
+            } => Self {
+                kind: "host_key_unknown".into(),
+                message: error.to_string(),
+                host_key: Some(HostKeyPrompt {
+                    host: host.clone(),
+                    port: *port,
+                    algorithm: algorithm.clone(),
+                    fingerprint: fingerprint.clone(),
+                }),
+            },
+            SshError::HostKeyChanged {
+                host,
+                port,
+                algorithm,
+                fingerprint,
+                ..
+            } => Self {
+                kind: "host_key_changed".into(),
+                message: error.to_string(),
+                host_key: Some(HostKeyPrompt {
+                    host: host.clone(),
+                    port: *port,
+                    algorithm: algorithm.clone(),
+                    fingerprint: fingerprint.clone(),
+                }),
+            },
+            other => Self {
+                kind: "other".into(),
+                message: other.to_string(),
+                host_key: None,
+            },
+        }
+    }
+}
+
 struct PtyEntry {
     conn: Arc<PtyConn>,
     task: JoinHandle<()>,
+    meta: SessionMeta,
 }
 
-/// Holds every live PTY session.
+/// Holds every live PTY session and the in-flight connection attempts that can
+/// still be cancelled from the UI.
 #[derive(Default)]
 pub struct PtyManager {
     entries: Mutex<HashMap<String, PtyEntry>>,
+    cancellations: Mutex<HashMap<String, Arc<Notify>>>,
 }
 
 impl PtyManager {
@@ -77,6 +152,7 @@ impl PtyManager {
         self.entries.lock().map(|guard| guard.len()).unwrap_or(0)
     }
 
+    #[allow(dead_code)] // kept for the verification harness and future session UI
     pub fn is_open(&self, session_id: &str) -> bool {
         self.entries
             .lock()
@@ -84,20 +160,68 @@ impl PtyManager {
             .unwrap_or(false)
     }
 
+    /// Register an in-flight connection so `pty_cancel` can abort it.
+    pub fn register_cancel(&self, request_id: &str) -> Result<Arc<Notify>, String> {
+        let notify = Arc::new(Notify::new());
+        lock(&self.cancellations)?.insert(request_id.to_string(), notify.clone());
+        Ok(notify)
+    }
+
+    /// Returns `true` when a matching in-flight attempt was signalled.
+    pub fn cancel(&self, request_id: &str) -> bool {
+        let notify = self
+            .cancellations
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(request_id));
+        if let Some(notify) = notify {
+            // notify_one stores a permit when nobody is waiting yet, so a
+            // cancel racing with the start of the connect still takes effect.
+            notify.notify_one();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_cancel(&self, request_id: &str) {
+        if let Ok(mut guard) = self.cancellations.lock() {
+            guard.remove(request_id);
+        }
+    }
+
     /// Connect, open the shell and start pumping output to the frontend.
     pub async fn open(
         &self,
         app: AppHandle,
         session_id: String,
+        meta: SessionMeta,
         params: ConnectParams,
-    ) -> Result<HostKey, String> {
-        let (conn, mut reader) = run(async move { PtyConn::open(params).await }).await?;
+        cancel: Arc<Notify>,
+    ) -> Result<HostKey, SshError> {
+        let (conn, mut reader) = run_ssh(async move {
+            tokio::select! {
+                result = tokio::time::timeout(OPEN_TIMEOUT, PtyConn::open(params)) => {
+                    match result {
+                        Ok(result) => result,
+                        Err(_) => Err(SshError::Connect(format!(
+                            "连接超时（{} 秒），已中止",
+                            OPEN_TIMEOUT.as_secs()
+                        ))),
+                    }
+                }
+                _ = cancel.notified() => Err(SshError::Connect("连接已取消".into())),
+            }
+        })
+        .await?;
+
         let conn = Arc::new(conn);
         let host_key = conn.host_key().clone();
 
         let pump_id = session_id.clone();
         let pump_app = app.clone();
-        let task = runtime()?.spawn(async move {
+        let runtime = runtime().map_err(SshError::Connect)?;
+        let task = runtime.spawn(async move {
             loop {
                 match reader.next_event().await {
                     PtyEvent::Data(bytes) => {
@@ -133,8 +257,8 @@ impl PtyManager {
             }
         });
 
-        let mut entries = lock(&self.entries)?;
-        if let Some(previous) = entries.insert(session_id, PtyEntry { conn, task }) {
+        let mut entries = lock(&self.entries).map_err(SshError::Connect)?;
+        if let Some(previous) = entries.insert(session_id, PtyEntry { conn, task, meta }) {
             previous.task.abort();
         }
         Ok(host_key)
@@ -155,11 +279,11 @@ impl PtyManager {
         run(async move { conn.signal(&signal).await }).await
     }
 
-    /// Returns `true` when a session was actually closed.
-    pub async fn close(&self, session_id: &str) -> Result<bool, String> {
+    /// Close a session and return the metadata the caller can audit.
+    pub async fn close(&self, session_id: &str) -> Result<Option<SessionMeta>, String> {
         let entry = lock(&self.entries)?.remove(session_id);
         let Some(entry) = entry else {
-            return Ok(false);
+            return Ok(None);
         };
         let conn = entry.conn.clone();
         let _ = run(async move {
@@ -168,26 +292,28 @@ impl PtyManager {
         })
         .await;
         entry.task.abort();
-        Ok(true)
+        Ok(Some(entry.meta))
     }
 
-    /// Close everything on window close / app exit.
-    pub async fn close_all(&self) -> Result<usize, String> {
-        let drained: Vec<(String, PtyEntry)> = {
-            let mut guard = lock(&self.entries)?;
-            guard.drain().collect()
-        };
+    /// Close everything on app exit. Synchronous: the process is going away and
+    /// there is no runtime left to await on.
+    pub fn shutdown(&self) -> usize {
+        let drained: Vec<(String, PtyEntry)> = self
+            .entries
+            .lock()
+            .map(|mut guard| guard.drain().collect())
+            .unwrap_or_default();
         let count = drained.len();
         for (_, entry) in drained {
-            let conn = entry.conn.clone();
-            let _ = run(async move {
-                conn.close().await;
-                Ok::<(), SshError>(())
-            })
-            .await;
             entry.task.abort();
+            drop(entry.conn);
         }
-        Ok(count)
+        if let Ok(mut guard) = self.cancellations.lock() {
+            for notify in guard.drain().map(|(_, notify)| notify) {
+                notify.notify_one();
+            }
+        }
+        count
     }
 
     fn conn(&self, session_id: &str) -> Result<Arc<PtyConn>, String> {
@@ -207,9 +333,7 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, String> {
 /// The process-wide PTY runtime, leaked so it outlives every session.
 fn runtime() -> Result<&'static Runtime, String> {
     static CELL: Mutex<Option<&'static Runtime>> = Mutex::new(None);
-    let mut guard = CELL
-        .lock()
-        .map_err(|_| "PTY 运行时锁不可用".to_string())?;
+    let mut guard = CELL.lock().map_err(|_| "PTY 运行时锁不可用".to_string())?;
     if let Some(existing) = *guard {
         return Ok(existing);
     }
@@ -225,28 +349,31 @@ fn runtime() -> Result<&'static Runtime, String> {
     Ok(created)
 }
 
-/// Run one `russh` operation on the PTY runtime and wait for its result.
-///
-/// Everything that touches the network goes through here, so the Tauri
-/// command handlers never block the UI thread and never need `block_on`
-/// inside an async context.
-async fn run<T, F>(future: F) -> Result<T, String>
+/// Run one `russh` operation on the PTY runtime and preserve its typed error.
+async fn run_ssh<T, F>(future: F) -> Result<T, SshError>
 where
     F: std::future::Future<Output = Result<T, SshError>> + Send + 'static,
     T: Send + 'static,
 {
     let (sender, receiver) = oneshot::channel();
-    runtime()?.spawn(async move {
+    let runtime = runtime().map_err(SshError::Connect)?;
+    runtime.spawn(async move {
         let _ = sender.send(future.await);
     });
     match receiver.await {
-        Ok(result) => result.map_err(|error| error.to_string()),
-        Err(_) => Err("PTY 后台任务已退出".to_string()),
+        Ok(result) => result,
+        Err(_) => Err(SshError::Connect("PTY 后台任务已退出".into())),
     }
 }
 
-/// How long the UI waits for a socket close before giving up.
-pub const CLOSE_GRACE: Duration = Duration::from_secs(2);
+/// String-flavoured wrapper for commands that do not need structured errors.
+async fn run<T, F>(future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, SshError>> + Send + 'static,
+    T: Send + 'static,
+{
+    run_ssh(future).await.map_err(|error| error.to_string())
+}
 
 #[cfg(test)]
 mod tests {
@@ -262,13 +389,48 @@ mod tests {
     #[test]
     fn unknown_session_reports_a_readable_error() {
         let manager = PtyManager::new();
-        let error = manager.conn("missing").unwrap_err();
+        let error = manager.conn("missing").err().unwrap();
         assert!(error.contains("missing"));
     }
 
     #[tokio::test]
     async fn closing_an_unknown_session_is_not_an_error() {
         let manager = PtyManager::new();
-        assert!(!manager.close("ghost").await.unwrap());
+        assert!(manager.close("ghost").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_consumed_once() {
+        let manager = PtyManager::new();
+        let notify = manager.register_cancel("request-1").unwrap();
+        let waiter = notify.notified();
+        assert!(manager.cancel("request-1"));
+        waiter.await;
+        assert!(!manager.cancel("request-1"));
+        manager.clear_cancel("request-1");
+    }
+
+    #[test]
+    fn shutdown_drains_sessions_and_cancellations() {
+        let manager = PtyManager::new();
+        manager.register_cancel("pending-1").unwrap();
+        assert_eq!(manager.shutdown(), 0);
+        assert!(!manager.cancel("pending-1"));
+    }
+
+    #[test]
+    fn host_key_unknown_error_carries_the_fingerprint() {
+        let error = SshError::HostKeyUnknown {
+            host: "example.com".into(),
+            port: 22,
+            algorithm: "ssh-ed25519".into(),
+            fingerprint: "SHA256:abc".into(),
+        };
+        let open_error = PtyOpenError::from_ssh(&error);
+        assert_eq!(open_error.kind, "host_key_unknown");
+        let prompt = open_error.host_key.expect("prompt payload");
+        assert_eq!(prompt.host, "example.com");
+        assert_eq!(prompt.port, 22);
+        assert_eq!(prompt.fingerprint, "SHA256:abc");
     }
 }

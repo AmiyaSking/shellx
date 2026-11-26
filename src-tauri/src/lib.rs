@@ -19,7 +19,7 @@ use state::AppState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let state = AppState::load(data_dir)?;
@@ -39,13 +39,21 @@ pub fn run() {
             commands::close_session,
             commands::mcp_server_info,
             commands::pty_open,
+            commands::pty_cancel,
             commands::pty_write,
             commands::pty_resize,
             commands::pty_signal,
             commands::pty_close,
             commands::pty_close_all,
             commands::pty_active_sessions,
+            commands::forget_host_key,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running ShellX");
+        .build(tauri::generate_context!())
+        .expect("error while building ShellX");
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            app_handle.state::<pty::PtyManager>().shutdown();
+        }
+    });
 }

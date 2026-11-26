@@ -29,6 +29,7 @@ interface FormState {
   authKind: AuthKind;
   privateKeyPath: string;
   password: string;
+  passphrase: string;
   mcpAccess: McpAccessMode;
   jumpHost: string;
   remark: string;
@@ -46,6 +47,7 @@ function initialForm(connection: Connection | null): FormState {
     authKind: connection?.auth.kind ?? "agent",
     privateKeyPath: connection?.auth.privateKeyPath ?? "",
     password: "",
+    passphrase: "",
     mcpAccess: connection?.mcpAccess ?? "disabled",
     jumpHost: connection?.jumpHost ?? "",
     remark: connection?.remark ?? "",
@@ -112,6 +114,7 @@ export default function ConnectionModal({
         jumpHost: form.jumpHost || null,
         remark: form.remark.trim(),
         password: form.password || null,
+        passphrase: form.passphrase || null,
       });
     } finally {
       setSaving(false);
@@ -124,7 +127,10 @@ export default function ConnectionModal({
         <div className="modal-head">
           <div>
             <h2>{mode === "create" ? "新建连接" : "编辑连接"}</h2>
-            <p className="muted">凭据不会写入连接配置文件；脚手架阶段仅保存在内存中。</p>
+            <p className="muted">
+              凭据写入系统凭据存储（Windows Credential Manager / macOS Keychain），
+              不会出现在 connections.json 中。
+            </p>
           </div>
           <button className="icon-btn" onClick={onClose} aria-label="关闭">
             ×
@@ -218,15 +224,31 @@ export default function ConnectionModal({
               </select>
             </label>
 
+            {form.authKind === "agent" && (
+              <p className="muted small span-2">
+                Agent 模式使用本机 OpenSSH Agent 或 Pageant；若未运行，请改用密码或私钥。
+              </p>
+            )}
             {form.authKind === "private_key" && (
-              <label>
-                <span>私钥路径</span>
-                <input
-                  value={form.privateKeyPath}
-                  onChange={(event) => set("privateKeyPath", event.target.value)}
-                  placeholder="~/.ssh/id_ed25519"
-                />
-              </label>
+              <>
+                <label>
+                  <span>私钥路径</span>
+                  <input
+                    value={form.privateKeyPath}
+                    onChange={(event) => set("privateKeyPath", event.target.value)}
+                    placeholder="~/.ssh/id_ed25519"
+                  />
+                </label>
+                <label>
+                  <span>私钥口令（可选）</span>
+                  <input
+                    type="password"
+                    value={form.passphrase}
+                    onChange={(event) => set("passphrase", event.target.value)}
+                    placeholder="留空表示私钥未加密或沿用已保存口令"
+                  />
+                </label>
+              </>
             )}
             {form.authKind === "password" && (
               <label>
@@ -235,7 +257,7 @@ export default function ConnectionModal({
                   type="password"
                   value={form.password}
                   onChange={(event) => set("password", event.target.value)}
-                  placeholder="仅保存在内存（脚手架）"
+                  placeholder="保存到系统凭据存储"
                 />
               </label>
             )}

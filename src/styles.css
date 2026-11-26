@@ -704,8 +704,48 @@ pre {
   background: #f87171;
 }
 
+/* ---------- host key confirmation ---------- */
+
+.hostkey-modal {
+  width: min(620px, 94vw);
+  padding: 18px 20px 0;
+}
+
+.hostkey-modal .modal-head {
+  padding: 0 0 12px;
+}
+
+.hostkey-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 14px;
+}
+
+.hostkey-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12px;
+}
+
+.hostkey-row code {
+  color: var(--text);
+}
+
+.hostkey-fingerprint {
+  margin-top: 6px;
+  color: #a7f3d0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .pty-error-banner {
   flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   margin: 8px 12px 0;
   padding: 8px 12px;
   border-radius: var(--radius);

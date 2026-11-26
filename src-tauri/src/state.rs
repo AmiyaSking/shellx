@@ -10,13 +10,13 @@ use crate::connections::ConnectionStore;
 use crate::mcp;
 use crate::models::{
     ApprovalDecision, ApprovalRequest, AuditEntry, AuditSource, AuthKind, CommandOutcome,
-    CommandRequest, CommandResult, Connection, ConnectionInput, McpServerInfo, PolicyAction,
-    PolicyDecision, RiskLevel, SessionInfo,
+    CommandRequest, CommandResult, Connection, ConnectionInput, HostKeyTrust, McpServerInfo,
+    PolicyAction, PolicyDecision, RiskLevel, SessionInfo,
 };
 use crate::policy::PolicyEngine;
 use crate::redaction::Redactor;
 use crate::sessions::SessionManager;
-use crate::ssh::{self, ConnectParams, Credential};
+use crate::ssh::{self, ConnectParams, Credential, JumpHost};
 use crate::vault::SecretVault;
 
 struct PendingApproval {
@@ -49,7 +49,7 @@ impl AppState {
             connections: Mutex::new(ConnectionStore::load(&data_dir)),
             sessions: Mutex::new(SessionManager::default()),
             approvals: Mutex::new(HashMap::new()),
-            vault: SecretVault::default(),
+            vault: SecretVault::new(),
             audit: AuditLogger::new(&data_dir),
             policy: PolicyEngine,
             redactor: Redactor::new(),
@@ -74,13 +74,23 @@ impl AppState {
 
     pub fn save_connection(&self, input: ConnectionInput) -> Result<Connection, String> {
         let password = input.password.clone();
+        let passphrase = input.passphrase.clone();
         let connection = {
             let mut store = lock(&self.connections)?;
             store.upsert(input)?
         };
         if let Some(secret) = password {
             if !secret.is_empty() {
-                self.vault.set(vault_key(&connection.id), secret);
+                if let Err(error) = self.vault.set(&vault_key(&connection.id), &secret) {
+                    eprintln!("[shellx] 口令未能写入系统凭据存储：{error}");
+                }
+            }
+        }
+        if let Some(secret) = passphrase {
+            if !secret.is_empty() {
+                if let Err(error) = self.vault.set(&passphrase_key(&connection.id), &secret) {
+                    eprintln!("[shellx] 私钥口令未能写入系统凭据存储：{error}");
+                }
             }
         }
         Ok(connection)
@@ -89,8 +99,26 @@ impl AppState {
     pub fn delete_connection(&self, id: &str) -> Result<(), String> {
         lock(&self.connections)?.remove(id)?;
         self.vault.remove(&vault_key(id));
+        self.vault.remove(&passphrase_key(id));
         lock(&self.sessions)?.close_for_connection(id);
         Ok(())
+    }
+
+    /// Record a connection lifecycle event in the audit log. Interactive PTY
+    /// input is not captured, but connect/disconnect/failure are.
+    pub fn record_pty_event(&self, connection_id: Option<&str>, detail: impl Into<String>) {
+        let connection = connection_id.and_then(|id| self.get_connection(id).ok());
+        let _ = self.audit.log(make_audit(
+            AuditSource::User,
+            connection.as_ref(),
+            None,
+            None,
+            PolicyAction::Allow,
+            None,
+            None,
+            None,
+            detail,
+        ));
     }
 
     pub fn preview_command(
@@ -297,27 +325,27 @@ impl AppState {
         connection_id: &str,
         cols: u32,
         rows: u32,
+        trusted_host_keys: Vec<HostKeyTrust>,
     ) -> Result<(String, ConnectParams), String> {
         let connection = self.get_connection(connection_id)?;
-        let credential = match connection.auth.kind {
-            AuthKind::Password => {
-                let secret = self.vault.get(&vault_key(&connection.id)).ok_or_else(|| {
-                    "该连接还没有保存口令（凭据只存在内存里，重启后需要重新填写）".to_string()
-                })?;
-                Credential::Password(secret)
-            }
-            AuthKind::PrivateKey => {
-                let path = connection
-                    .auth
-                    .private_key_path
-                    .clone()
-                    .ok_or_else(|| "该连接未配置私钥文件路径".to_string())?;
-                Credential::PrivateKey {
-                    path: PathBuf::from(path),
-                    passphrase: self.vault.get(&passphrase_key(&connection.id)),
+        let credential = self.credential_for(&connection)?;
+
+        let jump = match connection.jump_host.as_deref() {
+            Some(jump_id) => {
+                let jump = self
+                    .get_connection(jump_id)
+                    .map_err(|_| "连接配置的跳板机不存在".to_string())?;
+                if jump.jump_host.is_some() {
+                    return Err("暂不支持多级跳板机（跳板机本身又配置了跳板机）".into());
                 }
+                Some(JumpHost {
+                    host: jump.host.clone(),
+                    port: jump.port,
+                    username: jump.username.clone(),
+                    credential: self.credential_for(&jump)?,
+                })
             }
-            AuthKind::Agent => Credential::Agent,
+            None => None,
         };
 
         Ok((
@@ -327,12 +355,44 @@ impl AppState {
                 port: connection.port,
                 username: connection.username.clone(),
                 credential,
+                jump,
+                trusted_host_keys,
                 known_hosts_path: self.known_hosts_path(),
                 term: ssh::DEFAULT_TERM.to_string(),
                 cols: cols.max(1),
                 rows: rows.max(1),
             },
         ))
+    }
+
+    fn credential_for(&self, connection: &Connection) -> Result<Credential, String> {
+        match connection.auth.kind {
+            AuthKind::Password => {
+                let secret = self.vault.get(&vault_key(&connection.id)).ok_or_else(|| {
+                    format!(
+                        "连接「{}」还没有保存口令，请编辑连接填写密码（会存入系统凭据存储）",
+                        connection.alias
+                    )
+                })?;
+                Ok(Credential::Password(secret))
+            }
+            AuthKind::PrivateKey => {
+                let configured = connection
+                    .auth
+                    .private_key_path
+                    .clone()
+                    .ok_or_else(|| "该连接未配置私钥文件路径".to_string())?;
+                let path = expand_home(&configured);
+                if !path.is_file() {
+                    return Err(format!("私钥文件不存在：{}", path.display()));
+                }
+                Ok(Credential::PrivateKey {
+                    path,
+                    passphrase: self.vault.get(&passphrase_key(&connection.id)),
+                })
+            }
+            AuthKind::Agent => Ok(Credential::Agent),
+        }
     }
 
     fn get_connection(&self, id: &str) -> Result<Connection, String> {
@@ -410,6 +470,31 @@ fn passphrase_key(connection_id: &str) -> String {
     format!("connection:{connection_id}:passphrase")
 }
 
+/// Expand `~`, `~/...` and `~\...` using the current user's home directory.
+/// Other paths are returned unchanged.
+fn expand_home(path: &str) -> PathBuf {
+    let rest = if path == "~" {
+        Some("")
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        Some(rest)
+    } else if let Some(rest) = path.strip_prefix("~\\") {
+        Some(rest)
+    } else {
+        None
+    };
+    let Some(rest) = rest else {
+        return PathBuf::from(path);
+    };
+    let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else {
+        return PathBuf::from(path);
+    };
+    if rest.is_empty() {
+        PathBuf::from(home)
+    } else {
+        PathBuf::from(home).join(rest)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn make_audit(
     source: AuditSource,
@@ -465,10 +550,7 @@ fn simulate_command(connection: &Connection, command: &str) -> (String, i32) {
     } else if lower.starts_with("systemctl status") {
         format!(
             "● {}.service - simulated\n     Loaded: loaded\n     Active: active (running)",
-            lower
-                .split_whitespace()
-                .nth(2)
-                .unwrap_or("unknown")
+            lower.split_whitespace().nth(2).unwrap_or("unknown")
         )
     } else {
         format!(

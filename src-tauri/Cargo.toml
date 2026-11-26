@@ -24,6 +24,10 @@ regex = "1"
 # `ring` instead of the default `aws-lc-rs`: aws-lc-sys needs NASM at build time.
 russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+# Passwords and key passphrases go to the OS credential store, never to disk.
+# Linux uses the kernel keyring here; a Secret Service backend can be enabled
+# later without changing the vault API.
+keyring = { version = "3.6", default-features = false, features = ["windows-native", "apple-native", "linux-native"] }
 
 [profile.release]
 codegen-units = 1

@@ -43,6 +43,7 @@ export interface ConnectionInput {
   jumpHost?: string | null;
   remark: string;
   password?: string | null;
+  passphrase?: string | null;
 }
 
 export type AuditSource = "user" | "agent" | "system";
@@ -160,6 +161,27 @@ export interface PtyOpened {
   sessionId: string;
   alias: string;
   hostKey: HostKey;
+}
+
+/** A fingerprint the user confirmed in the first-connect dialog. */
+export interface HostKeyTrust {
+  host: string;
+  port: number;
+  fingerprint: string;
+}
+
+export interface HostKeyPrompt {
+  host: string;
+  port: number;
+  algorithm: string;
+  fingerprint: string;
+}
+
+/** Structured rejection from `pty_open`, so the UI can show a fingerprint dialog. */
+export interface PtyOpenError {
+  kind: "host_key_unknown" | "host_key_changed" | "other";
+  message: string;
+  hostKey?: HostKeyPrompt | null;
 }
 
 /** Payload of the `pty:output` Tauri event (raw bytes, base64). */

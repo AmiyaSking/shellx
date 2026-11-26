@@ -10,11 +10,15 @@ import {
   type CommandOutcome,
   type Connection,
   type HostKey,
+  type HostKeyPrompt,
+  type HostKeyTrust,
   type PtyClosedEvent,
   type PtyExitEvent,
+  type PtyOpenError,
   type PtyOutputEvent,
 } from "../lib/types";
 import ApprovalDialog from "./ApprovalDialog";
+import HostKeyDialog from "./HostKeyDialog";
 
 interface Props {
   connection: Connection;
@@ -34,6 +38,22 @@ const STATUS_LABELS: Record<PtyStatus, string> = {
   error: "连接失败",
 };
 
+function isPtyOpenError(value: unknown): value is PtyOpenError {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "kind" in value &&
+    "message" in value
+  );
+}
+
+function newRequestId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `req_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+}
+
 /** Raw bytes arrive base64-encoded so a split UTF-8 character stays intact. */
 function base64ToBytes(data: string): Uint8Array {
   const binary = atob(data);
@@ -51,6 +71,10 @@ export default function TerminalPane({ connection, active }: Props) {
   const sessionRef = useRef<string | null>(null);
   const connectionRef = useRef(connection);
   const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
+  const trustedHostKeysRef = useRef<HostKeyTrust[]>([]);
+  const retryOpenRef = useRef<() => void>(() => {});
+  const cancelRequestRef = useRef<string | null>(null);
+  const cancelledRef = useRef(false);
 
   // Browser-demo REPL state (kept so `npm run dev` still shows something).
   const inputRef = useRef("");
@@ -62,6 +86,8 @@ export default function TerminalPane({ connection, active }: Props) {
   const [hostKey, setHostKey] = useState<HostKey | null>(null);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
+  const [pendingHostKey, setPendingHostKey] = useState<HostKeyPrompt | null>(null);
+  const [hostKeyIssue, setHostKeyIssue] = useState<HostKeyPrompt | null>(null);
 
   const [agentMode, setAgentMode] = useState(false);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
@@ -213,52 +239,69 @@ export default function TerminalPane({ connection, active }: Props) {
     const writeChunk = (payload: string) => term.write(base64ToBytes(payload));
 
     /* ------------------------- real SSH PTY session ------------------------- */
+    let listenersReady = false;
+    const register = async () => {
+      if (listenersReady) return;
+      listenersReady = true;
+      unlisteners.push(
+        await listen<PtyOutputEvent>("pty:output", ({ payload }) => {
+          if (disposed) return;
+          if (!sessionId) {
+            const queued = early.get(payload.sessionId) ?? [];
+            queued.push(payload.data);
+            early.set(payload.sessionId, queued);
+            return;
+          }
+          if (payload.sessionId !== sessionId) return;
+          writeChunk(payload.data);
+        }),
+      );
+      unlisteners.push(
+        await listen<PtyExitEvent>("pty:exit", ({ payload }) => {
+          if (disposed || payload.sessionId !== sessionId) return;
+          shellExited = true;
+          setStatus("closed");
+          term.write(
+            `\r\n\x1b[38;5;245m[远端 shell 已退出 · code ${payload.exitCode ?? "?"}]\x1b[0m\r\n`,
+          );
+          // Drop the backend entry so active-count and audit stay truthful.
+          void api.ptyClose(payload.sessionId).catch(() => {});
+        }),
+      );
+      unlisteners.push(
+        await listen<PtyClosedEvent>("pty:closed", ({ payload }) => {
+          if (disposed || payload.sessionId !== sessionId) return;
+          if (shellExited) return;
+          setStatus("closed");
+          term.write(`\r\n\x1b[38;5;245m[${payload.reason}]\x1b[0m\r\n`);
+          void api.ptyClose(payload.sessionId).catch(() => {});
+        }),
+      );
+    };
+
     const startPty = async () => {
       setStatus("connecting");
       setErrorText(null);
       setHostKey(null);
-
-      const register = async () => {
-        unlisteners.push(
-          await listen<PtyOutputEvent>("pty:output", ({ payload }) => {
-            if (disposed) return;
-            if (!sessionId) {
-              const queued = early.get(payload.sessionId) ?? [];
-              queued.push(payload.data);
-              early.set(payload.sessionId, queued);
-              return;
-            }
-            if (payload.sessionId !== sessionId) return;
-            writeChunk(payload.data);
-          }),
-        );
-        unlisteners.push(
-          await listen<PtyExitEvent>("pty:exit", ({ payload }) => {
-            if (disposed || payload.sessionId !== sessionId) return;
-            shellExited = true;
-            setStatus("closed");
-            term.write(
-              `\r\n\x1b[38;5;245m[远端 shell 已退出 · code ${payload.exitCode ?? "?"}]\x1b[0m\r\n`,
-            );
-          }),
-        );
-        unlisteners.push(
-          await listen<PtyClosedEvent>("pty:closed", ({ payload }) => {
-            if (disposed || payload.sessionId !== sessionId) return;
-            if (shellExited) return;
-            setStatus("closed");
-            term.write(`\r\n\x1b[38;5;245m[${payload.reason}]\x1b[0m\r\n`);
-          }),
-        );
-      };
+      setHostKeyIssue(null);
+      cancelledRef.current = false;
 
       try {
         await register();
         term.writeln(
           `\x1b[38;5;245m正在连接 ${conn.username}@${conn.host}:${conn.port} …\x1b[0m`,
         );
-        const opened = await api.ptyOpen(conn.id, term.cols, term.rows);
-        if (disposed) {
+        const requestId = newRequestId();
+        cancelRequestRef.current = requestId;
+        const opened = await api.ptyOpen(
+          conn.id,
+          term.cols,
+          term.rows,
+          trustedHostKeysRef.current,
+          requestId,
+        );
+        cancelRequestRef.current = null;
+        if (disposed || cancelledRef.current) {
           void api.ptyClose(opened.sessionId).catch(() => {});
           return;
         }
@@ -272,12 +315,41 @@ export default function TerminalPane({ connection, active }: Props) {
         safeFit();
         term.focus();
       } catch (err) {
+        cancelRequestRef.current = null;
         if (disposed) return;
-        const message = String(err instanceof Error ? err.message : err);
+        if (cancelledRef.current) {
+          cancelledRef.current = false;
+          setStatus("idle");
+          term.writeln("\x1b[33m[连接已取消]\x1b[0m");
+          return;
+        }
+        if (isPtyOpenError(err) && err.kind === "host_key_unknown" && err.hostKey) {
+          setStatus("idle");
+          setPendingHostKey(err.hostKey);
+          term.writeln(
+            `\x1b[33m等待确认主机密钥：${err.hostKey.fingerprint}\x1b[0m`,
+          );
+          return;
+        }
+        if (isPtyOpenError(err) && err.kind === "host_key_changed" && err.hostKey) {
+          setStatus("error");
+          setHostKeyIssue(err.hostKey);
+          setErrorText(err.message);
+          term.writeln(`\x1b[31m✖ ${err.message}\x1b[0m`);
+          return;
+        }
+        const message = isPtyOpenError(err)
+          ? err.message
+          : err instanceof Error
+            ? err.message
+            : String(err);
         setStatus("error");
         setErrorText(message);
         term.writeln(`\x1b[31m✖ ${message}\x1b[0m`);
       }
+    };
+    retryOpenRef.current = () => {
+      void startPty();
     };
 
     /* ------------------------- browser demo REPL ------------------------- */
@@ -375,6 +447,11 @@ export default function TerminalPane({ connection, active }: Props) {
       dataSub.dispose();
       unlisteners.forEach((unlisten) => unlisten());
       unlisteners = [];
+      retryOpenRef.current = () => {};
+      if (cancelRequestRef.current) {
+        void api.ptyCancel(cancelRequestRef.current).catch(() => {});
+        cancelRequestRef.current = null;
+      }
       if (sessionId) void api.ptyClose(sessionId).catch(() => {});
       sessionRef.current = null;
       sizeRef.current = null;
@@ -416,7 +493,59 @@ export default function TerminalPane({ connection, active }: Props) {
 
   const reconnect = () => {
     setApproval(null);
+    setPendingHostKey(null);
+    setHostKeyIssue(null);
+    setErrorText(null);
     setAttempt((value) => value + 1);
+  };
+
+  const cancelConnect = () => {
+    cancelledRef.current = true;
+    const requestId = cancelRequestRef.current;
+    if (requestId) {
+      void api.ptyCancel(requestId).catch(() => {});
+    }
+    setStatus("idle");
+    terminalRef.current?.writeln("\r\n\x1b[33m已请求取消连接…\x1b[0m");
+  };
+
+  const trustPendingHostKey = () => {
+    const prompt = pendingHostKey;
+    if (!prompt) return;
+    const sameHost = (entry: HostKeyTrust) =>
+      entry.host.toLowerCase() === prompt.host.toLowerCase() && entry.port === prompt.port;
+    trustedHostKeysRef.current = [
+      ...trustedHostKeysRef.current.filter((entry) => !sameHost(entry)),
+      { host: prompt.host, port: prompt.port, fingerprint: prompt.fingerprint },
+    ];
+    setPendingHostKey(null);
+    retryOpenRef.current();
+  };
+
+  const dismissPendingHostKey = () => {
+    setPendingHostKey(null);
+    setStatus("idle");
+    terminalRef.current?.writeln("\r\n\x1b[33m已取消连接（未信任该主机密钥）\x1b[0m");
+  };
+
+  const forgetHostKeyAndRetry = async () => {
+    const issue = hostKeyIssue;
+    if (!issue) return;
+    try {
+      await api.forgetHostKey(issue.host, issue.port);
+      trustedHostKeysRef.current = trustedHostKeysRef.current.filter(
+        (entry) =>
+          !(
+            entry.host.toLowerCase() === issue.host.toLowerCase() &&
+            entry.port === issue.port
+          ),
+      );
+      setHostKeyIssue(null);
+      setErrorText(null);
+      retryOpenRef.current();
+    } catch (err) {
+      setErrorText(String(err));
+    }
   };
 
   return (
@@ -441,6 +570,11 @@ export default function TerminalPane({ connection, active }: Props) {
             <span className="muted small" title={`${hostKey.algorithm} ${hostKey.fingerprint}`}>
               {hostKey.known ? "主机密钥已信任" : "首次记录主机密钥"} · {hostKey.fingerprint.slice(0, 22)}…
             </span>
+          )}
+          {PTY_CAPABLE && status === "connecting" && (
+            <button type="button" className="btn btn-ghost btn-sm" onClick={cancelConnect}>
+              取消
+            </button>
           )}
           {PTY_CAPABLE && (status === "error" || status === "closed") && (
             <button type="button" className="btn btn-ghost btn-sm" onClick={reconnect}>
@@ -468,11 +602,28 @@ export default function TerminalPane({ connection, active }: Props) {
 
       {errorText && PTY_CAPABLE && (
         <div className="pty-error-banner" title={errorText}>
-          {errorText}
+          <span>{errorText}</span>
+          {hostKeyIssue && (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm"
+              onClick={() => void forgetHostKeyAndRetry()}
+            >
+              移除该主机密钥并重试
+            </button>
+          )}
         </div>
       )}
 
       <div className="xterm-host" ref={containerRef} />
+
+      {pendingHostKey && (
+        <HostKeyDialog
+          hostKey={pendingHostKey}
+          onTrust={trustPendingHostKey}
+          onCancel={dismissPendingHostKey}
+        />
+      )}
 
       {approval && (
         <ApprovalDialog

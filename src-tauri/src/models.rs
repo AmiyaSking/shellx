@@ -120,10 +120,32 @@ pub struct ConnectionInput {
     pub jump_host: Option<String>,
     #[serde(default)]
     pub remark: String,
-    /// Plaintext secret from the form. Stored in the in-memory vault scaffold,
-    /// never written to disk. TODO(phase-1): move to OS keychain.
+    /// Plaintext secrets from the form. They are written to the OS credential
+    /// store and never persisted in connections.json. An empty value leaves the
+    /// previously saved secret untouched.
     #[serde(default)]
     pub password: Option<String>,
+    #[serde(default)]
+    pub passphrase: Option<String>,
+}
+
+/// A host key the user explicitly confirmed in the fingerprint dialog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostKeyTrust {
+    pub host: String,
+    pub port: u16,
+    pub fingerprint: String,
+}
+
+impl HostKeyTrust {
+    pub fn fingerprint_for(&self, host: &str, port: u16) -> Option<&str> {
+        if self.port == port && self.host.eq_ignore_ascii_case(host) {
+            Some(self.fingerprint.as_str())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
