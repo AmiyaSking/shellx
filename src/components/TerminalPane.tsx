@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Terminal } from "@xterm/xterm";
 import { api, isTauri } from "../lib/api";
 import {
@@ -23,6 +28,29 @@ import HostKeyDialog from "./HostKeyDialog";
 interface Props {
   connection: Connection;
   active: boolean;
+  onTitleChange?: (title: string) => void;
+  onBell?: () => void;
+}
+
+const DEFAULT_FONT_SIZE = 13;
+
+function loadFontSize(): number {
+  try {
+    const saved = Number(window.localStorage.getItem("shellx.fontSize"));
+    if (Number.isFinite(saved) && saved >= 10 && saved <= 24) return saved;
+  } catch {
+    // localStorage is optional; fall through to the default.
+  }
+  return DEFAULT_FONT_SIZE;
+}
+
+function openExternalUrl(uri: string) {
+  if (!/^(https?:\/\/|mailto:)/i.test(uri)) return;
+  if (isTauri()) {
+    void openUrl(uri).catch(() => {});
+  } else {
+    window.open(uri, "_blank", "noopener,noreferrer");
+  }
 }
 
 type PtyStatus = "idle" | "connecting" | "live" | "closed" | "error";
@@ -64,10 +92,19 @@ function base64ToBytes(data: string): Uint8Array {
   return bytes;
 }
 
-export default function TerminalPane({ connection, active }: Props) {
+export default function TerminalPane({
+  connection,
+  active,
+  onTitleChange,
+  onBell,
+}: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const searchAddonRef = useRef<SearchAddon | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const onTitleChangeRef = useRef<Props["onTitleChange"]>(onTitleChange);
+  const onBellRef = useRef<Props["onBell"]>(onBell);
   const sessionRef = useRef<string | null>(null);
   const connectionRef = useRef(connection);
   const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
@@ -88,6 +125,8 @@ export default function TerminalPane({ connection, active }: Props) {
   const [attempt, setAttempt] = useState(0);
   const [pendingHostKey, setPendingHostKey] = useState<HostKeyPrompt | null>(null);
   const [hostKeyIssue, setHostKeyIssue] = useState<HostKeyPrompt | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
 
   const [agentMode, setAgentMode] = useState(false);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
@@ -95,6 +134,48 @@ export default function TerminalPane({ connection, active }: Props) {
   useEffect(() => {
     connectionRef.current = connection;
   }, [connection]);
+
+  useEffect(() => {
+    onTitleChangeRef.current = onTitleChange;
+  }, [onTitleChange]);
+
+  useEffect(() => {
+    onBellRef.current = onBell;
+  }, [onBell]);
+
+  useEffect(() => {
+    if (!searchOpen) return;
+    const timer = window.setTimeout(() => {
+      searchInputRef.current?.focus();
+      searchInputRef.current?.select();
+    }, 20);
+    return () => window.clearTimeout(timer);
+  }, [searchOpen]);
+
+  const findInTerminal = useCallback(
+    (direction: "next" | "previous", value?: string) => {
+      const addon = searchAddonRef.current;
+      if (!addon) return;
+      const query = value ?? searchQuery;
+      if (!query) {
+        addon.clearDecorations();
+        return;
+      }
+      const options = { caseSensitive: false, incremental: true };
+      if (direction === "next") {
+        addon.findNext(query, options);
+      } else {
+        addon.findPrevious(query, options);
+      }
+    },
+    [searchQuery],
+  );
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    searchAddonRef.current?.clearDecorations();
+    terminalRef.current?.focus();
+  }, []);
 
   /* ---------------- browser mock REPL (unchanged behaviour) ---------------- */
 
@@ -178,7 +259,7 @@ export default function TerminalPane({ connection, active }: Props) {
 
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 13,
+      fontSize: loadFontSize(),
       lineHeight: 1.35,
       scrollback: 5000,
       allowProposedApi: true,
@@ -207,6 +288,26 @@ export default function TerminalPane({ connection, active }: Props) {
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
 
+    const searchAddon = new SearchAddon();
+    term.loadAddon(searchAddon);
+    searchAddonRef.current = searchAddon;
+    term.loadAddon(new Unicode11Addon());
+    term.unicode.activeVersion = "11";
+    term.loadAddon(new WebLinksAddon((_event, uri) => openExternalUrl(uri)));
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => webgl.dispose());
+      term.loadAddon(webgl);
+    } catch {
+      // WebGL is optional; xterm falls back to the DOM renderer.
+    }
+
+    const titleSub = term.onTitleChange((title) => {
+      const cleaned = title.trim().slice(0, 80);
+      if (cleaned) onTitleChangeRef.current?.(cleaned);
+    });
+    const bellSub = term.onBell(() => onBellRef.current?.());
+
     const conn = connectionRef.current;
 
     const safeFit = () => {
@@ -222,6 +323,17 @@ export default function TerminalPane({ connection, active }: Props) {
       sizeRef.current = { cols, rows };
       const sessionId = sessionRef.current;
       if (sessionId) void api.ptyResize(sessionId, cols, rows).catch(() => {});
+    };
+
+    const applyFontSize = (size: number) => {
+      const clamped = Math.max(10, Math.min(24, size));
+      term.options.fontSize = clamped;
+      try {
+        window.localStorage.setItem("shellx.fontSize", String(clamped));
+      } catch {
+        // Settings persistence is best-effort.
+      }
+      safeFit();
     };
 
     const raf = requestAnimationFrame(safeFit);
@@ -372,7 +484,30 @@ export default function TerminalPane({ connection, active }: Props) {
     term.attachCustomKeyEventHandler((event) => {
       if (event.type !== "keydown") return true;
       const key = event.key.toLowerCase();
-      if (event.ctrlKey && event.shiftKey && key === "c") {
+      const mod = event.ctrlKey || event.metaKey;
+
+      if (mod && event.shiftKey && key === "f") {
+        event.preventDefault();
+        setSearchOpen(true);
+        return false;
+      }
+      if (mod && event.shiftKey && (key === "+" || key === "=")) {
+        event.preventDefault();
+        applyFontSize((term.options.fontSize ?? DEFAULT_FONT_SIZE) + 1);
+        return false;
+      }
+      if (mod && event.shiftKey && key === "-") {
+        event.preventDefault();
+        applyFontSize((term.options.fontSize ?? DEFAULT_FONT_SIZE) - 1);
+        return false;
+      }
+      if (mod && event.shiftKey && key === "0") {
+        event.preventDefault();
+        applyFontSize(DEFAULT_FONT_SIZE);
+        return false;
+      }
+
+      if (mod && event.shiftKey && key === "c") {
         const selection = term.getSelection();
         if (selection) {
           void navigator.clipboard.writeText(selection);
@@ -380,10 +515,15 @@ export default function TerminalPane({ connection, active }: Props) {
         }
         return true;
       }
-      if (event.ctrlKey && event.shiftKey && key === "v") {
+      if (mod && event.shiftKey && key === "v") {
         void navigator.clipboard.readText().then((text) => {
           if (!text) return;
-          if (sessionId) void api.ptyWrite(sessionId, text).catch(() => {});
+          if (sessionId) {
+            void api.ptyWrite(sessionId, text).catch(() => {});
+          } else if (!PTY_CAPABLE) {
+            inputRef.current += text;
+            term.write(text);
+          }
         });
         return false;
       }
@@ -445,6 +585,9 @@ export default function TerminalPane({ connection, active }: Props) {
       observer.disconnect();
       window.removeEventListener("resize", safeFit);
       dataSub.dispose();
+      titleSub.dispose();
+      bellSub.dispose();
+      searchAddonRef.current = null;
       unlisteners.forEach((unlisten) => unlisten());
       unlisteners = [];
       retryOpenRef.current = () => {};
@@ -563,6 +706,14 @@ export default function TerminalPane({ connection, active }: Props) {
           {connection.jumpHost && <span className="mini-badge">经跳板机</span>}
         </div>
         <div className="terminal-controls">
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            title="搜索终端输出（Ctrl+Shift+F）"
+            onClick={() => setSearchOpen(true)}
+          >
+            搜索
+          </button>
           {PTY_CAPABLE && (
             <span className={`pty-status pty-${status}`}>{STATUS_LABELS[status]}</span>
           )}
@@ -599,6 +750,55 @@ export default function TerminalPane({ connection, active }: Props) {
           )}
         </div>
       </div>
+
+      {searchOpen && (
+        <div className="terminal-search">
+          <input
+            ref={searchInputRef}
+            className="terminal-search-input"
+            value={searchQuery}
+            placeholder="搜索终端输出…"
+            spellCheck={false}
+            onChange={(event) => {
+              setSearchQuery(event.target.value);
+              findInTerminal("next", event.target.value);
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                findInTerminal(event.shiftKey ? "previous" : "next");
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                closeSearch();
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="icon-btn"
+            title="上一个（Shift+Enter）"
+            onClick={() => findInTerminal("previous")}
+          >
+            ↑
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            title="下一个（Enter）"
+            onClick={() => findInTerminal("next")}
+          >
+            ↓
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            title="关闭搜索（Esc）"
+            onClick={closeSearch}
+          >
+            ×
+          </button>
+        </div>
+      )}
 
       {errorText && PTY_CAPABLE && (
         <div className="pty-error-banner" title={errorText}>

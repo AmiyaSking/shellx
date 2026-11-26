@@ -50,18 +50,33 @@ export default function App() {
     })();
   }, [refreshConnections, refreshMcpInfo]);
 
-  const openConnection = useCallback((connection: Connection) => {
-    setTabs((current) => {
-      const existing = current.find((tab) => tab.connectionId === connection.id);
-      if (existing) {
-        setActiveTabId(existing.id);
-        return current;
-      }
-      const tab = { id: newTabId(), connectionId: connection.id };
-      setActiveTabId(tab.id);
-      return [...current, tab];
-    });
+  const selectTab = useCallback((tabId: string) => {
+    setActiveTabId(tabId);
+    setTabs((current) =>
+      current.map((tab) =>
+        tab.id === tabId ? { ...tab, attention: false } : tab,
+      ),
+    );
   }, []);
+
+  const createTab = useCallback((connectionId: string) => {
+    const tab: TerminalTab = { id: newTabId(), connectionId };
+    setTabs((current) => [...current, tab]);
+    setActiveTabId(tab.id);
+    return tab.id;
+  }, []);
+
+  const openConnection = useCallback(
+    (connection: Connection) => {
+      const existing = tabs.find((tab) => tab.connectionId === connection.id);
+      if (existing) {
+        selectTab(existing.id);
+        return;
+      }
+      createTab(connection.id);
+    },
+    [createTab, selectTab, tabs],
+  );
 
   const closeTab = useCallback((tabId: string) => {
     setTabs((current) => {
@@ -75,6 +90,24 @@ export default function App() {
       return next;
     });
   }, []);
+
+  const updateTabTitle = useCallback((tabId: string, title: string) => {
+    setTabs((current) =>
+      current.map((tab) => (tab.id === tabId ? { ...tab, title } : tab)),
+    );
+  }, []);
+
+  const markTabAttention = useCallback(
+    (tabId: string) => {
+      if (tabId === activeTabId) return;
+      setTabs((current) =>
+        current.map((tab) =>
+          tab.id === tabId ? { ...tab, attention: true } : tab,
+        ),
+      );
+    },
+    [activeTabId],
+  );
 
   const handleSaved = useCallback(
     async (input: ConnectionInput) => {
@@ -99,7 +132,14 @@ export default function App() {
       }
       try {
         await api.deleteConnection(connection.id);
-        setTabs((current) => current.filter((tab) => tab.connectionId !== connection.id));
+        setTabs((current) => {
+          const next = current.filter((tab) => tab.connectionId !== connection.id);
+          setActiveTabId((active) => {
+            if (active && next.some((tab) => tab.id === active)) return active;
+            return next[next.length - 1]?.id ?? null;
+          });
+          return next;
+        });
         setModal(null);
         await refreshConnections();
         await refreshMcpInfo();
@@ -114,6 +154,71 @@ export default function App() {
   const activeConnection = activeTab
     ? connectionById.get(activeTab.connectionId) ?? null
     : null;
+
+  const duplicateActiveTab = useCallback(() => {
+    if (activeConnection) {
+      createTab(activeConnection.id);
+    } else {
+      setModal({ mode: "create" });
+    }
+  }, [activeConnection, createTab]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const mod = event.ctrlKey || event.metaKey;
+      if (!mod || modal || auditOpen) return;
+      const target = event.target as HTMLElement | null;
+      const typing =
+        target !== null &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable) &&
+        !target.classList.contains("xterm-helper-textarea");
+      if (typing) return;
+
+      const key = event.key.toLowerCase();
+      if (event.shiftKey && key === "t") {
+        event.preventDefault();
+        event.stopPropagation();
+        duplicateActiveTab();
+        return;
+      }
+      if (event.shiftKey && key === "w") {
+        event.preventDefault();
+        event.stopPropagation();
+        if (activeTabId) closeTab(activeTabId);
+        return;
+      }
+      if (key === "tab" && tabs.length > 0) {
+        event.preventDefault();
+        event.stopPropagation();
+        const index = tabs.findIndex((tab) => tab.id === activeTabId);
+        const step = event.shiftKey ? -1 : 1;
+        const next = tabs[(index + step + tabs.length) % tabs.length] ?? tabs[0];
+        if (next) selectTab(next.id);
+        return;
+      }
+      if (!event.shiftKey && /^[1-9]$/.test(key)) {
+        const index = Number(key) - 1;
+        const tab = tabs[index];
+        if (tab) {
+          event.preventDefault();
+          event.stopPropagation();
+          selectTab(tab.id);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [
+    activeTabId,
+    auditOpen,
+    closeTab,
+    duplicateActiveTab,
+    modal,
+    selectTab,
+    tabs,
+  ]);
 
   return (
     <div className="app">
@@ -160,8 +265,9 @@ export default function App() {
             tabs={tabs}
             connections={connectionById}
             activeTabId={activeTabId}
-            onSelect={setActiveTabId}
+            onSelect={selectTab}
             onClose={closeTab}
+            onNew={duplicateActiveTab}
           />
 
           <div className="terminal-area">
@@ -187,6 +293,8 @@ export default function App() {
                   key={tab.id}
                   connection={connection}
                   active={tab.id === activeTabId}
+                  onTitleChange={(title) => updateTabTitle(tab.id, title)}
+                  onBell={() => markTabAttention(tab.id)}
                 />
               );
             })}

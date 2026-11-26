@@ -546,6 +546,29 @@ pre {
   color: var(--text);
 }
 
+.tab-new {
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  width: 30px;
+  border-radius: 6px;
+  font-size: 17px;
+  line-height: 1;
+}
+.tab-new:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+
+.tab-attention {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warning);
+  box-shadow: 0 0 7px rgba(251, 191, 36, 0.7);
+  flex: 0 0 6px;
+}
+
 .tabbar-fill {
   flex: 1;
 }
@@ -584,6 +607,7 @@ pre {
 /* ---------- terminal ---------- */
 
 .terminal-pane {
+  position: relative;
   display: none;
   flex-direction: column;
   flex: 1;
@@ -592,6 +616,34 @@ pre {
 }
 .terminal-pane.is-active {
   display: flex;
+}
+
+.terminal-search {
+  position: absolute;
+  top: 52px;
+  right: 18px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  border-radius: 9px;
+  border: 1px solid var(--border-strong);
+  background: rgba(13, 18, 25, 0.96);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.terminal-search-input {
+  width: 230px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-size: 12px;
+  outline: none;
+}
+.terminal-search-input:focus {
+  border-color: rgba(94, 234, 212, 0.5);
 }
 
 .terminal-toolbar {
