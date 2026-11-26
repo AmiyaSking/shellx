@@ -7,15 +7,27 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 use russh_sftp::client::SftpSession;
 use serde::Serialize;
-use tokio::io::AsyncWriteExt;
+use tauri::{AppHandle, Emitter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
 use crate::ssh::{self, AuthenticatedSession, ConnectParams};
+
+pub const EVENT_PROGRESS: &str = "sftp:progress";
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpProgressEvent {
+    pub session_id: String,
+    pub direction: String,
+    pub transferred: u64,
+    pub total: u64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,6 +154,7 @@ impl SftpManager {
 
     pub async fn download(
         &self,
+        app: AppHandle,
         session_id: &str,
         remote_path: String,
         local_path: String,
@@ -150,7 +163,13 @@ impl SftpManager {
             return Err("本地保存路径不能为空".into());
         }
         let sftp = self.sftp(session_id)?;
+        let session_id = session_id.to_string();
         on_runtime(async move {
+            let total = sftp
+                .metadata(remote_path.clone())
+                .await
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
             let mut remote = sftp
                 .open(remote_path)
                 .await
@@ -158,10 +177,15 @@ impl SftpManager {
             let mut local = tokio::fs::File::create(&local_path)
                 .await
                 .map_err(|error| format!("无法创建本地文件：{error}"))?;
-            let bytes = tokio::io::copy(&mut remote, &mut local)
-                .await
-                .map_err(|error| format!("下载失败：{error}"))?;
-            let _ = local.flush().await;
+            let bytes = copy_with_progress(
+                &mut remote,
+                &mut local,
+                total,
+                &app,
+                &session_id,
+                "download",
+            )
+            .await?;
             let _ = remote.close().await;
             Ok(bytes)
         })
@@ -170,12 +194,18 @@ impl SftpManager {
 
     pub async fn upload(
         &self,
+        app: AppHandle,
         session_id: &str,
         local_path: String,
         remote_path: String,
     ) -> Result<u64, String> {
         let sftp = self.sftp(session_id)?;
+        let session_id = session_id.to_string();
         on_runtime(async move {
+            let total = tokio::fs::metadata(&local_path)
+                .await
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
             let mut local = tokio::fs::File::open(&local_path)
                 .await
                 .map_err(|error| format!("无法读取本地文件：{error}"))?;
@@ -183,11 +213,72 @@ impl SftpManager {
                 .create(remote_path)
                 .await
                 .map_err(|error| format!("无法创建远端文件：{error}"))?;
-            let bytes = tokio::io::copy(&mut local, &mut remote)
-                .await
-                .map_err(|error| format!("上传失败：{error}"))?;
+            let bytes = copy_with_progress(
+                &mut local,
+                &mut remote,
+                total,
+                &app,
+                &session_id,
+                "upload",
+            )
+            .await?;
             let _ = remote.close().await;
             Ok(bytes)
+        })
+        .await
+    }
+
+    pub async fn create_dir(&self, session_id: &str, path: String) -> Result<(), String> {
+        if path.trim().is_empty() {
+            return Err("目录路径不能为空".into());
+        }
+        let sftp = self.sftp(session_id)?;
+        on_runtime(async move {
+            sftp.create_dir(path)
+                .await
+                .map_err(|error| format!("创建目录失败：{error}"))
+        })
+        .await
+    }
+
+    pub async fn remove(
+        &self,
+        session_id: &str,
+        path: String,
+        is_dir: bool,
+    ) -> Result<(), String> {
+        if path.trim().is_empty() {
+            return Err("路径不能为空".into());
+        }
+        let sftp = self.sftp(session_id)?;
+        on_runtime(async move {
+            if is_dir {
+                sftp.remove_dir(path)
+                    .await
+                    .map_err(|error| format!("删除目录失败（目录必须为空）：{error}"))
+            } else {
+                sftp.remove_file(path)
+                    .await
+                    .map_err(|error| format!("删除文件失败：{error}"))
+            }
+        })
+        .await
+    }
+
+    pub async fn rename(
+        &self,
+        session_id: &str,
+        old_path: String,
+        new_path: String,
+    ) -> Result<(), String> {
+        if old_path.trim().is_empty() || new_path.trim().is_empty() {
+            return Err("路径不能为空".into());
+        }
+        let sftp = self.sftp(session_id)?;
+        on_runtime(async move {
+            sftp.rename(old_path, new_path)
+                .await
+                .map_err(|error| format!("重命名失败：{error}"))
         })
         .await
     }
@@ -275,6 +366,65 @@ async fn list_entries(
 
 fn format_time(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339()
+}
+
+async fn copy_with_progress<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    total: u64,
+    app: &AppHandle,
+    session_id: &str,
+    direction: &str,
+) -> Result<u64, String>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut transferred = 0u64;
+    let mut last_emit = Instant::now();
+    emit_progress(app, session_id, direction, 0, total);
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| format!("传输读取失败：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|error| format!("传输写入失败：{error}"))?;
+        transferred += read as u64;
+        if last_emit.elapsed() >= Duration::from_millis(120) || transferred == total {
+            emit_progress(app, session_id, direction, transferred, total);
+            last_emit = Instant::now();
+        }
+    }
+
+    let _ = writer.flush().await;
+    emit_progress(app, session_id, direction, transferred, total);
+    Ok(transferred)
+}
+
+fn emit_progress(
+    app: &AppHandle,
+    session_id: &str,
+    direction: &str,
+    transferred: u64,
+    total: u64,
+) {
+    let _ = app.emit(
+        EVENT_PROGRESS,
+        SftpProgressEvent {
+            session_id: session_id.to_string(),
+            direction: direction.to_string(),
+            transferred,
+            total,
+        },
+    );
 }
 
 async fn on_runtime<T, F>(future: F) -> Result<T, String>

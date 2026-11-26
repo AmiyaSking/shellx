@@ -206,6 +206,29 @@ export const api = {
         })
       : mock.sftpUpload(sessionId, localPath, remotePath),
 
+  sftpMkdir: (sessionId: string, path: string): Promise<void> =>
+    isTauri()
+      ? invoke<void>("sftp_mkdir", { sessionId, path })
+      : mock.sftpMkdir(path),
+
+  sftpRemove: (
+    sessionId: string,
+    path: string,
+    isDir: boolean,
+  ): Promise<void> =>
+    isTauri()
+      ? invoke<void>("sftp_remove", { sessionId, path, isDir })
+      : mock.sftpRemove(path, isDir),
+
+  sftpRename: (
+    sessionId: string,
+    oldPath: string,
+    newPath: string,
+  ): Promise<void> =>
+    isTauri()
+      ? invoke<void>("sftp_rename", { sessionId, oldPath, newPath })
+      : mock.sftpRename(oldPath, newPath),
+
   sftpClose: (sessionId: string): Promise<boolean> =>
     isTauri()
       ? invoke<boolean>("sftp_close", { sessionId })
@@ -462,7 +485,25 @@ function execute(
   return { status: "completed", result };
 }
 
-function mockSftpListing(path: string): SftpListing {
+const mockSftpOverrides = new Map<string, SftpEntry[]>();
+
+function normalizeMockPath(path: string): string {
+  return path.replace(/\/+$/, "") || "/";
+}
+
+function mockSftpParent(path: string): string {
+  const normalized = normalizeMockPath(path);
+  if (normalized === "/") return "/";
+  const index = normalized.lastIndexOf("/");
+  return index <= 0 ? "/" : normalized.slice(0, index);
+}
+
+function mockSftpName(path: string): string {
+  const normalized = normalizeMockPath(path);
+  return normalized.slice(normalized.lastIndexOf("/") + 1);
+}
+
+function mockSftpBaseListing(path: string): SftpListing {
   const normalized = path.replace(/\/+$/, "") || "/";
   const now = new Date().toISOString();
   const entry = (
@@ -534,6 +575,23 @@ function mockSftpListing(path: string): SftpListing {
     };
   }
   return { path: normalized, entries: [] };
+}
+
+function mockSftpListing(path: string): SftpListing {
+  const normalized = normalizeMockPath(path);
+  const override = mockSftpOverrides.get(normalized);
+  if (override) {
+    return { path: normalized, entries: override.map((entry) => ({ ...entry })) };
+  }
+  return mockSftpBaseListing(normalized);
+}
+
+function mockSftpEntries(path: string): SftpEntry[] {
+  return mockSftpListing(path).entries;
+}
+
+function mockSftpStore(path: string, entries: SftpEntry[]): void {
+  mockSftpOverrides.set(normalizeMockPath(path), entries);
 }
 
 const mock = {
@@ -768,9 +826,93 @@ const mock = {
   async sftpUpload(
     _sessionId: string,
     _localPath: string,
-    _remotePath: string,
+    remotePath: string,
   ): Promise<number> {
+    const parent = mockSftpParent(remotePath);
+    const name = mockSftpName(remotePath);
+    const entries = mockSftpEntries(parent).filter(
+      (entry) => entry.name !== name,
+    );
+    entries.push({
+      name,
+      path: remotePath,
+      isDir: false,
+      isSymlink: false,
+      size: 2048,
+      modified: new Date().toISOString(),
+      permissions: 0o644,
+    });
+    mockSftpStore(parent, entries);
     return 2048;
+  },
+
+  async sftpMkdir(path: string): Promise<void> {
+    const parent = mockSftpParent(path);
+    const name = mockSftpName(path);
+    const entries = mockSftpEntries(parent);
+    if (entries.some((entry) => entry.name === name)) {
+      throw new Error("目录已存在");
+    }
+    entries.push({
+      name,
+      path,
+      isDir: true,
+      isSymlink: false,
+      size: 4096,
+      modified: new Date().toISOString(),
+      permissions: 0o755,
+    });
+    mockSftpStore(parent, entries);
+    mockSftpStore(path, []);
+  },
+
+  async sftpRemove(path: string, isDir: boolean): Promise<void> {
+    const parent = mockSftpParent(path);
+    const name = mockSftpName(path);
+    mockSftpStore(
+      parent,
+      mockSftpEntries(parent).filter((entry) => entry.name !== name),
+    );
+    if (isDir) {
+      for (const key of [...mockSftpOverrides.keys()]) {
+        if (key === path || key.startsWith(`${path}/`)) {
+          mockSftpOverrides.delete(key);
+        }
+      }
+    } else {
+      mockSftpOverrides.delete(path);
+    }
+  },
+
+  async sftpRename(oldPath: string, newPath: string): Promise<void> {
+    const oldParent = mockSftpParent(oldPath);
+    const newParent = mockSftpParent(newPath);
+    const newName = mockSftpName(newPath);
+    const oldEntries = mockSftpEntries(oldParent);
+    const index = oldEntries.findIndex(
+      (entry) => entry.name === mockSftpName(oldPath),
+    );
+    if (index < 0) throw new Error("源文件不存在");
+    const [entry] = oldEntries.splice(index, 1);
+    mockSftpStore(oldParent, oldEntries);
+    const newEntries = mockSftpEntries(newParent).filter(
+      (item) => item.name !== newName,
+    );
+    newEntries.push({ ...entry, name: newName, path: newPath });
+    mockSftpStore(newParent, newEntries);
+    if (entry.isDir) {
+      const moved = [...mockSftpOverrides.keys()]
+        .filter((key) => key.startsWith(`${oldPath}/`))
+        .map((key) => ({
+          oldKey: key,
+          newKey: `${newPath}${key.slice(oldPath.length)}`,
+          entries: mockSftpOverrides.get(key)!,
+        }));
+      for (const item of moved) {
+        mockSftpOverrides.delete(item.oldKey);
+        mockSftpOverrides.set(item.newKey, item.entries);
+      }
+    }
   },
 
   async previewSshConfig(): Promise<SshConfigPreview> {

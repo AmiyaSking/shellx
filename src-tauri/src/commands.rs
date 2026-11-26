@@ -393,6 +393,7 @@ pub async fn sftp_list(
 
 #[tauri::command]
 pub async fn sftp_download(
+    app: AppHandle,
     state: State<'_, AppState>,
     sftp: State<'_, SftpManager>,
     session_id: String,
@@ -401,7 +402,7 @@ pub async fn sftp_download(
 ) -> Result<u64, String> {
     let connection_id = sftp.connection_id(&session_id);
     let result = sftp
-        .download(&session_id, remote_path.clone(), local_path.clone())
+        .download(app, &session_id, remote_path.clone(), local_path.clone())
         .await;
     if let Some(connection_id) = connection_id {
         let detail = match &result {
@@ -417,6 +418,7 @@ pub async fn sftp_download(
 
 #[tauri::command]
 pub async fn sftp_upload(
+    app: AppHandle,
     state: State<'_, AppState>,
     sftp: State<'_, SftpManager>,
     session_id: String,
@@ -425,7 +427,7 @@ pub async fn sftp_upload(
 ) -> Result<u64, String> {
     let connection_id = sftp.connection_id(&session_id);
     let result = sftp
-        .upload(&session_id, local_path.clone(), remote_path.clone())
+        .upload(app, &session_id, local_path.clone(), remote_path.clone())
         .await;
     if let Some(connection_id) = connection_id {
         let detail = match &result {
@@ -433,6 +435,69 @@ pub async fn sftp_upload(
                 "SFTP 上传完成：{local_path} → {remote_path}（{bytes} 字节）"
             ),
             Err(error) => format!("SFTP 上传失败：{remote_path}：{error}"),
+        };
+        state.record_pty_event(Some(&connection_id), detail);
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn sftp_mkdir(
+    state: State<'_, AppState>,
+    sftp: State<'_, SftpManager>,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
+    let connection_id = sftp.connection_id(&session_id);
+    let result = sftp.create_dir(&session_id, path.clone()).await;
+    if let Some(connection_id) = connection_id {
+        let detail = match &result {
+            Ok(()) => format!("SFTP 创建目录：{path}"),
+            Err(error) => format!("SFTP 创建目录失败：{path}：{error}"),
+        };
+        state.record_pty_event(Some(&connection_id), detail);
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn sftp_remove(
+    state: State<'_, AppState>,
+    sftp: State<'_, SftpManager>,
+    session_id: String,
+    path: String,
+    is_dir: bool,
+) -> Result<(), String> {
+    let connection_id = sftp.connection_id(&session_id);
+    let result = sftp.remove(&session_id, path.clone(), is_dir).await;
+    if let Some(connection_id) = connection_id {
+        let detail = match &result {
+            Ok(()) => format!("SFTP 删除：{path}"),
+            Err(error) => format!("SFTP 删除失败：{path}：{error}"),
+        };
+        state.record_pty_event(Some(&connection_id), detail);
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn sftp_rename(
+    state: State<'_, AppState>,
+    sftp: State<'_, SftpManager>,
+    session_id: String,
+    old_path: String,
+    new_path: String,
+) -> Result<(), String> {
+    let connection_id = sftp.connection_id(&session_id);
+    let result = sftp
+        .rename(&session_id, old_path.clone(), new_path.clone())
+        .await;
+    if let Some(connection_id) = connection_id {
+        let detail = match &result {
+            Ok(()) => format!("SFTP 重命名：{old_path} → {new_path}"),
+            Err(error) => format!(
+                "SFTP 重命名失败：{old_path} → {new_path}：{error}"
+            ),
         };
         state.record_pty_event(Some(&connection_id), detail);
     }

@@ -37,7 +37,7 @@ ShellX 面向两类使用者：
 | 终端输出日志 | ✅ 已实现 | 写入 `sessions/日期/会话ID.log`，默认关闭 |
 | OpenSSH config 导入 | ✅ 已实现 | `~/.ssh/config` 预览选择导入，支持单级 ProxyJump 映射 |
 | 端口转发（-L / -R / -D） | ✅ 已实现 | 规则持久化，手动启动/停止，每规则独立 SSH 连接 |
-| SFTP 文件浏览 / 上传 / 下载 | ✅ 已实现 | 独立 SFTP 会话，系统文件对话框，流式传输 |
+| SFTP 文件浏览 / 上传 / 下载 | ✅ 已实现 | 独立会话、目录操作、流式传输与进度显示 |
 | 每连接 TERM / 编码 / 启动命令 | ✅ 已实现 | UTF-8 / GBK / GB18030 / Big5，登录后自动执行 |
 | keyboard-interactive / 2FA | ✅ 已实现 | 终端连接时弹窗输入 OTP/口令，跳板机同样支持 |
 | 旧算法兼容 | ✅ 已实现 | 每连接可选 ssh-rsa / SHA-1 KEX/MAC / CBC / 3DES |
@@ -95,7 +95,7 @@ Tauri Backend / Local Core (Rust)
   ├─ ssh.rs            russh 连接 / 主机密钥 / Agent / 跳板机 / PTY 通道
   ├─ ssh_config.rs     OpenSSH config 只读解析（导入预览）
   ├─ forwards.rs       本地/远程/SOCKS5 端口转发与规则持久化
-  ├─ sftp.rs           SFTP 文件浏览、流式上传/下载
+  ├─ sftp.rs           SFTP 文件浏览、目录操作、流式传输与进度
   ├─ pty.rs            PTY 会话表 / 事件桥 / 超时与取消
   ├─ shell.rs          命令链解析（策略引擎输入）
   ├─ encoding.rs       PTY 字节 base64 传输
@@ -218,7 +218,7 @@ stdio JSON-RPC 循环将以 `shellx --mcp-stdio` 形式接入；`src-tauri/src/m
 - 「登录后启动命令」会在 shell 建立后自动输入并回车，请只配置可信命令。
 - keyboard-interactive/2FA 目前只在终端连接中弹窗；端口转发与 SFTP 使用独立 SSH 连接，遇到强制 2FA 的服务器会提示先在终端连接。
 - 「兼容旧算法」默认关闭，开启后会加入 ssh-rsa、SHA-1 KEX/MAC、CBC 与 3DES；仅用于老旧服务器/网络设备，会降低连接安全性。
-- SFTP 会话独立于终端会话；主机密钥必须先在终端连接中确认。上传会覆盖同名远端文件，尚未提供 mkdir/删除/重命名与传输进度条。
+- SFTP 会话独立于终端会话；主机密钥必须先在终端连接中确认。上传会覆盖同名远端文件；删除目录要求目录为空，暂不支持递归删除；重命名采用 SFTP RENAME，目标存在时的行为取决于服务器。
 - 端口转发规则在「转发」面板管理；主机密钥必须先在终端连接中确认。每条运行中的规则使用独立 SSH 连接，不共享终端会话。
 - `-R` 的非回环监听需要服务器端允许 `GatewayPorts`；`-D` 当前为无认证 SOCKS5，建议只监听 `127.0.0.1`。
 - SSH config 导入为一次性预览：`Include` 不会展开，`Match` 与通配符 Host 会跳过；`ProxyJump` 仅在目标同时被导入或已存在时映射，多级跳转按直连导入并提示。

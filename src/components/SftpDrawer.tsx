@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { api, isTauri } from "../lib/api";
-import type { Connection, SftpEntry, SftpListing } from "../lib/types";
+import type {
+  Connection,
+  SftpEntry,
+  SftpListing,
+  SftpProgressEvent,
+} from "../lib/types";
 
 interface Props {
   connections: Connection[];
@@ -53,6 +59,7 @@ export default function SftpDrawer({
   const [busyPath, setBusyPath] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [progress, setProgress] = useState<SftpProgressEvent | null>(null);
   const sessionRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -62,6 +69,18 @@ export default function SftpDrawer({
         sessionRef.current = null;
       }
     };
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    void listen<SftpProgressEvent>("sftp:progress", ({ payload }) => {
+      if (payload.sessionId !== sessionRef.current) return;
+      setProgress(payload);
+    }).then((dispose) => {
+      unlisten = dispose;
+    });
+    return () => unlisten?.();
   }, []);
 
   useEffect(() => {
@@ -101,6 +120,7 @@ export default function SftpDrawer({
       setLoading(true);
       setError(null);
       setNotice(null);
+      setProgress(null);
       try {
         const next = await api.sftpList(sessionRef.current, path);
         setListing(next);
@@ -132,6 +152,7 @@ export default function SftpDrawer({
       const remotePath = joinRemote(listing.path, name);
       setBusyPath("__upload__");
       setError(null);
+      setProgress(null);
       const bytes = await api.sftpUpload(
         sessionRef.current,
         localPath,
@@ -143,6 +164,7 @@ export default function SftpDrawer({
       setError(String(err));
     } finally {
       setBusyPath(null);
+      setProgress(null);
     }
   };
 
@@ -160,12 +182,84 @@ export default function SftpDrawer({
       if (!localPath) return;
       setBusyPath(entry.path);
       setError(null);
+      setProgress(null);
       const bytes = await api.sftpDownload(
         sessionRef.current,
         entry.path,
         localPath,
       );
       setNotice(`已下载 ${entry.name}（${bytes} 字节）`);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusyPath(null);
+      setProgress(null);
+    }
+  };
+
+  const makeDirectory = async () => {
+    if (!sessionRef.current || !listing) return;
+    const name = window.prompt("新文件夹名称");
+    if (!name) return;
+    if (name.includes("/") || name.includes("\\") || name === "." || name === "..") {
+      setError("文件夹名称不合法。");
+      return;
+    }
+    setBusyPath("__mkdir__");
+    setError(null);
+    try {
+      await api.sftpMkdir(sessionRef.current, joinRemote(listing.path, name));
+      await navigate(listing.path);
+      setNotice(`已创建文件夹 ${name}`);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusyPath(null);
+    }
+  };
+
+  const renameEntry = async (entry: SftpEntry) => {
+    if (!sessionRef.current || !listing) return;
+    const name = window.prompt("新名称", entry.name);
+    if (!name || name === entry.name) return;
+    if (name.includes("/") || name.includes("\\") || name === "." || name === "..") {
+      setError("名称不合法。");
+      return;
+    }
+    setBusyPath(entry.path);
+    setError(null);
+    try {
+      await api.sftpRename(
+        sessionRef.current,
+        entry.path,
+        joinRemote(listing.path, name),
+      );
+      await navigate(listing.path);
+      setNotice(`已重命名为 ${name}`);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBusyPath(null);
+    }
+  };
+
+  const removeEntry = async (entry: SftpEntry) => {
+    if (!sessionRef.current || !listing) return;
+    if (
+      !window.confirm(
+        `删除${entry.isDir ? "目录" : "文件"}「${entry.name}」？${
+          entry.isDir ? "目录必须为空。" : ""
+        }`,
+      )
+    ) {
+      return;
+    }
+    setBusyPath(entry.path);
+    setError(null);
+    try {
+      await api.sftpRemove(sessionRef.current, entry.path, entry.isDir);
+      await navigate(listing.path);
+      setNotice(`已删除 ${entry.name}`);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -180,6 +274,14 @@ export default function SftpDrawer({
       void download(entry);
     }
   };
+
+  const progressPercent =
+    progress && progress.total > 0
+      ? Math.min(
+          100,
+          Math.round((progress.transferred / progress.total) * 100),
+        )
+      : null;
 
   return (
     <div className="drawer-backdrop" role="presentation" onClick={onClose}>
@@ -276,12 +378,43 @@ export default function SftpDrawer({
               </button>
               <button
                 className="btn btn-ghost btn-sm"
-                disabled={busyPath === "__upload__"}
+                disabled={busyPath !== null}
+                onClick={() => void makeDirectory()}
+              >
+                新建目录
+              </button>
+              <button
+                className="btn btn-ghost btn-sm"
+                disabled={busyPath !== null}
                 onClick={() => void upload()}
               >
                 {busyPath === "__upload__" ? "上传中…" : "上传"}
               </button>
             </div>
+
+            {progress && (
+              <div className="sftp-progress">
+                <div className="sftp-progress-track">
+                  <div
+                    className={`sftp-progress-bar ${
+                      progressPercent === null ? "is-indeterminate" : ""
+                    }`}
+                    style={
+                      progressPercent === null
+                        ? undefined
+                        : { width: `${progressPercent}%` }
+                    }
+                  />
+                </div>
+                <span className="muted small">
+                  {progress.direction === "upload" ? "上传" : "下载"}{" "}
+                  {humanSize(progress.transferred)}
+                  {progress.total > 0
+                    ? ` / ${humanSize(progress.total)} · ${progressPercent}%`
+                    : ""}
+                </span>
+              </div>
+            )}
 
             <div className="sftp-list">
               <div className="sftp-list-head">
@@ -321,6 +454,7 @@ export default function SftpDrawer({
                       {entry.isDir ? (
                         <button
                           className="btn btn-ghost btn-sm"
+                          disabled={busyPath !== null}
                           onClick={() => void navigate(entry.path)}
                         >
                           打开
@@ -328,12 +462,30 @@ export default function SftpDrawer({
                       ) : (
                         <button
                           className="btn btn-ghost btn-sm"
-                          disabled={busyPath === entry.path}
+                          disabled={busyPath !== null}
                           onClick={() => void download(entry)}
                         >
                           {busyPath === entry.path ? "下载中…" : "下载"}
                         </button>
                       )}
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        title="重命名"
+                        disabled={busyPath !== null}
+                        onClick={() => void renameEntry(entry)}
+                      >
+                        ✎
+                      </button>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        title="删除"
+                        disabled={busyPath !== null}
+                        onClick={() => void removeEntry(entry)}
+                      >
+                        ×
+                      </button>
                     </div>
                   </div>
                 ))}

@@ -240,6 +240,13 @@ export interface SftpOpened {
   listing: SftpListing;
 }
 
+export interface SftpProgressEvent {
+  sessionId: string;
+  direction: "upload" | "download" | string;
+  transferred: number;
+  total: number;
+}
+
 /** A fingerprint the user confirmed in the first-connect dialog. */
 export interface HostKeyTrust {
   host: string;
