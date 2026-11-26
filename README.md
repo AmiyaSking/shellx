@@ -37,7 +37,8 @@ ShellX 面向两类使用者：
 | 终端输出日志 | ✅ 已实现 | 写入 `sessions/日期/会话ID.log`，默认关闭 |
 | OpenSSH config 导入 | ✅ 已实现 | `~/.ssh/config` 预览选择导入，支持单级 ProxyJump 映射 |
 | 端口转发（-L / -R / -D） | ✅ 已实现 | 规则持久化，手动启动/停止，每规则独立 SSH 连接 |
-| SFTP、Agent/X11 转发 | 🚧 待补齐 | |
+| SFTP 文件浏览 / 上传 / 下载 | ✅ 已实现 | 独立 SFTP 会话，系统文件对话框，流式传输 |
+| Agent/X11 转发 | 🚧 待补齐 | |
 | 本地 MCP stdio 传输 | 🚧 待接入 | 工具目录、JSON Schema、分发器已就绪 |
 
 > 桌面版连接真实服务器；浏览器 `npm run dev` 会使用内置 Mock 后端，界面显示「浏览器 Mock 模式」。
@@ -90,6 +91,7 @@ Tauri Backend / Local Core (Rust)
   ├─ ssh.rs            russh 连接 / 主机密钥 / Agent / 跳板机 / PTY 通道
   ├─ ssh_config.rs     OpenSSH config 只读解析（导入预览）
   ├─ forwards.rs       本地/远程/SOCKS5 端口转发与规则持久化
+  ├─ sftp.rs           SFTP 文件浏览、流式上传/下载
   ├─ pty.rs            PTY 会话表 / 事件桥 / 超时与取消
   ├─ shell.rs          命令链解析（策略引擎输入）
   ├─ encoding.rs       PTY 字节 base64 传输
@@ -199,14 +201,15 @@ stdio JSON-RPC 循环将以 `shellx --mcp-stdio` 形式接入；`src-tauri/src/m
 
 1. **第一阶段（连接可靠性）**：✅ 真实 SSH/PTY、SSH Agent、单级跳板机、系统钥匙串、主机密钥确认、连接超时/取消、PTY 会话审计。
 2. **第二阶段（终端体验）**：✅ 搜索、可点击链接、Unicode 宽度、GPU 渲染、快捷键、同主机多开、动态标题、响铃提示、设置页、右键菜单、多行粘贴确认、标签重命名/拖拽、多窗格分屏、可拖动分隔条、工作区恢复、终端输出日志；🚧 嵌套分屏。
-3. **第三阶段（专业能力）**：✅ OpenSSH config 导入、端口转发（-L / -R / -D）；🚧 SFTP、Agent/X11 转发、keyboard-interactive/2FA、旧算法兼容、每连接编码与启动命令。
+3. **第三阶段（专业能力）**：✅ OpenSSH config 导入、端口转发（-L / -R / -D）、SFTP 文件浏览/上传/下载；🚧 Agent/X11 转发、keyboard-interactive/2FA、旧算法兼容、每连接编码与启动命令。
 4. **第四阶段（工程化）**：MCP stdio 传输、输出批处理与背压、集成测试/CI、规则配置界面。
 
 ## 说明
 
 - 凭据保存在系统凭据存储；Linux 当前使用内核 keyring，重启后可能需要重新输入，后续可切换到 Secret Service。
 - 浏览器 Mock 模式不会建立任何网络连接；桌面版才会连接真实服务器。
-- 当前暂不支持多级跳板机、嵌套混合分屏、SFTP、Agent/X11 转发。
+- 当前暂不支持多级跳板机、嵌套混合分屏、Agent/X11 转发。
+- SFTP 会话独立于终端会话；主机密钥必须先在终端连接中确认。上传会覆盖同名远端文件，尚未提供 mkdir/删除/重命名与传输进度条。
 - 端口转发规则在「转发」面板管理；主机密钥必须先在终端连接中确认。每条运行中的规则使用独立 SSH 连接，不共享终端会话。
 - `-R` 的非回环监听需要服务器端允许 `GatewayPorts`；`-D` 当前为无认证 SOCKS5，建议只监听 `127.0.0.1`。
 - SSH config 导入为一次性预览：`Include` 不会展开，`Match` 与通配符 Host 会跳过；`ProxyJump` 仅在目标同时被导入或已存在时映射，多级跳转按直连导入并提示。

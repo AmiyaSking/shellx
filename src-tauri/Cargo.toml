@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -25,7 +26,8 @@ regex = "1"
 # SSH transport for the interactive terminal.
 # `ring` instead of the default `aws-lc-rs`: aws-lc-sys needs NASM at build time.
 russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+russh-sftp = "4"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "fs"] }
 # Passwords and key passphrases go to the OS credential store, never to disk.
 # Linux uses the kernel keyring here; a Secret Service backend can be enabled
 # later without changing the vault API.

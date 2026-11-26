@@ -210,6 +210,26 @@ export interface ForwardStatus {
   error?: string | null;
 }
 
+export interface SftpEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  isSymlink: boolean;
+  size: number;
+  modified?: string | null;
+  permissions?: number | null;
+}
+
+export interface SftpListing {
+  path: string;
+  entries: SftpEntry[];
+}
+
+export interface SftpOpened {
+  sessionId: string;
+  listing: SftpListing;
+}
+
 /** A fingerprint the user confirmed in the first-connect dialog. */
 export interface HostKeyTrust {
   host: string;

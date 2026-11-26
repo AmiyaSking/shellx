@@ -19,6 +19,7 @@ import AuditDrawer from "./components/AuditDrawer";
 import ConnectionModal from "./components/ConnectionModal";
 import ForwardDrawer from "./components/ForwardDrawer";
 import SettingsDrawer from "./components/SettingsDrawer";
+import SftpDrawer from "./components/SftpDrawer";
 import Sidebar from "./components/Sidebar";
 import SshConfigImportDialog from "./components/SshConfigImportDialog";
 import TabBar, {
@@ -86,6 +87,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [forwardOpen, setForwardOpen] = useState(false);
+  const [sftpOpen, setSftpOpen] = useState(false);
   const [mcpInfo, setMcpInfo] = useState<McpServerInfo | null>(null);
   const [modal, setModal] = useState<
     { mode: "create" } | { mode: "edit"; connection: Connection } | null
@@ -539,7 +541,16 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const mod = event.ctrlKey || event.metaKey;
-      if (!mod || modal || auditOpen || settingsOpen || forwardOpen) return;
+      if (
+        !mod ||
+        modal ||
+        auditOpen ||
+        settingsOpen ||
+        forwardOpen ||
+        sftpOpen
+      ) {
+        return;
+      }
       const target = event.target as HTMLElement | null;
       const typing =
         target !== null &&
@@ -604,6 +615,7 @@ export default function App() {
     modal,
     selectTab,
     settingsOpen,
+    sftpOpen,
     splitActivePane,
     tabs,
   ]);
@@ -625,7 +637,19 @@ export default function App() {
           <button
             className="btn btn-ghost"
             onClick={() => {
+              setSftpOpen(true);
+              setForwardOpen(false);
+              setAuditOpen(false);
+              setSettingsOpen(false);
+            }}
+          >
+            文件
+          </button>
+          <button
+            className="btn btn-ghost"
+            onClick={() => {
               setForwardOpen(true);
+              setSftpOpen(false);
               setAuditOpen(false);
               setSettingsOpen(false);
             }}
@@ -638,6 +662,7 @@ export default function App() {
               setSettingsOpen(true);
               setAuditOpen(false);
               setForwardOpen(false);
+              setSftpOpen(false);
             }}
           >
             设置
@@ -648,6 +673,7 @@ export default function App() {
               setAuditOpen(true);
               setSettingsOpen(false);
               setForwardOpen(false);
+              setSftpOpen(false);
             }}
           >
             审计日志
@@ -769,6 +795,13 @@ export default function App() {
         <ForwardDrawer
           connections={connections}
           onClose={() => setForwardOpen(false)}
+        />
+      )}
+      {sftpOpen && (
+        <SftpDrawer
+          connections={connections}
+          initialConnectionId={activeConnection?.id ?? null}
+          onClose={() => setSftpOpen(false)}
         />
       )}
 

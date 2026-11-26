@@ -1361,6 +1361,127 @@ body.is-resizing-panes-column * {
   margin-bottom: 10px;
 }
 
+/* ---------- SFTP file browser ---------- */
+
+.sftp-drawer {
+  width: min(880px, 96vw);
+}
+
+.sftp-connect-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sftp-connect-row select {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-size: 12px;
+}
+
+.sftp-pathbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sftp-path-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  outline: none;
+}
+.sftp-path-input:focus {
+  border-color: rgba(94, 234, 212, 0.5);
+}
+
+.sftp-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.sftp-list-head,
+.sftp-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 90px 150px 90px;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+}
+
+.sftp-list-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  color: var(--text-faint);
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+
+.sftp-row {
+  font-size: 12px;
+  border-bottom: 1px solid rgba(29, 41, 56, 0.6);
+  cursor: default;
+}
+.sftp-row:last-child {
+  border-bottom: none;
+}
+.sftp-row:hover {
+  background: var(--bg-hover);
+}
+
+.sftp-name {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.sftp-name span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sftp-icon {
+  width: 16px;
+  text-align: center;
+  flex: 0 0 16px;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+.sftp-icon.is-dir {
+  color: var(--accent);
+}
+
+.sftp-row-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.sftp-notice {
+  padding: 8px 11px;
+  border-radius: 8px;
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  background: rgba(52, 211, 153, 0.08);
+  color: #6ee7b7;
+  font-size: 11px;
+}
+
 /* ---------- port forwarding ---------- */
 
 .forward-drawer {

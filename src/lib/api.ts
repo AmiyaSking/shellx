@@ -16,6 +16,9 @@ import type {
   PolicyDecision,
   PtyOpened,
   RiskLevel,
+  SftpEntry,
+  SftpListing,
+  SftpOpened,
   SshConfigPreview,
 } from "./types";
 
@@ -153,6 +156,47 @@ export const api = {
     isTauri()
       ? invoke<ForwardStatus[]>("list_forward_statuses")
       : mock.listForwardStatuses(),
+
+  sftpOpen: (connectionId: string): Promise<SftpOpened> =>
+    isTauri()
+      ? invoke<SftpOpened>("sftp_open", { connectionId })
+      : mock.sftpOpen(connectionId),
+
+  sftpList: (sessionId: string, path: string): Promise<SftpListing> =>
+    isTauri()
+      ? invoke<SftpListing>("sftp_list", { sessionId, path })
+      : mock.sftpList(sessionId, path),
+
+  sftpDownload: (
+    sessionId: string,
+    remotePath: string,
+    localPath: string,
+  ): Promise<number> =>
+    isTauri()
+      ? invoke<number>("sftp_download", {
+          sessionId,
+          remotePath,
+          localPath,
+        })
+      : mock.sftpDownload(sessionId, remotePath, localPath),
+
+  sftpUpload: (
+    sessionId: string,
+    localPath: string,
+    remotePath: string,
+  ): Promise<number> =>
+    isTauri()
+      ? invoke<number>("sftp_upload", {
+          sessionId,
+          localPath,
+          remotePath,
+        })
+      : mock.sftpUpload(sessionId, localPath, remotePath),
+
+  sftpClose: (sessionId: string): Promise<boolean> =>
+    isTauri()
+      ? invoke<boolean>("sftp_close", { sessionId })
+      : Promise.resolve(true),
 };
 
 /* ------------------------------------------------------------------ */
@@ -390,6 +434,80 @@ function execute(
   return { status: "completed", result };
 }
 
+function mockSftpListing(path: string): SftpListing {
+  const normalized = path.replace(/\/+$/, "") || "/";
+  const now = new Date().toISOString();
+  const entry = (
+    name: string,
+    isDir: boolean,
+    size: number,
+    extra: Partial<SftpEntry> = {},
+  ): SftpEntry => ({
+    name,
+    path: normalized === "/" ? `/${name}` : `${normalized}/${name}`,
+    isDir,
+    isSymlink: false,
+    size,
+    modified: now,
+    permissions: isDir ? 0o755 : 0o644,
+    ...extra,
+  });
+
+  if (normalized === "/home/amiya") {
+    return {
+      path: normalized,
+      entries: [
+        entry("app", true, 4096),
+        entry("logs", true, 4096),
+        entry("config", true, 4096),
+        entry("README.md", false, 2048),
+        entry("deploy.sh", false, 1024),
+        entry(".bashrc", false, 571),
+      ],
+    };
+  }
+  if (normalized === "/home/amiya/app") {
+    return {
+      path: normalized,
+      entries: [
+        entry("releases", true, 4096),
+        entry("current", false, 0, {
+          isSymlink: true,
+          permissions: 0o777,
+        }),
+        entry("app.jar", false, 18_432_000),
+        entry("config.yml", false, 1024),
+      ],
+    };
+  }
+  if (normalized === "/home/amiya/logs") {
+    return {
+      path: normalized,
+      entries: [
+        entry("app.log", false, 524_288),
+        entry("error.log", false, 8192),
+      ],
+    };
+  }
+  if (normalized === "/home") {
+    return {
+      path: normalized,
+      entries: [entry("amiya", true, 4096), entry("deploy", true, 4096)],
+    };
+  }
+  if (normalized === "/") {
+    return {
+      path: normalized,
+      entries: [
+        entry("home", true, 4096),
+        entry("etc", true, 4096),
+        entry("var", true, 4096),
+      ],
+    };
+  }
+  return { path: normalized, entries: [] };
+}
+
 const mock = {
   async listConnections() {
     return [...mockState.connections];
@@ -593,6 +711,33 @@ const mock = {
           error: null,
         },
     );
+  },
+
+  async sftpOpen(_connectionId: string): Promise<SftpOpened> {
+    return {
+      sessionId: nextId("sftp"),
+      listing: mockSftpListing("/home/amiya"),
+    };
+  },
+
+  async sftpList(_sessionId: string, path: string): Promise<SftpListing> {
+    return mockSftpListing(path);
+  },
+
+  async sftpDownload(
+    _sessionId: string,
+    _remotePath: string,
+    _localPath: string,
+  ): Promise<number> {
+    return 2048;
+  },
+
+  async sftpUpload(
+    _sessionId: string,
+    _localPath: string,
+    _remotePath: string,
+  ): Promise<number> {
+    return 2048;
   },
 
   async previewSshConfig(): Promise<SshConfigPreview> {

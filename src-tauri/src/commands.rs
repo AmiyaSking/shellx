@@ -9,6 +9,7 @@ use crate::forwards::{
     ForwardKind, ForwardManager, ForwardRule, ForwardRuleInput, ForwardStatus,
 };
 use crate::pty::{PtyManager, PtyOpenError, PtyOpened, SessionMeta};
+use crate::sftp::{SftpListing, SftpManager, SftpOpened};
 use crate::ssh;
 use crate::ssh_config::{self, SshConfigPreview};
 use crate::state::AppState;
@@ -344,4 +345,96 @@ pub fn list_forward_statuses(
 ) -> Result<Vec<ForwardStatus>, String> {
     let rules = state.list_forward_rules()?;
     Ok(forwards.statuses(&rules))
+}
+
+// ---------------------------------------------------------------------------
+// SFTP file browser
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn sftp_open(
+    state: State<'_, AppState>,
+    sftp: State<'_, SftpManager>,
+    connection_id: String,
+) -> Result<SftpOpened, String> {
+    let params = state.forward_params(&connection_id)?;
+    let session_id = Uuid::new_v4().to_string();
+    let opened = sftp
+        .open(session_id, connection_id.clone(), params)
+        .await?;
+    state.record_pty_event(Some(&connection_id), "SFTP 会话已打开");
+    Ok(opened)
+}
+
+#[tauri::command]
+pub async fn sftp_list(
+    sftp: State<'_, SftpManager>,
+    session_id: String,
+    path: String,
+) -> Result<SftpListing, String> {
+    sftp.list(&session_id, path).await
+}
+
+#[tauri::command]
+pub async fn sftp_download(
+    state: State<'_, AppState>,
+    sftp: State<'_, SftpManager>,
+    session_id: String,
+    remote_path: String,
+    local_path: String,
+) -> Result<u64, String> {
+    let connection_id = sftp.connection_id(&session_id);
+    let result = sftp
+        .download(&session_id, remote_path.clone(), local_path.clone())
+        .await;
+    if let Some(connection_id) = connection_id {
+        let detail = match &result {
+            Ok(bytes) => format!(
+                "SFTP 下载完成：{remote_path} → {local_path}（{bytes} 字节）"
+            ),
+            Err(error) => format!("SFTP 下载失败：{remote_path}：{error}"),
+        };
+        state.record_pty_event(Some(&connection_id), detail);
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn sftp_upload(
+    state: State<'_, AppState>,
+    sftp: State<'_, SftpManager>,
+    session_id: String,
+    local_path: String,
+    remote_path: String,
+) -> Result<u64, String> {
+    let connection_id = sftp.connection_id(&session_id);
+    let result = sftp
+        .upload(&session_id, local_path.clone(), remote_path.clone())
+        .await;
+    if let Some(connection_id) = connection_id {
+        let detail = match &result {
+            Ok(bytes) => format!(
+                "SFTP 上传完成：{local_path} → {remote_path}（{bytes} 字节）"
+            ),
+            Err(error) => format!("SFTP 上传失败：{remote_path}：{error}"),
+        };
+        state.record_pty_event(Some(&connection_id), detail);
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn sftp_close(
+    state: State<'_, AppState>,
+    sftp: State<'_, SftpManager>,
+    session_id: String,
+) -> Result<bool, String> {
+    let connection_id = sftp.connection_id(&session_id);
+    let closed = sftp.close(&session_id).await;
+    if closed {
+        if let Some(connection_id) = connection_id {
+            state.record_pty_event(Some(&connection_id), "SFTP 会话已关闭");
+        }
+    }
+    Ok(closed)
 }

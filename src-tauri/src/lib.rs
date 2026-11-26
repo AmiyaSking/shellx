@@ -9,6 +9,7 @@ mod policy;
 mod pty;
 mod redaction;
 mod sessions;
+mod sftp;
 mod shell;
 mod ssh;
 mod ssh_config;
@@ -24,12 +25,14 @@ pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let state = AppState::load(data_dir)?;
             app.manage(state);
             app.manage(pty::PtyManager::new());
             app.manage(forwards::ForwardManager::new());
+            app.manage(sftp::SftpManager::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -60,6 +63,11 @@ pub fn run() {
             commands::start_forward,
             commands::stop_forward,
             commands::list_forward_statuses,
+            commands::sftp_open,
+            commands::sftp_list,
+            commands::sftp_download,
+            commands::sftp_upload,
+            commands::sftp_close,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ShellX");
@@ -68,6 +76,7 @@ pub fn run() {
         if matches!(event, tauri::RunEvent::Exit) {
             app_handle.state::<pty::PtyManager>().shutdown();
             app_handle.state::<forwards::ForwardManager>().shutdown();
+            app_handle.state::<sftp::SftpManager>().shutdown();
         }
     });
 }
