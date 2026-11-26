@@ -61,6 +61,7 @@ pub fn run() {
             commands::list_sessions,
             commands::close_session,
             commands::mcp_server_info,
+            commands::mcp_launch_info,
             commands::get_mcp_policy,
             commands::save_mcp_policy,
             commands::pty_open,

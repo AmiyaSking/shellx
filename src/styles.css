@@ -1867,9 +1867,14 @@ body.is-resizing-panes-column * {
 
 /* ---------- MCP policy drawer ---------- */
 
-.mcp-policy-open {
-  width: 100%;
+.mcp-card-actions {
+  display: flex;
+  gap: 6px;
   margin-top: 8px;
+}
+
+.mcp-card-actions .btn {
+  flex: 1;
   justify-content: center;
 }
 
@@ -2085,4 +2090,84 @@ body.is-resizing-panes-column * {
   display: flex;
   min-width: 0;
   flex-direction: column;
+}
+
+/* ---------- MCP client config drawer ---------- */
+
+.mcp-config-drawer {
+  width: min(900px, 96vw);
+}
+
+.mcp-config-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mcp-config-clients {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mcp-config-tab {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-panel);
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.mcp-config-tab:hover {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.mcp-config-tab.is-active {
+  color: var(--accent);
+  border-color: rgba(94, 234, 212, 0.5);
+  background: rgba(94, 234, 212, 0.08);
+}
+
+.mcp-config-path {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.mcp-config-code {
+  position: relative;
+  min-height: 260px;
+  overflow: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0a0e13;
+}
+
+.mcp-config-code pre {
+  margin: 0;
+  padding-right: 48px;
+  color: #cbd5e1;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.mcp-config-copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+}
+
+.mcp-config-footer {
+  justify-content: flex-end;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
 }

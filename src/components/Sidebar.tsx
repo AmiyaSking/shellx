@@ -16,6 +16,7 @@ interface Props {
   onImport: () => void;
   onEdit: (connection: Connection) => void;
   onOpenMcpPolicy: () => void;
+  onOpenMcpConfig: () => void;
 }
 
 export default function Sidebar({
@@ -28,6 +29,7 @@ export default function Sidebar({
   onImport,
   onEdit,
   onOpenMcpPolicy,
+  onOpenMcpConfig,
 }: Props) {
   const [query, setQuery] = useState("");
 
@@ -186,12 +188,17 @@ export default function Sidebar({
                   ? "MCP 服务运行中。"
                   : "stdio 传输已就绪，由 MCP 客户端按需启动 `shellx --mcp-stdio`。"}
             </p>
-            <button
-              className="btn btn-ghost btn-sm mcp-policy-open"
-              onClick={onOpenMcpPolicy}
-            >
-              MCP 权限设置
-            </button>
+            <div className="mcp-card-actions">
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={onOpenMcpPolicy}
+              >
+                MCP 权限设置
+              </button>
+              <button className="btn btn-ghost btn-sm" onClick={onOpenMcpConfig}>
+                客户端配置
+              </button>
+            </div>
           </>
         ) : (
           <p className="muted">MCP 状态读取中…</p>

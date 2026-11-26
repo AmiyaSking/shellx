@@ -26,6 +26,7 @@ import AuditDrawer from "./components/AuditDrawer";
 import AuthPromptDialog from "./components/AuthPromptDialog";
 import ConnectionModal from "./components/ConnectionModal";
 import ForwardDrawer from "./components/ForwardDrawer";
+import McpClientConfigDrawer from "./components/McpClientConfigDrawer";
 import McpPolicyDrawer from "./components/McpPolicyDrawer";
 import SettingsDrawer from "./components/SettingsDrawer";
 import SftpDrawer from "./components/SftpDrawer";
@@ -95,6 +96,7 @@ export default function App() {
   const [auditOpen, setAuditOpen] = useState(false);
   const [auditFilter, setAuditFilter] = useState("");
   const [mcpPolicyOpen, setMcpPolicyOpen] = useState(false);
+  const [mcpConfigOpen, setMcpConfigOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [forwardOpen, setForwardOpen] = useState(false);
@@ -699,6 +701,7 @@ export default function App() {
               setAuditOpen(false);
               setSettingsOpen(false);
               setMcpPolicyOpen(false);
+              setMcpConfigOpen(false);
             }}
           >
             转发
@@ -711,6 +714,7 @@ export default function App() {
               setForwardOpen(false);
               setSftpOpen(false);
               setMcpPolicyOpen(false);
+              setMcpConfigOpen(false);
             }}
           >
             设置
@@ -724,6 +728,7 @@ export default function App() {
               setForwardOpen(false);
               setSftpOpen(false);
               setMcpPolicyOpen(false);
+              setMcpConfigOpen(false);
             }}
           >
             审计日志
@@ -755,6 +760,15 @@ export default function App() {
           onEdit={(connection) => setModal({ mode: "edit", connection })}
           onOpenMcpPolicy={() => {
             setMcpPolicyOpen(true);
+            setMcpConfigOpen(false);
+            setAuditOpen(false);
+            setSettingsOpen(false);
+            setForwardOpen(false);
+            setSftpOpen(false);
+          }}
+          onOpenMcpConfig={() => {
+            setMcpConfigOpen(true);
+            setMcpPolicyOpen(false);
             setAuditOpen(false);
             setSettingsOpen(false);
             setForwardOpen(false);
@@ -861,6 +875,11 @@ export default function App() {
             setAuditFilter(filter);
             setAuditOpen(true);
           }}
+        />
+      )}
+      {mcpConfigOpen && (
+        <McpClientConfigDrawer
+          onClose={() => setMcpConfigOpen(false)}
         />
       )}
       {settingsOpen && <SettingsDrawer onClose={() => setSettingsOpen(false)} />}

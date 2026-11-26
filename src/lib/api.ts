@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { McpLaunchInfo } from "./mcpClientConfigs";
 import type {
   ApprovalRequest,
   AuditEntry,
@@ -71,6 +72,9 @@ export const api = {
 
   mcpServerInfo: (): Promise<McpServerInfo> =>
     isTauri() ? invoke<McpServerInfo>("mcp_server_info") : mock.mcpServerInfo(),
+
+  mcpLaunchInfo: (): Promise<McpLaunchInfo> =>
+    isTauri() ? invoke<McpLaunchInfo>("mcp_launch_info") : mock.mcpLaunchInfo(),
 
   getMcpPolicy: (): Promise<McpPolicySnapshot> =>
     isTauri() ? invoke<McpPolicySnapshot>("get_mcp_policy") : mock.getMcpPolicy(),
@@ -875,6 +879,13 @@ const mock = {
       (rule) => !(rule.target.kind === "connection" && rule.target.id === id),
     );
     delete mockMcpPolicy.capabilities[id];
+  },
+
+  async mcpLaunchInfo(): Promise<McpLaunchInfo> {
+    return {
+      command: "C:\\path\\to\\shellx.exe",
+      args: ["--mcp-stdio"],
+    };
   },
 
   async getMcpPolicy(): Promise<McpPolicySnapshot> {

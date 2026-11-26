@@ -48,6 +48,7 @@ ShellX 面向两类使用者：
 | X11 转发 | 🚧 暂未实现 | Windows 场景价值较低 |
 | 本地 MCP stdio 传输 | ✅ 已实现 | `shellx --mcp-stdio`；JSON-RPC 2.0，命令、SFTP、端口转发工具调用走策略/审计 |
 | MCP 权限配置 | ✅ 已实现 | 可见范围、访问级别、确认阈值、能力上限与工具开关；旧配置自动迁移 |
+| MCP 客户端配置 | ✅ 已实现 | 按当前可执行文件生成 15 种 Agent 客户端的配置并可一键复制 |
 | MCP 交互式终端 | ✅ 已实现 | 默认关闭；需在连接设置中显式开启并确认危险提示，绕过命令级策略 |
 | MCP 端口转发 | ✅ 已实现 | 仅能启动桌面端预定义、绑定回环地址的规则 |
 
@@ -189,7 +190,7 @@ cargo test
 
 ### 测试与 CI
 
-- **前端**：Vitest + jsdom，覆盖设置持久化/默认值迁移与工作区序列化；`npm test`
+- **前端**：Vitest + jsdom，覆盖设置持久化/默认值迁移、工作区序列化，以及 15 种 MCP 客户端配置模板；`npm test`
 - **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法、SFTP 传输取消、MCP 权限继承/迁移/锁定等单元测试；`cargo test`
 - **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发、`exec` 输出/退出码/超时/运行中信号，以及 SFTP 目录列举、创建/重命名/递归删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
 - **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`wait=false` 后台执行、`read_output` 分页与状态轮询、`send_signal`、`close_session`、SFTP 读写/建目录/重命名/递归删除、只读与 staging 写拦截、端口转发启动/停止与非回环拦截、PTY 显式开启/回显/关闭、自定义策略授权/能力上限/工具开关/策略热刷新、`resources/*` 资源读取
@@ -268,6 +269,14 @@ shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
 - 端口转发：MCP 只能启动桌面端已保存的规则，且规则必须绑定回环地址（`127.0.0.1` / `::1` / `localhost`）；启动需要 `write` 级别。默认迁移后 dev 允许，staging/prod 会因确认阈值自动拒绝。MCP 不能创建新规则。
 - 交互式终端：默认关闭，必须在连接设置中勾选「允许 MCP 交互式终端」并确认危险提示；同时要求连接的访问级别为「完全访问」，只读/读写级别始终拒绝。开启后 Agent 获得完整 shell，**绕过命令级策略、环境分级与审批**；每个 stdio 进程最多 8 个终端会话。
 - 终端输出按连接编码解码并保留 ANSI 转义，每个会话只保留最近 256 KiB 原始输出；终端输入内容不写审计，只记录打开/关闭。MCP 终端与桌面端终端标签互不共享，也不会请求 SSH Agent 转发。
+
+### MCP 客户端配置
+
+侧边栏「本地 MCP → 客户端配置」会根据当前运行的可执行文件路径生成对应客户端的配置，并支持一键复制：
+
+Claude Code、Cursor、CodeBuddy Code CLI、ZCode、TRAE、VS Code、Windsurf、Codex、DeepSeek Harness、OpenCode、Pi、Cherry Studio、Qoder、WorkBuddy、Antigravity。
+
+不同客户端使用各自的格式（`mcpServers` JSON、VS Code `servers`、Codex TOML、OpenCode `mcp`、DeepSeek Harness YAML、Cherry Studio 手动条目等），但启动命令都是 `ShellX.exe --mcp-stdio`。配置只包含启动参数，不包含权限或连接范围；权限在「MCP 权限设置」中统一管理。
 
 ### MCP 权限设置
 

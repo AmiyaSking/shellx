@@ -86,6 +86,18 @@ pub fn mcp_server_info(state: State<'_, AppState>) -> Result<McpServerInfo, Stri
     state.mcp_info()
 }
 
+/// Launch information used to generate MCP client configuration snippets.
+#[tauri::command]
+pub fn mcp_launch_info() -> serde_json::Value {
+    let command = std::env::current_exe()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "shellx".to_string());
+    serde_json::json!({
+        "command": command,
+        "args": ["--mcp-stdio"]
+    })
+}
+
 #[tauri::command]
 pub fn get_mcp_policy(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     state.mcp_policy_snapshot()
