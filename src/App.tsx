@@ -7,15 +7,23 @@ import {
   useState,
   type MouseEvent as ReactMouseEvent,
 } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { api, isTauri } from "./lib/api";
 import {
   loadSettings,
   SETTINGS_EVENT,
   type AppSettings,
 } from "./lib/settings";
-import type { Connection, ConnectionInput, McpServerInfo } from "./lib/types";
+import type {
+  AuthPromptClosedEvent,
+  AuthPromptEvent,
+  Connection,
+  ConnectionInput,
+  McpServerInfo,
+} from "./lib/types";
 import { loadWorkspace, saveWorkspace } from "./lib/workspace";
 import AuditDrawer from "./components/AuditDrawer";
+import AuthPromptDialog from "./components/AuthPromptDialog";
 import ConnectionModal from "./components/ConnectionModal";
 import ForwardDrawer from "./components/ForwardDrawer";
 import SettingsDrawer from "./components/SettingsDrawer";
@@ -88,6 +96,7 @@ export default function App() {
   const [importOpen, setImportOpen] = useState(false);
   const [forwardOpen, setForwardOpen] = useState(false);
   const [sftpOpen, setSftpOpen] = useState(false);
+  const [authPrompts, setAuthPrompts] = useState<AuthPromptEvent[]>([]);
   const [mcpInfo, setMcpInfo] = useState<McpServerInfo | null>(null);
   const [modal, setModal] = useState<
     { mode: "create" } | { mode: "edit"; connection: Connection } | null
@@ -155,6 +164,40 @@ export default function App() {
     }, 300);
     return () => window.clearTimeout(timer);
   }, [activeTabId, settings.restoreWorkspace, tabs, workspaceReady]);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let disposed = false;
+    const unlisteners: (() => void)[] = [];
+    const register = (pending: Promise<() => void>) => {
+      void pending.then((dispose) => {
+        if (disposed) dispose();
+        else unlisteners.push(dispose);
+      });
+    };
+
+    register(
+      listen<AuthPromptEvent>("auth:prompt", ({ payload }) => {
+        setAuthPrompts((current) =>
+          current.some((prompt) => prompt.promptId === payload.promptId)
+            ? current
+            : [...current, payload],
+        );
+      }),
+    );
+    register(
+      listen<AuthPromptClosedEvent>("auth:closed", ({ payload }) => {
+        setAuthPrompts((current) =>
+          current.filter((prompt) => prompt.promptId !== payload.promptId),
+        );
+      }),
+    );
+
+    return () => {
+      disposed = true;
+      unlisteners.forEach((dispose) => dispose());
+    };
+  }, []);
 
   useEffect(() => {
     void api.setSessionLogging(loadSettings().sessionLogging).catch(() => {});
@@ -825,6 +868,15 @@ export default function App() {
               : undefined
           }
           onClose={() => setModal(null)}
+        />
+      )}
+
+      {authPrompts[0] && (
+        <AuthPromptDialog
+          prompt={authPrompts[0]}
+          onClose={() =>
+            setAuthPrompts((current) => current.slice(1))
+          }
         />
       )}
     </div>

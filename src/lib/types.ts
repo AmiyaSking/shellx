@@ -289,14 +289,17 @@ export interface AuthPromptInfo {
   echo: boolean;
 }
 
-/** Payload of the `pty:auth-prompt` Tauri event (keyboard-interactive / 2FA). */
-export interface PtyAuthPromptEvent {
-  requestId: string;
-  authId: string;
+/** Payload of the global `auth:prompt` Tauri event (keyboard-interactive / 2FA). */
+export interface AuthPromptEvent {
+  promptId: string;
   host: string;
   name: string;
   instructions: string;
   prompts: AuthPromptInfo[];
+}
+
+export interface AuthPromptClosedEvent {
+  promptId: string;
 }
 
 

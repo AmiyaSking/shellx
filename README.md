@@ -39,7 +39,7 @@ ShellX 面向两类使用者：
 | 端口转发（-L / -R / -D） | ✅ 已实现 | 规则持久化，手动启动/停止，每规则独立 SSH 连接 |
 | SFTP 文件浏览 / 上传 / 下载 | ✅ 已实现 | 独立会话、目录操作、流式传输与进度显示 |
 | 每连接 TERM / 编码 / 启动命令 | ✅ 已实现 | UTF-8 / GBK / GB18030 / Big5，登录后自动执行 |
-| keyboard-interactive / 2FA | ✅ 已实现 | 终端连接时弹窗输入 OTP/口令，跳板机同样支持 |
+| keyboard-interactive / 2FA | ✅ 已实现 | 全局弹窗；终端、端口转发、SFTP、跳板机均支持 |
 | 旧算法兼容 | ✅ 已实现 | 每连接可选 ssh-rsa / SHA-1 KEX/MAC / CBC / 3DES |
 | SSH Agent 转发 | ✅ 已实现 | 每连接可选，OpenSSH Agent / `SSH_AUTH_SOCK` |
 | X11 转发 | 🚧 暂未实现 | Windows 场景价值较低 |
@@ -216,7 +216,7 @@ stdio JSON-RPC 循环将以 `shellx --mcp-stdio` 形式接入；`src-tauri/src/m
 - SSH Agent 转发只对交互式终端会话请求；端口转发/SFTP 不会请求 Agent 通道。Windows 转发依赖 OpenSSH Authentication Agent 服务，Pageant 仅用于认证、不支持转发。
 - 每连接可设置 TERM 类型与字符编码（UTF-8 / GBK / GB18030 / Big5），修改后在下一次连接生效；输出日志记录远端原始编码字节。
 - 「登录后启动命令」会在 shell 建立后自动输入并回车，请只配置可信命令。
-- keyboard-interactive/2FA 目前只在终端连接中弹窗；端口转发与 SFTP 使用独立 SSH 连接，遇到强制 2FA 的服务器会提示先在终端连接。
+- keyboard-interactive/2FA 使用全局认证弹窗，终端、端口转发、SFTP 和跳板机连接都可复用；多个并发认证请求会排队显示，连接取消或超时会自动关闭对应弹窗。
 - 「兼容旧算法」默认关闭，开启后会加入 ssh-rsa、SHA-1 KEX/MAC、CBC 与 3DES；仅用于老旧服务器/网络设备，会降低连接安全性。
 - SFTP 会话独立于终端会话；主机密钥必须先在终端连接中确认。上传会覆盖同名远端文件；删除目录要求目录为空，暂不支持递归删除；重命名采用 SFTP RENAME，目标存在时的行为取决于服务器。
 - 端口转发规则在「转发」面板管理；主机密钥必须先在终端连接中确认。每条运行中的规则使用独立 SSH 连接，不共享终端会话。

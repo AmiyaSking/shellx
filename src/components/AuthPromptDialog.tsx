@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
-import type { PtyAuthPromptEvent } from "../lib/types";
+import type { AuthPromptEvent } from "../lib/types";
 
 interface Props {
-  prompt: PtyAuthPromptEvent;
+  prompt: AuthPromptEvent;
   onClose: () => void;
 }
 
@@ -19,7 +19,7 @@ export default function AuthPromptDialog({ prompt, onClose }: Props) {
     if (busy) return;
     setBusy(true);
     try {
-      await api.ptyAuthCancel(prompt.authId);
+      await api.authCancel(prompt.promptId);
     } catch {
       // The connection will time out or be cancelled separately.
     } finally {
@@ -39,7 +39,7 @@ export default function AuthPromptDialog({ prompt, onClose }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const accepted = await api.ptyAuthRespond(prompt.authId, answers);
+      const accepted = await api.authRespond(prompt.promptId, answers);
       if (!accepted) {
         setError("认证请求已过期或被取消。");
         setBusy(false);

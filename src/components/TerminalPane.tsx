@@ -31,14 +31,12 @@ import {
   type HostKey,
   type HostKeyPrompt,
   type HostKeyTrust,
-  type PtyAuthPromptEvent,
   type PtyClosedEvent,
   type PtyExitEvent,
   type PtyOpenError,
   type PtyOutputEvent,
 } from "../lib/types";
 import ApprovalDialog from "./ApprovalDialog";
-import AuthPromptDialog from "./AuthPromptDialog";
 import HostKeyDialog from "./HostKeyDialog";
 import PasteConfirmDialog from "./PasteConfirmDialog";
 
@@ -146,7 +144,6 @@ export default function TerminalPane({
   const [attempt, setAttempt] = useState(0);
   const [pendingHostKey, setPendingHostKey] = useState<HostKeyPrompt | null>(null);
   const [hostKeyIssue, setHostKeyIssue] = useState<HostKeyPrompt | null>(null);
-  const [authPrompt, setAuthPrompt] = useState<PtyAuthPromptEvent | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [pendingPaste, setPendingPaste] = useState<string | null>(null);
@@ -504,13 +501,6 @@ export default function TerminalPane({
           void api.ptyClose(payload.sessionId).catch(() => {});
         }),
       );
-      unlisteners.push(
-        await listen<PtyAuthPromptEvent>("pty:auth-prompt", ({ payload }) => {
-          if (disposed) return;
-          if (payload.requestId !== cancelRequestRef.current) return;
-          setAuthPrompt(payload);
-        }),
-      );
     };
 
     const startPty = async () => {
@@ -518,7 +508,6 @@ export default function TerminalPane({
       setErrorText(null);
       setHostKey(null);
       setHostKeyIssue(null);
-      setAuthPrompt(null);
       cancelledRef.current = false;
 
       try {
@@ -552,7 +541,6 @@ export default function TerminalPane({
       } catch (err) {
         cancelRequestRef.current = null;
         if (disposed) return;
-        setAuthPrompt(null);
         if (cancelledRef.current) {
           cancelledRef.current = false;
           setStatus("idle");
@@ -767,7 +755,6 @@ export default function TerminalPane({
     if (requestId) {
       void api.ptyCancel(requestId).catch(() => {});
     }
-    setAuthPrompt(null);
     setStatus("idle");
     terminalRef.current?.writeln("\r\n\x1b[33m已请求取消连接…\x1b[0m");
   };
@@ -1060,13 +1047,6 @@ export default function TerminalPane({
           hostKey={pendingHostKey}
           onTrust={trustPendingHostKey}
           onCancel={dismissPendingHostKey}
-        />
-      )}
-
-      {authPrompt && (
-        <AuthPromptDialog
-          prompt={authPrompt}
-          onClose={() => setAuthPrompt(null)}
         />
       )}
 

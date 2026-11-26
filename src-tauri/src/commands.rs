@@ -1,6 +1,7 @@
 use tauri::{AppHandle, State};
 use uuid::Uuid;
 
+use crate::auth_broker::AuthBroker;
 use crate::models::{
     AuditEntry, AuditSource, CommandOutcome, CommandRequest, Connection, ConnectionInput,
     HostKeyTrust, McpServerInfo, PolicyDecision, SessionInfo,
@@ -100,6 +101,7 @@ pub async fn pty_open(
     app: AppHandle,
     state: State<'_, AppState>,
     pty: State<'_, PtyManager>,
+    broker: State<'_, AuthBroker>,
     connection_id: String,
     cols: u32,
     rows: u32,
@@ -114,7 +116,7 @@ pub async fn pty_open(
             trusted_host_keys.unwrap_or_default(),
         )
         .map_err(open_error)?;
-    params.auth_prompter = Some(pty.make_auth_prompter(app.clone(), request_id.clone()));
+    params.auth_prompter = Some(broker.prompter(app.clone()));
     let target = format!("{}@{}:{}", params.username, params.host, params.port);
     let cancel = pty.register_cancel(&request_id).map_err(open_error)?;
     let session_id = Uuid::new_v4().to_string();
@@ -127,7 +129,6 @@ pub async fn pty_open(
         .open(app, session_id.clone(), meta, params, cancel)
         .await;
     pty.clear_cancel(&request_id);
-    pty.clear_auth_for_request(&request_id);
 
     match result {
         Ok(host_key) => {
@@ -165,17 +166,17 @@ pub fn pty_cancel(pty: State<'_, PtyManager>, request_id: String) -> bool {
 }
 
 #[tauri::command]
-pub fn pty_auth_respond(
-    pty: State<'_, PtyManager>,
-    auth_id: String,
+pub fn auth_respond(
+    broker: State<'_, AuthBroker>,
+    prompt_id: String,
     responses: Vec<String>,
 ) -> bool {
-    pty.respond_auth(&auth_id, responses)
+    broker.respond(&prompt_id, responses)
 }
 
 #[tauri::command]
-pub fn pty_auth_cancel(pty: State<'_, PtyManager>, auth_id: String) -> bool {
-    pty.cancel_auth(&auth_id)
+pub fn auth_cancel(broker: State<'_, AuthBroker>, prompt_id: String) -> bool {
+    broker.cancel(&prompt_id)
 }
 
 #[tauri::command]
@@ -302,12 +303,15 @@ pub fn delete_forward_rule(
 
 #[tauri::command]
 pub async fn start_forward(
+    app: AppHandle,
     state: State<'_, AppState>,
     forwards: State<'_, ForwardManager>,
+    broker: State<'_, AuthBroker>,
     id: String,
 ) -> Result<ForwardStatus, String> {
     let rule = state.get_forward_rule(&id)?;
-    let params = state.forward_params(&rule.connection_id)?;
+    let mut params = state.forward_params(&rule.connection_id)?;
+    params.auth_prompter = Some(broker.prompter(app));
     let detail = format!(
         "端口转发启动：{} {}:{} -> {}:{}",
         match rule.kind {
@@ -369,11 +373,14 @@ pub fn list_forward_statuses(
 
 #[tauri::command]
 pub async fn sftp_open(
+    app: AppHandle,
     state: State<'_, AppState>,
     sftp: State<'_, SftpManager>,
+    broker: State<'_, AuthBroker>,
     connection_id: String,
 ) -> Result<SftpOpened, String> {
-    let params = state.forward_params(&connection_id)?;
+    let mut params = state.forward_params(&connection_id)?;
+    params.auth_prompter = Some(broker.prompter(app));
     let session_id = Uuid::new_v4().to_string();
     let opened = sftp
         .open(session_id, connection_id.clone(), params)

@@ -26,20 +26,16 @@ use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
 
 use crate::encoding::base64_encode;
-use crate::ssh::{
-    AuthPromptInfo, AuthPrompter, ConnectParams, HostKey, PtyConn, PtyEvent, SshError,
-};
+use crate::ssh::{ConnectParams, HostKey, PtyConn, PtyEvent, SshError};
 
 pub const EVENT_OUTPUT: &str = "pty:output";
 pub const EVENT_EXIT: &str = "pty:exit";
 pub const EVENT_CLOSED: &str = "pty:closed";
-pub const EVENT_AUTH_PROMPT: &str = "pty:auth-prompt";
 
 /// How long a TCP connect + handshake + auth may take before we give up.
 /// Keyboard-interactive/2FA waits for the user, so this is generous; the UI
 /// can cancel at any time.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(120);
-const AUTH_PROMPT_TIMEOUT: Duration = Duration::from_secs(110);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,22 +66,6 @@ pub struct PtyOpened {
     pub session_id: String,
     pub alias: String,
     pub host_key: HostKey,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PtyAuthPromptPayload {
-    pub request_id: String,
-    pub auth_id: String,
-    pub host: String,
-    pub name: String,
-    pub instructions: String,
-    pub prompts: Vec<AuthPromptInfo>,
-}
-
-struct PendingAuth {
-    request_id: String,
-    sender: oneshot::Sender<Result<Vec<String>, String>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -170,7 +150,6 @@ struct PtyEntry {
 pub struct PtyManager {
     entries: Mutex<HashMap<String, PtyEntry>>,
     cancellations: Mutex<HashMap<String, Arc<Notify>>>,
-    pending_auth: Arc<Mutex<HashMap<String, PendingAuth>>>,
     session_logging: Arc<AtomicBool>,
 }
 
@@ -234,102 +213,6 @@ impl PtyManager {
     pub fn clear_cancel(&self, request_id: &str) {
         if let Ok(mut guard) = self.cancellations.lock() {
             guard.remove(request_id);
-        }
-    }
-
-    /// Build the callback used by keyboard-interactive / 2FA authentication.
-    pub fn make_auth_prompter(
-        &self,
-        app: AppHandle,
-        request_id: String,
-    ) -> AuthPrompter {
-        let pending = self.pending_auth.clone();
-        AuthPrompter::new(move |host, name, instructions, prompts| {
-            let app = app.clone();
-            let pending = pending.clone();
-            let request_id = request_id.clone();
-            Box::pin(async move {
-                let auth_id = uuid::Uuid::new_v4().to_string();
-                let (sender, receiver) = oneshot::channel();
-                {
-                    let mut guard = pending.lock().map_err(|_| {
-                        SshError::Unsupported("认证提示状态锁不可用".to_string())
-                    })?;
-                    guard.insert(
-                        auth_id.clone(),
-                        PendingAuth {
-                            request_id: request_id.clone(),
-                            sender,
-                        },
-                    );
-                }
-
-                let payload = PtyAuthPromptPayload {
-                    request_id,
-                    auth_id: auth_id.clone(),
-                    host: host.clone(),
-                    name,
-                    instructions,
-                    prompts,
-                };
-                if app.emit(EVENT_AUTH_PROMPT, payload).is_err() {
-                    if let Ok(mut guard) = pending.lock() {
-                        guard.remove(&auth_id);
-                    }
-                    return Err(SshError::Unsupported(
-                        "无法在界面中显示认证提示".to_string(),
-                    ));
-                }
-
-                match tokio::time::timeout(AUTH_PROMPT_TIMEOUT, receiver).await {
-                    Ok(Ok(Ok(answers))) => Ok(answers),
-                    Ok(Ok(Err(message))) => Err(SshError::Unsupported(message)),
-                    Ok(Err(_)) => {
-                        Err(SshError::Unsupported("认证请求已取消".to_string()))
-                    }
-                    Err(_) => {
-                        if let Ok(mut guard) = pending.lock() {
-                            guard.remove(&auth_id);
-                        }
-                        Err(SshError::Unsupported(
-                            "交互式认证等待超时".to_string(),
-                        ))
-                    }
-                }
-            })
-        })
-    }
-
-    pub fn respond_auth(&self, auth_id: &str, responses: Vec<String>) -> bool {
-        let entry = self
-            .pending_auth
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.remove(auth_id));
-        match entry {
-            Some(entry) => entry.sender.send(Ok(responses)).is_ok(),
-            None => false,
-        }
-    }
-
-    pub fn cancel_auth(&self, auth_id: &str) -> bool {
-        let entry = self
-            .pending_auth
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.remove(auth_id));
-        match entry {
-            Some(entry) => {
-                let _ = entry.sender.send(Err("用户取消了认证".to_string()));
-                true
-            }
-            None => false,
-        }
-    }
-
-    pub fn clear_auth_for_request(&self, request_id: &str) {
-        if let Ok(mut guard) = self.pending_auth.lock() {
-            guard.retain(|_, pending| pending.request_id != request_id);
         }
     }
 

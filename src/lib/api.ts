@@ -89,17 +89,17 @@ export const api = {
       ? invoke<boolean>("pty_cancel", { requestId })
       : Promise.resolve(false),
 
-  ptyAuthRespond: (
-    authId: string,
+  authRespond: (
+    promptId: string,
     responses: string[],
   ): Promise<boolean> =>
     isTauri()
-      ? invoke<boolean>("pty_auth_respond", { authId, responses })
+      ? invoke<boolean>("auth_respond", { promptId, responses })
       : Promise.resolve(true),
 
-  ptyAuthCancel: (authId: string): Promise<boolean> =>
+  authCancel: (promptId: string): Promise<boolean> =>
     isTauri()
-      ? invoke<boolean>("pty_auth_cancel", { authId })
+      ? invoke<boolean>("auth_cancel", { promptId })
       : Promise.resolve(true),
 
   forgetHostKey: (host: string, port: number): Promise<boolean> =>

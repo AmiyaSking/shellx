@@ -1,4 +1,5 @@
 mod audit;
+mod auth_broker;
 mod commands;
 mod connections;
 mod encoding;
@@ -33,6 +34,7 @@ pub fn run() {
             app.manage(pty::PtyManager::new());
             app.manage(forwards::ForwardManager::new());
             app.manage(sftp::SftpManager::new());
+            app.manage(auth_broker::AuthBroker::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -48,8 +50,8 @@ pub fn run() {
             commands::mcp_server_info,
             commands::pty_open,
             commands::pty_cancel,
-            commands::pty_auth_respond,
-            commands::pty_auth_cancel,
+            commands::auth_respond,
+            commands::auth_cancel,
             commands::pty_write,
             commands::pty_resize,
             commands::pty_signal,
@@ -82,6 +84,7 @@ pub fn run() {
             app_handle.state::<pty::PtyManager>().shutdown();
             app_handle.state::<forwards::ForwardManager>().shutdown();
             app_handle.state::<sftp::SftpManager>().shutdown();
+            app_handle.state::<auth_broker::AuthBroker>().shutdown();
         }
     });
 }
