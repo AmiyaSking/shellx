@@ -46,7 +46,9 @@ ShellX 面向两类使用者：
 | 旧算法兼容 | ✅ 已实现 | 每连接可选 ssh-rsa / SHA-1 KEX/MAC / CBC / 3DES |
 | SSH Agent 转发 | ✅ 已实现 | 每连接可选，OpenSSH Agent / `SSH_AUTH_SOCK` |
 | X11 转发 | 🚧 暂未实现 | Windows 场景价值较低 |
-| 本地 MCP stdio 传输 | ✅ 已实现 | `shellx --mcp-stdio`；JSON-RPC 2.0，命令与 SFTP 工具调用走策略/审计 |
+| 本地 MCP stdio 传输 | ✅ 已实现 | `shellx --mcp-stdio`；JSON-RPC 2.0，命令、SFTP、端口转发工具调用走策略/审计 |
+| MCP 交互式终端 | ✅ 已实现 | 默认关闭；需在连接设置中显式开启并确认危险提示，绕过命令级策略 |
+| MCP 端口转发 | ✅ 已实现 | 仅能启动桌面端预定义、绑定回环地址的规则 |
 
 > 桌面版连接真实服务器；浏览器 `npm run dev` 会使用内置 Mock 后端，界面显示「浏览器 Mock 模式」。
 
@@ -187,7 +189,7 @@ cargo test
 - **前端**：Vitest + jsdom，覆盖设置持久化/默认值迁移与工作区序列化；`npm test`
 - **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法、SFTP 传输取消等单元测试；`cargo test`
 - **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发、`exec` 输出/退出码/超时/运行中信号，以及 SFTP 目录列举、创建/重命名/递归删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
-- **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`wait=false` 后台执行、`read_output` 分页与状态轮询、`send_signal`、`close_session`、SFTP 读写/建目录/重命名/递归删除、只读与 staging 写拦截、`resources/*` 资源读取
+- **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`wait=false` 后台执行、`read_output` 分页与状态轮询、`send_signal`、`close_session`、SFTP 读写/建目录/重命名/递归删除、只读与 staging 写拦截、端口转发启动/停止与非回环拦截、PTY 显式开启/回显/关闭、`resources/*` 资源读取
 - **CI**：`.github/workflows/ci.yml` 在 Windows 上执行前端测试/构建 + `cargo test` / `cargo check`
 - 系统凭据存储的读写测试标记为 `#[ignore]`，需要手动运行：
   `cargo test keyring_roundtrip -- --ignored`
@@ -221,6 +223,12 @@ Tauri 应用数据目录（标识符 `com.shellx.app`）下：
 | `sftp_write_file` | 中 | 已实现：创建/覆盖远端文件（最大 1 MiB） |
 | `sftp_mkdir` / `sftp_rename` | 中 | 已实现：创建目录 / 重命名远端路径 |
 | `sftp_remove` | 中 | 已实现：删除远端文件；删除目录需显式 `recursive=true` |
+| `list_forward_rules` | 低 | 已实现：列出已保存的转发规则与运行状态 |
+| `start_forward` / `stop_forward` | 中 | 已实现：启动/停止桌面端预定义规则，仅允许回环监听 |
+| `terminal_open` | 高 | 已实现：打开交互式 PTY；需连接显式开启「MCP 交互式终端」（默认关闭） |
+| `terminal_write` | 高 | 已实现：向终端发送输入，文本按连接编码转换或传 base64 原始字节 |
+| `terminal_read` | 中 | 已实现：读取最近输出（默认 64 KiB，最大 256 KiB） |
+| `terminal_resize` / `terminal_signal` / `terminal_close` | 低 / 中 | 已实现：调整窗口大小、向前台进程发信号、关闭会话 |
 
 以 stdio 方式启动（MCP 客户端会自行拉起该进程）：
 
@@ -253,6 +261,9 @@ shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
 - SFTP 工具沿用连接的 `mcpAccess`：`read_only` 只能读取；`standard_controlled` 在 dev 环境允许写入/删除，staging/prod 的写操作按命令矩阵需要审批，stdio 模式会自动拒绝并写审计。
 - SFTP 单次读取默认 64 KiB、最大 512 KiB；单次写入最大 1 MiB；删除目录必须显式传 `recursive=true`。
 - SFTP 工具只操作远端路径，不接受本地文件路径；主机密钥同样必须先在桌面端确认，2FA 在 stdio 模式下不可用。
+- 端口转发：MCP 只能启动桌面端已保存的规则，且规则必须绑定回环地址（`127.0.0.1` / `::1` / `localhost`）；`read_only` 连接不允许启动，staging/prod 受控连接按写操作矩阵自动拒绝。MCP 不能创建新规则。
+- 交互式终端：默认关闭，必须在连接设置中勾选「允许 MCP 交互式终端」并确认危险提示；只有 MCP 授权为「受控」的连接可以开启，只读连接始终拒绝。开启后 Agent 获得完整 shell，**绕过命令级策略、环境分级与审批**；每个 stdio 进程最多 8 个终端会话。
+- 终端输出按连接编码解码并保留 ANSI 转义，每个会话只保留最近 256 KiB 原始输出；终端输入内容不写审计，只记录打开/关闭。MCP 终端与桌面端终端标签互不共享，也不会请求 SSH Agent 转发。
 
 ### MCP 资源（只读）
 
@@ -275,6 +286,7 @@ shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
 
 - 凭据保存在系统凭据存储；Linux 当前使用内核 keyring，重启后可能需要重新输入，后续可切换到 Secret Service。`shellx --mcp-stdio` 以独立进程读取同一个凭据存储，Linux 内核 keyring 在跨进程/重启场景下可能读不到口令。
 - `shellx --mcp-stdio` 使用与桌面版相同的应用数据目录（可用 `--data-dir` 或 `SHELLX_DATA_DIR` 覆盖）；主机密钥必须先在桌面端终端连接中确认。stdio 模式没有审批弹窗，需要人工审批的命令会被自动拒绝并记入审计。
+- 连接设置中的「允许 MCP 交互式终端」默认关闭，且只有 MCP 授权为「受控」时才能勾选；开启时会弹出危险确认，只读连接始终不能使用交互式终端。
 - 浏览器 Mock 模式不会建立任何网络连接；桌面版才会连接真实服务器。
 - 当前暂不支持多级跳板机、嵌套混合分屏、X11 转发。
 - SSH Agent 转发只对交互式终端会话请求；端口转发/SFTP 不会请求 Agent 通道。Windows 转发依赖 OpenSSH Authentication Agent 服务，Pageant 仅用于认证、不支持转发。
@@ -283,7 +295,7 @@ shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
 - keyboard-interactive/2FA 使用全局认证弹窗，终端、端口转发、SFTP 和跳板机连接都可复用；多个并发认证请求会排队显示，连接取消或超时会自动关闭对应弹窗。
 - 「兼容旧算法」默认关闭，开启后会加入 ssh-rsa、SHA-1 KEX/MAC、CBC 与 3DES；仅用于老旧服务器/网络设备，会降低连接安全性。
 - SFTP 会话独立于终端会话；MCP 的 SFTP 会话运行在 stdio 进程内，与桌面端 SFTP 面板互不共享，需通过 `sftp_open` 单独建立；主机密钥必须先在终端连接中确认。上传会覆盖同名远端文件；删除目录会递归删除其中的全部内容（会先弹出确认）；上传/下载可随时取消，取消后可能留下部分本地或远端文件；重命名采用 SFTP RENAME，目标存在时的行为取决于服务器。
-- 端口转发规则在「转发」面板管理；主机密钥必须先在终端连接中确认。每条运行中的规则使用独立 SSH 连接，不共享终端会话。
+- 端口转发规则在「转发」面板管理；主机密钥必须先在终端连接中确认。每条运行中的规则使用独立 SSH 连接，不共享终端会话。MCP 启动的转发运行在 stdio 进程内，与桌面端「转发」面板的运行状态互不共享，但规则本身通过 `forwards.json` 共享。
 - `-R` 的非回环监听需要服务器端允许 `GatewayPorts`；`-D` 当前为无认证 SOCKS5，建议只监听 `127.0.0.1`。
 - SSH config 导入为一次性预览：`Include` 不会展开，`Match` 与通配符 Host 会跳过；`ProxyJump` 仅在目标同时被导入或已存在时映射，多级跳转按直连导入并提示。
 - 「启动时恢复工作区」默认关闭；开启后会在应用启动时使用已保存连接自动重连。

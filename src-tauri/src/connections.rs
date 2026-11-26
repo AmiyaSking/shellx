@@ -86,6 +86,7 @@ impl ConnectionStore {
             environment: input.environment,
             auth: input.auth,
             mcp_access: input.mcp_access,
+            mcp_pty_enabled: input.mcp_pty_enabled,
             jump_host: input.jump_host,
             remark: input.remark,
             term: if input.term.trim().is_empty() {

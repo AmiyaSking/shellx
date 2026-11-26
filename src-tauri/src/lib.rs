@@ -5,6 +5,7 @@ mod connections;
 mod encoding;
 mod forwards;
 mod mcp;
+mod mcp_pty;
 mod mcp_stdio;
 mod models;
 mod policy;

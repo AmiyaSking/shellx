@@ -23,6 +23,8 @@ export interface Connection {
   environment: Environment;
   auth: AuthMethod;
   mcpAccess: McpAccessMode;
+  /** Allow MCP clients to open a full interactive PTY (dangerous). */
+  mcpPtyEnabled: boolean;
   jumpHost?: string | null;
   remark: string;
   term: string;
@@ -45,6 +47,7 @@ export interface ConnectionInput {
   environment: Environment;
   auth: AuthMethod;
   mcpAccess: McpAccessMode;
+  mcpPtyEnabled?: boolean;
   jumpHost?: string | null;
   remark: string;
   term: string;

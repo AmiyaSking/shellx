@@ -120,6 +120,14 @@ export default function Sidebar({
                     >
                       MCP · {MCP_ACCESS_LABELS[connection.mcpAccess]}
                     </span>
+                    {connection.mcpPtyEnabled && (
+                      <span
+                        className="mini-badge mcp-pty"
+                        title="MCP 交互式终端已开启（危险：绕过命令级策略）"
+                      >
+                        PTY ⚠
+                      </span>
+                    )}
                     {connection.tags.slice(0, 3).map((tag) => (
                       <span className="mini-badge" key={tag}>
                         {tag}

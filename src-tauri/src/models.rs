@@ -98,6 +98,10 @@ pub struct Connection {
     #[serde(default)]
     pub auth: AuthMethod,
     pub mcp_access: McpAccessMode,
+    /// Allow MCP clients to open a full interactive PTY. Off by default
+    /// because an interactive shell bypasses command-level policy.
+    #[serde(default)]
+    pub mcp_pty_enabled: bool,
     #[serde(default)]
     pub jump_host: Option<String>,
     #[serde(default)]
@@ -134,6 +138,8 @@ pub struct ConnectionInput {
     pub auth: AuthMethod,
     #[serde(default)]
     pub mcp_access: McpAccessMode,
+    #[serde(default)]
+    pub mcp_pty_enabled: bool,
     #[serde(default)]
     pub jump_host: Option<String>,
     #[serde(default)]

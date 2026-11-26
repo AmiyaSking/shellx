@@ -2,11 +2,37 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::encoding::base64_decode;
+use crate::forwards::ForwardManager;
+use crate::mcp_pty::McpPtyManager;
 use crate::models::{
     AuditSource, CommandOutcome, CommandRequest, McpToolInfo, RiskLevel,
 };
 use crate::sftp::SftpManager;
 use crate::state::{AppState, CommandStart};
+
+/// Managers owned by the MCP stdio process. They are independent of the
+/// desktop app's Tauri-managed instances (separate process).
+pub struct McpServices {
+    pub sftp: SftpManager,
+    pub forwards: ForwardManager,
+    pub pty: McpPtyManager,
+}
+
+impl McpServices {
+    pub fn new() -> Self {
+        Self {
+            sftp: SftpManager::new(),
+            forwards: ForwardManager::new(),
+            pty: McpPtyManager::new(),
+        }
+    }
+}
+
+impl Default for McpServices {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub struct ToolDef {
     pub name: &'static str,
@@ -86,6 +112,51 @@ pub const TOOL_CATALOG: &[ToolDef] = &[
         name: "sftp_rename",
         description: "重命名远端文件或目录",
         risk: RiskLevel::Medium,
+    },
+    ToolDef {
+        name: "list_forward_rules",
+        description: "列出已保存的端口转发规则及其运行状态",
+        risk: RiskLevel::Low,
+    },
+    ToolDef {
+        name: "start_forward",
+        description: "启动桌面端预定义的端口转发规则（仅允许回环监听）",
+        risk: RiskLevel::Medium,
+    },
+    ToolDef {
+        name: "stop_forward",
+        description: "停止运行中的端口转发规则",
+        risk: RiskLevel::Medium,
+    },
+    ToolDef {
+        name: "terminal_open",
+        description: "打开交互式 PTY（危险：需连接显式开启 MCP 终端，绕过命令级策略）",
+        risk: RiskLevel::High,
+    },
+    ToolDef {
+        name: "terminal_write",
+        description: "向交互式终端发送输入（文本或 base64 原始字节）",
+        risk: RiskLevel::High,
+    },
+    ToolDef {
+        name: "terminal_read",
+        description: "读取交互式终端最近的输出",
+        risk: RiskLevel::Medium,
+    },
+    ToolDef {
+        name: "terminal_resize",
+        description: "调整交互式终端窗口大小",
+        risk: RiskLevel::Low,
+    },
+    ToolDef {
+        name: "terminal_signal",
+        description: "向交互式终端的前台进程发送信号",
+        risk: RiskLevel::Medium,
+    },
+    ToolDef {
+        name: "terminal_close",
+        description: "关闭交互式终端会话",
+        risk: RiskLevel::Low,
     },
 ];
 
@@ -250,6 +321,86 @@ pub fn tool_definitions() -> Vec<Value> {
                     "required": ["session_id", "old_path", "new_path"],
                     "additionalProperties": false
                 }),
+                "list_forward_rules" => json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                "start_forward" => json!({
+                    "type": "object",
+                    "properties": { "rule_id": { "type": "string" } },
+                    "required": ["rule_id"],
+                    "additionalProperties": false
+                }),
+                "stop_forward" => json!({
+                    "type": "object",
+                    "properties": { "rule_id": { "type": "string" } },
+                    "required": ["rule_id"],
+                    "additionalProperties": false
+                }),
+                "terminal_open" => json!({
+                    "type": "object",
+                    "properties": {
+                        "connection_id": { "type": "string", "description": "已开启 MCP 交互式终端的连接 ID" },
+                        "cols": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "默认 80" },
+                        "rows": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "默认 24" }
+                    },
+                    "required": ["connection_id"],
+                    "additionalProperties": false
+                }),
+                "terminal_write" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "data": { "type": "string", "description": "要发送的输入；文本会自动按连接编码转换" },
+                        "encoding": {
+                            "type": "string",
+                            "enum": ["text", "base64"],
+                            "description": "默认 text；base64 可发送任意控制字节"
+                        }
+                    },
+                    "required": ["session_id", "data"],
+                    "additionalProperties": false
+                }),
+                "terminal_read" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "max_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 262144,
+                            "description": "读取最近多少字节的输出，默认 65536"
+                        }
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                }),
+                "terminal_resize" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "cols": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                        "rows": { "type": "integer", "minimum": 1, "maximum": 1000 }
+                    },
+                    "required": ["session_id", "cols", "rows"],
+                    "additionalProperties": false
+                }),
+                "terminal_signal" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "signal": { "type": "string" }
+                    },
+                    "required": ["session_id", "signal"],
+                    "additionalProperties": false
+                }),
+                "terminal_close" => json!({
+                    "type": "object",
+                    "properties": { "session_id": { "type": "string" } },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                }),
                 _ => json!({
                     "type": "object",
                     "properties": {},
@@ -359,7 +510,7 @@ fn resource_text(uri: &str, mime_type: &str, text: String) -> Value {
 /// rejected (and audited) instead of hanging forever.
 pub async fn dispatch_tool(
     state: &AppState,
-    sftp: &SftpManager,
+    services: &McpServices,
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
@@ -466,7 +617,8 @@ pub async fn dispatch_tool(
                 state.authorize_sftp(connection_id, false, "打开 SFTP 会话")?;
             let params = state.sftp_params(connection_id)?;
             let session_id = Uuid::new_v4().to_string();
-            let opened = sftp
+            let opened = services
+                .sftp
                 .open(session_id.clone(), connection_id.to_string(), params)
                 .await?;
             state.record_agent_event(
@@ -481,8 +633,8 @@ pub async fn dispatch_tool(
         }
         "sftp_close" => {
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
-            let connection_id = sftp.connection_id(session_id);
-            let closed = sftp.close(session_id).await;
+            let connection_id = services.sftp.connection_id(session_id);
+            let closed = services.sftp.close(session_id).await;
             if closed {
                 if let Some(connection_id) = connection_id {
                     state.record_agent_event(
@@ -495,27 +647,27 @@ pub async fn dispatch_tool(
         }
         "sftp_list" => {
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
-            let connection_id = sftp_connection(sftp, session_id)?;
+            let connection_id = sftp_connection(&services.sftp, session_id)?;
             state.authorize_sftp(&connection_id, false, "列出 SFTP 目录")?;
             let path = arguments
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or(".")
                 .to_string();
-            let listing = sftp.list(session_id, path).await?;
+            let listing = services.sftp.list(session_id, path).await?;
             serde_json::to_value(listing).map_err(|error| error.to_string())
         }
         "sftp_stat" => {
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
-            let connection_id = sftp_connection(sftp, session_id)?;
+            let connection_id = sftp_connection(&services.sftp, session_id)?;
             state.authorize_sftp(&connection_id, false, "读取 SFTP 元信息")?;
             let path = string_arg(&arguments, "path", "path")?.to_string();
-            let entry = sftp.stat(session_id, path).await?;
+            let entry = services.sftp.stat(session_id, path).await?;
             serde_json::to_value(entry).map_err(|error| error.to_string())
         }
         "sftp_read_file" => {
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
-            let connection_id = sftp_connection(sftp, session_id)?;
+            let connection_id = sftp_connection(&services.sftp, session_id)?;
             state.authorize_sftp(&connection_id, false, "读取 SFTP 文件")?;
             let path = string_arg(&arguments, "path", "path")?.to_string();
             let max_bytes = arguments
@@ -523,7 +675,7 @@ pub async fn dispatch_tool(
                 .and_then(Value::as_u64)
                 .unwrap_or(64 * 1024)
                 .clamp(1, 512 * 1024) as usize;
-            let file = sftp.read_file(session_id, path.clone(), max_bytes).await?;
+            let file = services.sftp.read_file(session_id, path.clone(), max_bytes).await?;
             state.record_agent_event(
                 Some(&connection_id),
                 format!(
@@ -538,7 +690,7 @@ pub async fn dispatch_tool(
             const MAX_WRITE_BYTES: usize = 1024 * 1024;
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
             let path = string_arg(&arguments, "path", "path")?.to_string();
-            let connection_id = sftp_connection(sftp, session_id)?;
+            let connection_id = sftp_connection(&services.sftp, session_id)?;
             state.authorize_sftp(
                 &connection_id,
                 true,
@@ -562,7 +714,7 @@ pub async fn dispatch_tool(
                     MAX_WRITE_BYTES
                 ));
             }
-            let bytes = sftp.write_file(session_id, path.clone(), data).await?;
+            let bytes = services.sftp.write_file(session_id, path.clone(), data).await?;
             state.record_agent_event(
                 Some(&connection_id),
                 format!("MCP 写入 SFTP 文件 {path}（{bytes} 字节）"),
@@ -576,13 +728,13 @@ pub async fn dispatch_tool(
         "sftp_mkdir" => {
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
             let path = string_arg(&arguments, "path", "path")?.to_string();
-            let connection_id = sftp_connection(sftp, session_id)?;
+            let connection_id = sftp_connection(&services.sftp, session_id)?;
             state.authorize_sftp(
                 &connection_id,
                 true,
                 &format!("创建 SFTP 目录 {path}"),
             )?;
-            sftp.create_dir(session_id, path.clone()).await?;
+            services.sftp.create_dir(session_id, path.clone()).await?;
             state.record_agent_event(
                 Some(&connection_id),
                 format!("MCP 创建 SFTP 目录 {path}"),
@@ -603,13 +755,13 @@ pub async fn dispatch_tool(
             if is_dir && !recursive {
                 return Err("删除目录需要显式传入 recursive=true".into());
             }
-            let connection_id = sftp_connection(sftp, session_id)?;
+            let connection_id = sftp_connection(&services.sftp, session_id)?;
             state.authorize_sftp(
                 &connection_id,
                 true,
                 &format!("删除 SFTP 路径 {path}"),
             )?;
-            sftp.remove(session_id, path.clone(), is_dir).await?;
+            services.sftp.remove(session_id, path.clone(), is_dir).await?;
             state.record_agent_event(
                 Some(&connection_id),
                 format!(
@@ -623,13 +775,13 @@ pub async fn dispatch_tool(
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
             let old_path = string_arg(&arguments, "old_path", "oldPath")?.to_string();
             let new_path = string_arg(&arguments, "new_path", "newPath")?.to_string();
-            let connection_id = sftp_connection(sftp, session_id)?;
+            let connection_id = sftp_connection(&services.sftp, session_id)?;
             state.authorize_sftp(
                 &connection_id,
                 true,
                 &format!("重命名 SFTP 路径 {old_path} -> {new_path}"),
             )?;
-            sftp.rename(session_id, old_path.clone(), new_path.clone())
+            services.sftp.rename(session_id, old_path.clone(), new_path.clone())
                 .await?;
             state.record_agent_event(
                 Some(&connection_id),
@@ -641,6 +793,181 @@ pub async fn dispatch_tool(
                 "newPath": new_path,
                 "renamed": true
             }))
+        }
+        "list_forward_rules" => {
+            let mut rules = Vec::new();
+            for rule in state.list_forward_rules()? {
+                let status = services.forwards.status(&rule.id);
+                rules.push(json!({
+                    "id": rule.id,
+                    "connectionId": rule.connection_id,
+                    "kind": rule.kind,
+                    "bindHost": rule.bind_host,
+                    "bindPort": rule.bind_port,
+                    "targetHost": rule.target_host,
+                    "targetPort": rule.target_port,
+                    "remark": rule.remark,
+                    "running": status.running,
+                    "boundPort": status.bound_port,
+                    "error": status.error
+                }));
+            }
+            Ok(json!({ "rules": rules }))
+        }
+        "start_forward" => {
+            let rule_id = string_arg(&arguments, "rule_id", "ruleId")?;
+            let rule = state.get_forward_rule(rule_id)?;
+            let connection = state.authorize_mcp_action(
+                &rule.connection_id,
+                true,
+                &format!("启动端口转发规则 {}", rule.id),
+            )?;
+            if !is_loopback_bind(&rule.bind_host) {
+                return Err(
+                    "MCP 只能启动绑定回环地址（127.0.0.1 / ::1 / localhost）的转发规则"
+                        .into(),
+                );
+            }
+            let params = state.forward_params(&rule.connection_id)?;
+            match services.forwards.start(rule.clone(), params).await {
+                Ok(status) => {
+                    state.record_agent_event(
+                        Some(&connection.id),
+                        format!(
+                            "MCP 启动端口转发 {}（{}:{} -> {}:{}）",
+                            rule.id,
+                            rule.bind_host,
+                            status.bound_port.unwrap_or(rule.bind_port),
+                            rule.target_host,
+                            rule.target_port
+                        ),
+                    );
+                    serde_json::to_value(status).map_err(|error| error.to_string())
+                }
+                Err(error) => {
+                    state.record_agent_event(
+                        Some(&connection.id),
+                        format!("MCP 启动端口转发失败 {}：{error}", rule.id),
+                    );
+                    Err(error)
+                }
+            }
+        }
+        "stop_forward" => {
+            let rule_id = string_arg(&arguments, "rule_id", "ruleId")?;
+            let connection_id = state
+                .get_forward_rule(rule_id)
+                .ok()
+                .map(|rule| rule.connection_id);
+            let stopped = services.forwards.stop(rule_id);
+            if stopped {
+                state.record_agent_event(
+                    connection_id.as_deref(),
+                    format!("MCP 停止端口转发 {rule_id}"),
+                );
+            }
+            Ok(json!({ "ruleId": rule_id, "stopped": stopped }))
+        }
+        "terminal_open" => {
+            let connection_id = string_arg(&arguments, "connection_id", "connectionId")?;
+            let connection = state.authorize_mcp_pty(connection_id)?;
+            let cols = arguments
+                .get("cols")
+                .and_then(Value::as_u64)
+                .unwrap_or(80)
+                .clamp(1, 1000) as u32;
+            let rows = arguments
+                .get("rows")
+                .and_then(Value::as_u64)
+                .unwrap_or(24)
+                .clamp(1, 1000) as u32;
+            let (_, mut params) =
+                state.pty_params(connection_id, cols, rows, Vec::new())?;
+            // Agent-driven shells never receive the user's SSH agent.
+            params.agent_forwarding = false;
+            let session_id = Uuid::new_v4().to_string();
+            let opened = services
+                .pty
+                .open(session_id.clone(), connection_id.to_string(), params)
+                .await?;
+            state.record_agent_event(
+                Some(&connection.id),
+                format!("MCP 打开交互式终端 {session_id}（{cols}x{rows}）"),
+            );
+            serde_json::to_value(opened).map_err(|error| error.to_string())
+        }
+        "terminal_write" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let connection_id = services
+                .pty
+                .connection_id(session_id)
+                .ok_or_else(|| format!("终端会话 {session_id} 不存在或已关闭"))?;
+            state.authorize_mcp_pty(&connection_id)?;
+            let data = string_arg(&arguments, "data", "data")?;
+            let encoding = arguments
+                .get("encoding")
+                .and_then(Value::as_str)
+                .unwrap_or("text")
+                .to_ascii_lowercase();
+            match encoding.as_str() {
+                "base64" => {
+                    services.pty.write(session_id, base64_decode(data)?).await?;
+                }
+                "text" | "utf-8" | "utf8" => {
+                    services.pty.write_text(session_id, data).await?;
+                }
+                other => return Err(format!("不支持的 encoding：{other}")),
+            }
+            Ok(json!({ "sessionId": session_id, "written": true }))
+        }
+        "terminal_read" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let connection_id = services
+                .pty
+                .connection_id(session_id)
+                .ok_or_else(|| format!("终端会话 {session_id} 不存在或已关闭"))?;
+            state.authorize_mcp_pty(&connection_id)?;
+            let max_bytes = arguments
+                .get("max_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(64 * 1024)
+                .clamp(1, 256 * 1024) as usize;
+            let output = services.pty.read(session_id, max_bytes)?;
+            serde_json::to_value(output).map_err(|error| error.to_string())
+        }
+        "terminal_resize" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let cols = arguments
+                .get("cols")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "缺少 cols 参数".to_string())? as u32;
+            let rows = arguments
+                .get("rows")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "缺少 rows 参数".to_string())? as u32;
+            if !(1..=1000).contains(&cols) || !(1..=1000).contains(&rows) {
+                return Err("cols/rows 必须在 1-1000 之间".into());
+            }
+            services.pty.resize(session_id, cols, rows).await?;
+            Ok(json!({ "sessionId": session_id, "cols": cols, "rows": rows }))
+        }
+        "terminal_signal" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let signal = string_arg(&arguments, "signal", "signal")?;
+            services.pty.signal(session_id, signal).await?;
+            Ok(json!({ "sessionId": session_id, "signal": signal, "sent": true }))
+        }
+        "terminal_close" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let connection_id = services.pty.connection_id(session_id);
+            let closed = services.pty.close(session_id).await;
+            if closed {
+                state.record_agent_event(
+                    connection_id.as_deref(),
+                    format!("MCP 关闭交互式终端 {session_id}"),
+                );
+            }
+            Ok(json!({ "sessionId": session_id, "closed": closed }))
         }
         other => Err(format!("未知 MCP 工具: {other}")),
     }
@@ -671,6 +998,11 @@ async fn finish_outcome(
             ))
         }
     }
+}
+
+fn is_loopback_bind(host: &str) -> bool {
+    let host = host.trim();
+    host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
 }
 
 fn sftp_connection(sftp: &SftpManager, session_id: &str) -> Result<String, String> {

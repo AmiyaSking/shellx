@@ -125,6 +125,15 @@ impl AppState {
         Ok(lock(&self.connections)?.list())
     }
 
+    /// Re-read persisted connection and forwarding settings. The MCP stdio
+    /// process is long-lived and runs alongside the GUI, so permission and
+    /// PTY toggles must take effect without restarting the MCP server.
+    pub fn refresh_from_disk(&self) -> Result<(), String> {
+        *lock(&self.connections)? = ConnectionStore::load(&self.data_dir);
+        *lock(&self.forwards)? = ForwardStore::load(&self.data_dir);
+        Ok(())
+    }
+
     pub fn save_connection(&self, input: ConnectionInput) -> Result<Connection, String> {
         let password = input.password.clone();
         let passphrase = input.passphrase.clone();
@@ -200,22 +209,62 @@ impl AppState {
         write: bool,
         action: &str,
     ) -> Result<Connection, String> {
+        self.authorize_mcp_action(connection_id, write, action)
+    }
+
+    /// Gate an MCP-originated action by connection authorization and, for
+    /// writes, the environment matrix. Returns the connection for auditing.
+    pub fn authorize_mcp_action(
+        &self,
+        connection_id: &str,
+        write: bool,
+        action: &str,
+    ) -> Result<Connection, String> {
         let connection = self.get_connection(connection_id)?;
         let denial = match connection.mcp_access {
             McpAccessMode::Disabled => Some("该连接未授权给 MCP".to_string()),
             McpAccessMode::ReadOnly if write => {
-                Some("该连接对 MCP 为只读模式，不允许 SFTP 写入或删除".to_string())
+                Some("该连接对 MCP 为只读模式，不允许写入或删除".to_string())
             }
             McpAccessMode::StandardControlled
                 if write && connection.environment != Environment::Dev =>
             {
                 Some(format!(
-                    "{} 环境的 SFTP 写操作需要人工审批，stdio 模式无法审批，已自动拒绝",
+                    "{} 环境的写操作需要人工审批，stdio 模式无法审批，已自动拒绝",
                     connection.environment.label()
                 ))
             }
             _ => None,
         };
+        self.finish_authorization(connection, action, denial)
+    }
+
+    /// Interactive PTY is a separate, explicit opt-in: an interactive shell
+    /// bypasses command-level policy, so it is off unless the connection says
+    /// `mcpPtyEnabled`.
+    pub fn authorize_mcp_pty(&self, connection_id: &str) -> Result<Connection, String> {
+        let connection = self.get_connection(connection_id)?;
+        let denial = match connection.mcp_access {
+            McpAccessMode::Disabled => Some("该连接未授权给 MCP".to_string()),
+            McpAccessMode::ReadOnly => Some(
+                "MCP 交互式终端要求连接的 MCP 授权为「受控」，只读连接不能开启"
+                    .to_string(),
+            ),
+            McpAccessMode::StandardControlled if !connection.mcp_pty_enabled => Some(
+                "该连接未开启 MCP 交互式终端；请在桌面端编辑连接并显式开启（危险）"
+                    .to_string(),
+            ),
+            McpAccessMode::StandardControlled => None,
+        };
+        self.finish_authorization(connection, "打开 MCP 交互式终端", denial)
+    }
+
+    fn finish_authorization(
+        &self,
+        connection: Connection,
+        action: &str,
+        denial: Option<String>,
+    ) -> Result<Connection, String> {
         if let Some(reason) = denial {
             let _ = self.audit.log(make_audit(
                 AuditSource::Agent,

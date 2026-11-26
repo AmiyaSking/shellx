@@ -31,6 +31,7 @@ interface FormState {
   password: string;
   passphrase: string;
   mcpAccess: McpAccessMode;
+  mcpPtyEnabled: boolean;
   jumpHost: string;
   remark: string;
   term: string;
@@ -54,6 +55,7 @@ function initialForm(connection: Connection | null): FormState {
     password: "",
     passphrase: "",
     mcpAccess: connection?.mcpAccess ?? "disabled",
+    mcpPtyEnabled: connection?.mcpPtyEnabled ?? false,
     jumpHost: connection?.jumpHost ?? "",
     remark: connection?.remark ?? "",
     term: connection?.term ?? "xterm-256color",
@@ -89,6 +91,17 @@ export default function ConnectionModal({
     setForm((current) => ({ ...current, [key]: value }));
   };
 
+  const toggleMcpPty = (enabled: boolean) => {
+    if (!enabled) {
+      set("mcpPtyEnabled", false);
+      return;
+    }
+    const confirmed = window.confirm(
+      "危险：开启后 MCP Agent 可以获得完整的交互式 shell，绕过命令级策略、风险分级与审批。\n\n仅在完全信任接入的 Agent 时开启。确定开启吗？",
+    );
+    if (confirmed) set("mcpPtyEnabled", true);
+  };
+
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
     const port = Number(form.port);
@@ -121,6 +134,8 @@ export default function ConnectionModal({
           privateKeyPath: form.privateKeyPath.trim() || null,
         },
         mcpAccess: form.mcpAccess,
+        mcpPtyEnabled:
+          form.mcpAccess === "standard_controlled" && form.mcpPtyEnabled,
         jumpHost: form.jumpHost || null,
         remark: form.remark.trim(),
         term: form.term.trim() || "xterm-256color",
@@ -243,6 +258,28 @@ export default function ConnectionModal({
               「只读」允许 MCP 读取命令与 SFTP 文件；「受控」在 dev 环境还允许
               SFTP 写入/删除，staging/prod 的写操作需要人工审批（stdio 模式会自动拒绝）。
             </p>
+
+            <label className="span-2 checkbox-field">
+              <input
+                type="checkbox"
+                checked={
+                  form.mcpAccess === "standard_controlled" &&
+                  form.mcpPtyEnabled
+                }
+                disabled={form.mcpAccess !== "standard_controlled"}
+                onChange={(event) => toggleMcpPty(event.target.checked)}
+              />
+              <span>
+                允许 MCP 交互式终端（危险，默认关闭；需将 MCP 授权设为「受控」）。开启后
+                Agent 可获得完整 shell，绕过命令级策略与审批。
+              </span>
+            </label>
+            {form.mcpPtyEnabled && (
+              <p className="muted small span-2">
+                ⚠ 已开启：任何获得该连接 MCP 权限的 Agent
+                都可以执行任意交互命令，请仅在完全信任时使用。
+              </p>
+            )}
 
             {form.authKind === "agent" && (
               <p className="muted small span-2">
