@@ -105,6 +105,15 @@ pub async fn handle_request(state: &AppState, request: Value) -> Option<Value> {
         "ping" => Some(ok_response(id, json!({}))),
         "tools/list" => Some(ok_response(id, json!({ "tools": mcp::tool_definitions() }))),
         "tools/call" => Some(call_tool(state, id, request.get("params")).await),
+        "resources/list" => match mcp::resource_definitions(state) {
+            Ok(resources) => Some(ok_response(id, json!({ "resources": resources }))),
+            Err(error) => Some(error_response(id, -32603, error)),
+        },
+        "resources/templates/list" => Some(ok_response(
+            id,
+            json!({ "resourceTemplates": mcp::resource_templates() }),
+        )),
+        "resources/read" => Some(read_resource(state, id, request.get("params"))),
         other => Some(error_response(
             id,
             -32601,
@@ -124,13 +133,29 @@ fn initialize_result(request: &Value) -> Value {
 
     json!({
         "protocolVersion": protocol_version,
-        "capabilities": { "tools": { "listChanged": false } },
+        "capabilities": {
+            "tools": { "listChanged": false },
+            "resources": { "subscribe": false, "listChanged": false }
+        },
         "serverInfo": {
             "name": "shellx",
             "version": env!("CARGO_PKG_VERSION")
         },
         "instructions": SERVER_INSTRUCTIONS
     })
+}
+
+fn read_resource(state: &AppState, id: Value, params: Option<&Value>) -> Value {
+    let Some(uri) = params
+        .and_then(|params| params.get("uri"))
+        .and_then(Value::as_str)
+    else {
+        return error_response(id, -32602, "resources/read 缺少 uri 参数".into());
+    };
+    match mcp::read_resource(state, uri) {
+        Ok(result) => ok_response(id, result),
+        Err(message) => error_response(id, -32002, message),
+    }
 }
 
 async fn call_tool(state: &AppState, id: Value, params: Option<&Value>) -> Value {
@@ -301,6 +326,7 @@ mod tests {
         assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(response["result"]["serverInfo"]["name"], "shellx");
         assert!(response["result"]["capabilities"]["tools"].is_object());
+        assert!(response["result"]["capabilities"]["resources"].is_object());
     }
 
     #[tokio::test]
@@ -344,6 +370,83 @@ mod tests {
         for tool in tools {
             assert!(tool["inputSchema"]["type"] == "object");
         }
+    }
+
+    #[tokio::test]
+    async fn resources_expose_sessions_audit_and_templates() {
+        let fixture = test_state();
+        let response = handle_line(
+            &fixture.state,
+            r#"{"jsonrpc":"2.0","id":20,"method":"resources/list"}"#,
+        )
+        .await
+        .expect("resources/list response");
+        let resources = response["result"]["resources"]
+            .as_array()
+            .expect("resources array");
+        let uris: Vec<&str> = resources
+            .iter()
+            .filter_map(|resource| resource["uri"].as_str())
+            .collect();
+        assert!(uris.contains(&"shellx://sessions"));
+        assert!(uris.contains(&"shellx://audit"));
+
+        let templates = handle_line(
+            &fixture.state,
+            r#"{"jsonrpc":"2.0","id":21,"method":"resources/templates/list"}"#,
+        )
+        .await
+        .expect("resources/templates/list response");
+        assert_eq!(
+            templates["result"]["resourceTemplates"][0]["uriTemplate"],
+            "shellx://sessions/{sessionId}/output"
+        );
+
+        let read = handle_line(
+            &fixture.state,
+            r#"{"jsonrpc":"2.0","id":22,"method":"resources/read","params":{"uri":"shellx://sessions"}}"#,
+        )
+        .await
+        .expect("read sessions resource");
+        assert_eq!(read["result"]["contents"][0]["mimeType"], "application/json");
+        let body: Value =
+            serde_json::from_str(read["result"]["contents"][0]["text"].as_str().unwrap())
+                .expect("parse sessions JSON");
+        assert!(body["sessions"].is_array());
+
+        let audit = handle_line(
+            &fixture.state,
+            r#"{"jsonrpc":"2.0","id":23,"method":"resources/read","params":{"uri":"shellx://audit"}}"#,
+        )
+        .await
+        .expect("read audit resource");
+        let body: Value =
+            serde_json::from_str(audit["result"]["contents"][0]["text"].as_str().unwrap())
+                .expect("parse audit JSON");
+        assert!(
+            !body["entries"].as_array().unwrap().is_empty(),
+            "startup audit entry should be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_resource_returns_resource_error() {
+        let fixture = test_state();
+        let response = handle_line(
+            &fixture.state,
+            r#"{"jsonrpc":"2.0","id":24,"method":"resources/read","params":{"uri":"shellx://nope"}}"#,
+        )
+        .await
+        .expect("error response");
+        assert_eq!(response["error"]["code"], -32002);
+
+        let missing = handle_line(
+            &fixture.state,
+            r#"{"jsonrpc":"2.0","id":25,"method":"resources/read","params":{}}"#,
+        )
+        .await
+        .expect("missing uri response");
+        assert_eq!(missing["error"]["code"], -32602);
     }
 
     #[tokio::test]
@@ -510,6 +613,40 @@ mod tests {
         assert!(page["output"].as_str().unwrap().contains("hello-from-mcp"));
         assert_eq!(page["eof"], true);
 
+        let expected_uri = format!("shellx://sessions/{session_id}/output");
+        let resources = handle_line(
+            &fixture.state,
+            r#"{"jsonrpc":"2.0","id":26,"method":"resources/list"}"#,
+        )
+        .await
+        .expect("resources/list response");
+        assert!(
+            resources["result"]["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|resource| resource["uri"].as_str() == Some(expected_uri.as_str())),
+            "session output must be listed as a resource"
+        );
+
+        let resource = handle_line(
+            &fixture.state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 27,
+                "method": "resources/read",
+                "params": { "uri": expected_uri }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("resources/read response");
+        assert_eq!(resource["result"]["contents"][0]["mimeType"], "text/plain");
+        assert!(resource["result"]["contents"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("hello-from-mcp"));
+
         let closed = handle_line(
             &fixture.state,
             &json!({
@@ -673,7 +810,7 @@ mod tests {
         let fixture = test_state();
         let response = handle_line(
             &fixture.state,
-            r#"{"jsonrpc":"2.0","id":10,"method":"resources/list"}"#,
+            r#"{"jsonrpc":"2.0","id":10,"method":"bogus/method"}"#,
         )
         .await
         .expect("error response");

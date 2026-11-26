@@ -140,6 +140,21 @@ impl SessionManager {
         })
     }
 
+    /// Entire buffered output of a session, used by the MCP resources
+    /// interface (the ring is bounded, so this is never unbounded).
+    pub fn output_text(&self, id: &str) -> Result<String, String> {
+        let session = self
+            .sessions
+            .get(id)
+            .ok_or_else(|| format!("会话 {id} 不存在"))?;
+        Ok(session
+            .output
+            .iter()
+            .cloned()
+            .collect::<Vec<String>>()
+            .join("\n"))
+    }
+
     pub fn list(&self) -> Vec<SessionInfo> {
         let mut sessions: Vec<SessionInfo> = self
             .sessions

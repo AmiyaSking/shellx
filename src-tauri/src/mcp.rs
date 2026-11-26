@@ -122,6 +122,93 @@ pub fn tool_definitions() -> Vec<Value> {
         .collect()
 }
 
+pub const RESOURCE_SESSIONS: &str = "shellx://sessions";
+pub const RESOURCE_AUDIT: &str = "shellx://audit";
+pub const SESSION_OUTPUT_TEMPLATE: &str = "shellx://sessions/{sessionId}/output";
+
+pub fn session_output_uri(session_id: &str) -> String {
+    format!("shellx://sessions/{session_id}/output")
+}
+
+/// Read-only context resources advertised to MCP clients. Output is already
+/// redacted when it enters the session ring, so no extra masking is needed.
+pub fn resource_definitions(state: &AppState) -> Result<Vec<Value>, String> {
+    let mut resources = vec![
+        json!({
+            "uri": RESOURCE_SESSIONS,
+            "name": "sessions",
+            "title": "命令会话",
+            "description": "当前命令会话的元信息（JSON）",
+            "mimeType": "application/json"
+        }),
+        json!({
+            "uri": RESOURCE_AUDIT,
+            "name": "audit",
+            "title": "审计日志",
+            "description": "最近的审计记录（JSON，最多 100 条）",
+            "mimeType": "application/json"
+        }),
+    ];
+    for session in state.list_sessions()? {
+        resources.push(json!({
+            "uri": session_output_uri(&session.id),
+            "name": format!("session-{}-output", session.id),
+            "title": format!("{} 输出", session.connection_alias),
+            "description": "会话缓冲输出（纯文本）",
+            "mimeType": "text/plain"
+        }));
+    }
+    Ok(resources)
+}
+
+pub fn resource_templates() -> Vec<Value> {
+    vec![json!({
+        "uriTemplate": SESSION_OUTPUT_TEMPLATE,
+        "name": "session-output",
+        "title": "会话输出",
+        "description": "按会话 ID 读取缓冲输出",
+        "mimeType": "text/plain"
+    })]
+}
+
+/// Resolve a `resources/read` URI. Unknown URIs are reported as resource
+/// errors by the transport.
+pub fn read_resource(state: &AppState, uri: &str) -> Result<Value, String> {
+    if uri == RESOURCE_SESSIONS {
+        let sessions = state.list_sessions()?;
+        let text = serde_json::to_string_pretty(&json!({ "sessions": sessions }))
+            .map_err(|error| error.to_string())?;
+        return Ok(resource_text(uri, "application/json", text));
+    }
+    if uri == RESOURCE_AUDIT {
+        let entries = state.list_audit(100);
+        let text = serde_json::to_string_pretty(&json!({ "entries": entries }))
+            .map_err(|error| error.to_string())?;
+        return Ok(resource_text(uri, "application/json", text));
+    }
+    if let Some(rest) = uri.strip_prefix("shellx://sessions/") {
+        let Some(session_id) = rest.strip_suffix("/output") else {
+            return Err(format!("未知资源：{uri}"));
+        };
+        if session_id.is_empty() || session_id.contains('/') {
+            return Err(format!("无效的会话资源：{uri}"));
+        }
+        let text = state.session_output_text(session_id)?;
+        return Ok(resource_text(uri, "text/plain", text));
+    }
+    Err(format!("未知资源：{uri}"))
+}
+
+fn resource_text(uri: &str, mime_type: &str, text: String) -> Value {
+    json!({
+        "contents": [{
+            "uri": uri,
+            "mimeType": mime_type,
+            "text": text
+        }]
+    })
+}
+
 /// Dispatch one MCP `tools/call`. Policy, approval and audit always apply
 /// because execution goes through `AppState::run_command`.
 ///

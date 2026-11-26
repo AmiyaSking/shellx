@@ -475,6 +475,11 @@ impl AppState {
         lock(&self.sessions)?.read_output(session_id, offset, limit)
     }
 
+    /// Full buffered output for the MCP resources interface.
+    pub fn session_output_text(&self, session_id: &str) -> Result<String, String> {
+        lock(&self.sessions)?.output_text(session_id)
+    }
+
     pub fn mcp_info(&self) -> Result<McpServerInfo, String> {
         let authorized_connections = lock(&self.connections)?.authorized_count();
         let active_sessions = lock(&self.sessions)?.active_count();
