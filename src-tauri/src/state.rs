@@ -388,6 +388,7 @@ impl AppState {
                 username: connection.username.clone(),
                 credential,
                 jump,
+                auth_prompter: None,
                 remote_forwards: Vec::new(),
                 trusted_host_keys,
                 known_hosts_path: self.known_hosts_path(),

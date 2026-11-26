@@ -273,6 +273,21 @@ export interface PtyClosedEvent {
   reason: string;
 }
 
+export interface AuthPromptInfo {
+  prompt: string;
+  echo: boolean;
+}
+
+/** Payload of the `pty:auth-prompt` Tauri event (keyboard-interactive / 2FA). */
+export interface PtyAuthPromptEvent {
+  requestId: string;
+  authId: string;
+  host: string;
+  name: string;
+  instructions: string;
+  prompts: AuthPromptInfo[];
+}
+
 
 export const ENV_LABELS: Record<Environment, string> = {
   dev: "开发",

@@ -48,6 +48,8 @@ pub fn run() {
             commands::mcp_server_info,
             commands::pty_open,
             commands::pty_cancel,
+            commands::pty_auth_respond,
+            commands::pty_auth_cancel,
             commands::pty_write,
             commands::pty_resize,
             commands::pty_signal,

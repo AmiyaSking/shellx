@@ -12,11 +12,13 @@
 
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use russh::client::{self, Msg};
+use russh::client::{self, KeyboardInteractiveAuthResponse, Msg};
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{self as rkeys, ssh_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
@@ -24,6 +26,7 @@ use russh::{
     Channel, ChannelMsg, ChannelOpenFailure, ChannelReadHalf, ChannelWriteHalf,
     Disconnect, Sig,
 };
+use serde::Serialize;
 
 use crate::models::HostKeyTrust;
 
@@ -41,6 +44,62 @@ pub enum Credential {
     /// Local SSH agent (OpenSSH agent / Pageant). The agent signs the
     /// authentication request; private key material never enters ShellX.
     Agent,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthPromptInfo {
+    pub prompt: String,
+    pub echo: bool,
+}
+
+type AuthPromptFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<String>, SshError>> + Send>>;
+
+/// A callback used by keyboard-interactive / 2FA authentication. The terminal
+/// implements it by asking the user through a Tauri event; background
+/// forwarding/SFTP sessions pass `None` and report an unsupported error.
+#[derive(Clone)]
+pub struct AuthPrompter(
+    Arc<
+        dyn Fn(String, String, String, Vec<AuthPromptInfo>) -> AuthPromptFuture
+            + Send
+            + Sync,
+    >,
+);
+
+impl AuthPrompter {
+    pub fn new<F>(prompt: F) -> Self
+    where
+        F: Fn(String, String, String, Vec<AuthPromptInfo>) -> AuthPromptFuture
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self(Arc::new(prompt))
+    }
+
+    pub async fn prompt(
+        &self,
+        host: &str,
+        name: &str,
+        instructions: &str,
+        prompts: Vec<AuthPromptInfo>,
+    ) -> Result<Vec<String>, SshError> {
+        (self.0)(
+            host.to_string(),
+            name.to_string(),
+            instructions.to_string(),
+            prompts,
+        )
+        .await
+    }
+}
+
+impl fmt::Debug for AuthPrompter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AuthPrompter")
+    }
 }
 
 // Hand-written so a password can never leak into a log line through `{:?}`.
@@ -84,6 +143,8 @@ pub struct ConnectParams {
     pub username: String,
     pub credential: Credential,
     pub jump: Option<JumpHost>,
+    /// Callback for keyboard-interactive / 2FA prompts.
+    pub auth_prompter: Option<AuthPrompter>,
     /// Remote forwarding targets for server-initiated channels.
     pub remote_forwards: Vec<RemoteForward>,
     /// Fingerprints the user already confirmed in the host-key dialog. A first
@@ -110,6 +171,7 @@ impl ConnectParams {
             username: username.into(),
             credential: Credential::Agent,
             jump: None,
+            auth_prompter: None,
             remote_forwards: Vec::new(),
             trusted_host_keys: Vec::new(),
             known_hosts_path: PathBuf::from("known_hosts"),
@@ -479,6 +541,7 @@ pub async fn connect_authenticated(
             &jump.username,
             &jump.host,
             &jump.credential,
+            params.auth_prompter.as_ref(),
         )
         .await
         .map_err(|error| match error {
@@ -532,6 +595,7 @@ pub async fn connect_authenticated(
         &params.username,
         &params.host,
         &params.credential,
+        params.auth_prompter.as_ref(),
     )
     .await?;
 
@@ -665,6 +729,7 @@ async fn authenticate(
     username: &str,
     host: &str,
     credential: &Credential,
+    prompter: Option<&AuthPrompter>,
 ) -> Result<(), SshError> {
     let auth_failed = |detail: String| SshError::Auth {
         username: username.to_string(),
@@ -700,16 +765,110 @@ async fn authenticate(
                 .await
                 .map_err(|error| auth_failed(error.to_string()))?
         }
-        Credential::Agent => return authenticate_agent(session, username, host).await,
+        Credential::Agent => {
+            match authenticate_agent(session, username, host).await {
+                Ok(()) => return Ok(()),
+                Err(_) if prompter.is_some() => {
+                    return authenticate_keyboard_interactive(
+                        session, username, host, prompter,
+                    )
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     };
 
     if result.success() {
-        Ok(())
+        return Ok(());
+    }
+
+    // Servers commonly require password plus a second keyboard-interactive
+    // factor (OTP, Duo, ...). Only prompt when the server actually offers it.
+    let keyboard_interactive_offered = match &result {
+        client::AuthResult::Failure {
+            remaining_methods,
+            partial_success,
+        } => {
+            *partial_success
+                || remaining_methods
+                    .iter()
+                    .any(|method| matches!(method, russh::MethodKind::KeyboardInteractive))
+        }
+        client::AuthResult::Success => false,
+    };
+    if keyboard_interactive_offered {
+        authenticate_keyboard_interactive(session, username, host, prompter).await
     } else {
         Err(auth_failed(
             "服务器拒绝了该凭据（口令/私钥错误，或该用户不允许此认证方式）".to_string(),
         ))
     }
+}
+
+async fn authenticate_keyboard_interactive(
+    session: &mut client::Handle<HostKeyHandler>,
+    username: &str,
+    host: &str,
+    prompter: Option<&AuthPrompter>,
+) -> Result<(), SshError> {
+    let auth_failed = |detail: String| SshError::Auth {
+        username: username.to_string(),
+        host: host.to_string(),
+        detail,
+    };
+    let Some(prompter) = prompter else {
+        return Err(auth_failed(
+            "服务器要求 keyboard-interactive / 2FA 认证，请在终端窗口中连接"
+                .to_string(),
+        ));
+    };
+
+    let mut response = session
+        .authenticate_keyboard_interactive_start(username.to_string(), None::<String>)
+        .await
+        .map_err(|error| {
+            auth_failed(format!("启动 keyboard-interactive 认证失败：{error}"))
+        })?;
+
+    for _ in 0..12 {
+        match response {
+            KeyboardInteractiveAuthResponse::Success => return Ok(()),
+            KeyboardInteractiveAuthResponse::Failure { .. } => {
+                return Err(auth_failed(
+                    "服务器拒绝了 keyboard-interactive 认证".to_string(),
+                ));
+            }
+            KeyboardInteractiveAuthResponse::InfoRequest {
+                name,
+                instructions,
+                prompts,
+            } => {
+                let prompts: Vec<AuthPromptInfo> = prompts
+                    .into_iter()
+                    .map(|prompt| AuthPromptInfo {
+                        prompt: prompt.prompt,
+                        echo: prompt.echo,
+                    })
+                    .collect();
+                let answers = prompter
+                    .prompt(host, &name, &instructions, prompts)
+                    .await?;
+                response = session
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .map_err(|error| {
+                        auth_failed(format!(
+                            "提交 keyboard-interactive 应答失败：{error}"
+                        ))
+                    })?;
+            }
+        }
+    }
+
+    Err(auth_failed(
+        "keyboard-interactive 认证轮次过多，已中止".to_string(),
+    ))
 }
 
 /// A boxed agent client so the named-pipe, Pageant and Unix-socket transports

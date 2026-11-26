@@ -106,7 +106,7 @@ pub async fn pty_open(
     request_id: String,
     trusted_host_keys: Option<Vec<HostKeyTrust>>,
 ) -> Result<PtyOpened, PtyOpenError> {
-    let (alias, params) = state
+    let (alias, mut params) = state
         .pty_params(
             &connection_id,
             cols,
@@ -114,6 +114,7 @@ pub async fn pty_open(
             trusted_host_keys.unwrap_or_default(),
         )
         .map_err(open_error)?;
+    params.auth_prompter = Some(pty.make_auth_prompter(app.clone(), request_id.clone()));
     let target = format!("{}@{}:{}", params.username, params.host, params.port);
     let cancel = pty.register_cancel(&request_id).map_err(open_error)?;
     let session_id = Uuid::new_v4().to_string();
@@ -126,6 +127,7 @@ pub async fn pty_open(
         .open(app, session_id.clone(), meta, params, cancel)
         .await;
     pty.clear_cancel(&request_id);
+    pty.clear_auth_for_request(&request_id);
 
     match result {
         Ok(host_key) => {
@@ -160,6 +162,20 @@ pub async fn pty_open(
 #[tauri::command]
 pub fn pty_cancel(pty: State<'_, PtyManager>, request_id: String) -> bool {
     pty.cancel(&request_id)
+}
+
+#[tauri::command]
+pub fn pty_auth_respond(
+    pty: State<'_, PtyManager>,
+    auth_id: String,
+    responses: Vec<String>,
+) -> bool {
+    pty.respond_auth(&auth_id, responses)
+}
+
+#[tauri::command]
+pub fn pty_auth_cancel(pty: State<'_, PtyManager>, auth_id: String) -> bool {
+    pty.cancel_auth(&auth_id)
 }
 
 #[tauri::command]
