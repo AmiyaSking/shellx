@@ -1,8 +1,11 @@
 use serde_json::{json, Value};
+use uuid::Uuid;
 
+use crate::encoding::base64_decode;
 use crate::models::{
     AuditSource, CommandOutcome, CommandRequest, McpToolInfo, RiskLevel,
 };
+use crate::sftp::SftpManager;
 use crate::state::{AppState, CommandStart};
 
 pub struct ToolDef {
@@ -37,6 +40,51 @@ pub const TOOL_CATALOG: &[ToolDef] = &[
     ToolDef {
         name: "close_session",
         description: "关闭指定会话",
+        risk: RiskLevel::Medium,
+    },
+    ToolDef {
+        name: "sftp_open",
+        description: "打开 SFTP 文件会话（连接须已授权给 MCP；主机密钥须已在桌面端确认）",
+        risk: RiskLevel::Low,
+    },
+    ToolDef {
+        name: "sftp_close",
+        description: "关闭 SFTP 文件会话",
+        risk: RiskLevel::Low,
+    },
+    ToolDef {
+        name: "sftp_list",
+        description: "列出远端目录",
+        risk: RiskLevel::Low,
+    },
+    ToolDef {
+        name: "sftp_stat",
+        description: "读取远端文件或目录的元信息",
+        risk: RiskLevel::Low,
+    },
+    ToolDef {
+        name: "sftp_read_file",
+        description: "读取远端文件内容（默认最多 64KiB，UTF-8 或 base64）",
+        risk: RiskLevel::Low,
+    },
+    ToolDef {
+        name: "sftp_write_file",
+        description: "创建或覆盖远端文件（dev 环境受控连接可写，staging/prod 需审批）",
+        risk: RiskLevel::Medium,
+    },
+    ToolDef {
+        name: "sftp_mkdir",
+        description: "创建远端目录",
+        risk: RiskLevel::Medium,
+    },
+    ToolDef {
+        name: "sftp_remove",
+        description: "删除远端文件或目录（目录需 recursive=true）",
+        risk: RiskLevel::Medium,
+    },
+    ToolDef {
+        name: "sftp_rename",
+        description: "重命名远端文件或目录",
         risk: RiskLevel::Medium,
     },
 ];
@@ -105,6 +153,101 @@ pub fn tool_definitions() -> Vec<Value> {
                     "type": "object",
                     "properties": { "session_id": { "type": "string" } },
                     "required": ["session_id"],
+                    "additionalProperties": false
+                }),
+                "sftp_open" => json!({
+                    "type": "object",
+                    "properties": {
+                        "connection_id": { "type": "string", "description": "已授权连接 ID" }
+                    },
+                    "required": ["connection_id"],
+                    "additionalProperties": false
+                }),
+                "sftp_close" => json!({
+                    "type": "object",
+                    "properties": { "session_id": { "type": "string" } },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                }),
+                "sftp_list" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "path": { "type": "string", "description": "远端目录，默认 ." }
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": false
+                }),
+                "sftp_stat" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["session_id", "path"],
+                    "additionalProperties": false
+                }),
+                "sftp_read_file" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "path": { "type": "string" },
+                        "max_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 524288,
+                            "description": "最多读取字节数，默认 65536"
+                        }
+                    },
+                    "required": ["session_id", "path"],
+                    "additionalProperties": false
+                }),
+                "sftp_write_file" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "path": { "type": "string" },
+                        "content": { "type": "string" },
+                        "encoding": {
+                            "type": "string",
+                            "enum": ["utf-8", "base64"],
+                            "description": "默认 utf-8"
+                        }
+                    },
+                    "required": ["session_id", "path", "content"],
+                    "additionalProperties": false
+                }),
+                "sftp_mkdir" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["session_id", "path"],
+                    "additionalProperties": false
+                }),
+                "sftp_remove" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "path": { "type": "string" },
+                        "is_dir": { "type": "boolean", "description": "目标是目录" },
+                        "recursive": {
+                            "type": "boolean",
+                            "description": "删除目录时必须为 true，表示递归删除"
+                        }
+                    },
+                    "required": ["session_id", "path"],
+                    "additionalProperties": false
+                }),
+                "sftp_rename" => json!({
+                    "type": "object",
+                    "properties": {
+                        "session_id": { "type": "string" },
+                        "old_path": { "type": "string" },
+                        "new_path": { "type": "string" }
+                    },
+                    "required": ["session_id", "old_path", "new_path"],
                     "additionalProperties": false
                 }),
                 _ => json!({
@@ -216,6 +359,7 @@ fn resource_text(uri: &str, mime_type: &str, text: String) -> Value {
 /// rejected (and audited) instead of hanging forever.
 pub async fn dispatch_tool(
     state: &AppState,
+    sftp: &SftpManager,
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
@@ -316,6 +460,188 @@ pub async fn dispatch_tool(
                 Err(format!("会话 {session_id} 不存在"))
             }
         }
+        "sftp_open" => {
+            let connection_id = string_arg(&arguments, "connection_id", "connectionId")?;
+            let connection =
+                state.authorize_sftp(connection_id, false, "打开 SFTP 会话")?;
+            let params = state.sftp_params(connection_id)?;
+            let session_id = Uuid::new_v4().to_string();
+            let opened = sftp
+                .open(session_id.clone(), connection_id.to_string(), params)
+                .await?;
+            state.record_agent_event(
+                Some(&connection.id),
+                format!(
+                    "MCP 打开 SFTP 会话（{}，{} 个条目）",
+                    opened.listing.path,
+                    opened.listing.entries.len()
+                ),
+            );
+            serde_json::to_value(opened).map_err(|error| error.to_string())
+        }
+        "sftp_close" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let connection_id = sftp.connection_id(session_id);
+            let closed = sftp.close(session_id).await;
+            if closed {
+                if let Some(connection_id) = connection_id {
+                    state.record_agent_event(
+                        Some(&connection_id),
+                        format!("MCP 关闭 SFTP 会话 {session_id}"),
+                    );
+                }
+            }
+            Ok(json!({ "sessionId": session_id, "closed": closed }))
+        }
+        "sftp_list" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let connection_id = sftp_connection(sftp, session_id)?;
+            state.authorize_sftp(&connection_id, false, "列出 SFTP 目录")?;
+            let path = arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(".")
+                .to_string();
+            let listing = sftp.list(session_id, path).await?;
+            serde_json::to_value(listing).map_err(|error| error.to_string())
+        }
+        "sftp_stat" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let connection_id = sftp_connection(sftp, session_id)?;
+            state.authorize_sftp(&connection_id, false, "读取 SFTP 元信息")?;
+            let path = string_arg(&arguments, "path", "path")?.to_string();
+            let entry = sftp.stat(session_id, path).await?;
+            serde_json::to_value(entry).map_err(|error| error.to_string())
+        }
+        "sftp_read_file" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let connection_id = sftp_connection(sftp, session_id)?;
+            state.authorize_sftp(&connection_id, false, "读取 SFTP 文件")?;
+            let path = string_arg(&arguments, "path", "path")?.to_string();
+            let max_bytes = arguments
+                .get("max_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(64 * 1024)
+                .clamp(1, 512 * 1024) as usize;
+            let file = sftp.read_file(session_id, path.clone(), max_bytes).await?;
+            state.record_agent_event(
+                Some(&connection_id),
+                format!(
+                    "MCP 读取 SFTP 文件 {path}（{} 字节{}）",
+                    file.size,
+                    if file.truncated { "，已截断" } else { "" }
+                ),
+            );
+            serde_json::to_value(file).map_err(|error| error.to_string())
+        }
+        "sftp_write_file" => {
+            const MAX_WRITE_BYTES: usize = 1024 * 1024;
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let path = string_arg(&arguments, "path", "path")?.to_string();
+            let connection_id = sftp_connection(sftp, session_id)?;
+            state.authorize_sftp(
+                &connection_id,
+                true,
+                &format!("写入 SFTP 文件 {path}"),
+            )?;
+            let content = string_arg(&arguments, "content", "content")?;
+            let encoding = arguments
+                .get("encoding")
+                .and_then(Value::as_str)
+                .unwrap_or("utf-8")
+                .to_ascii_lowercase();
+            let data = match encoding.as_str() {
+                "utf-8" | "utf8" | "text" => content.as_bytes().to_vec(),
+                "base64" => base64_decode(content)?,
+                other => return Err(format!("不支持的 encoding：{other}")),
+            };
+            if data.len() > MAX_WRITE_BYTES {
+                return Err(format!(
+                    "写入内容 {} 字节，超过 {} 字节上限",
+                    data.len(),
+                    MAX_WRITE_BYTES
+                ));
+            }
+            let bytes = sftp.write_file(session_id, path.clone(), data).await?;
+            state.record_agent_event(
+                Some(&connection_id),
+                format!("MCP 写入 SFTP 文件 {path}（{bytes} 字节）"),
+            );
+            Ok(json!({
+                "sessionId": session_id,
+                "path": path,
+                "bytesWritten": bytes
+            }))
+        }
+        "sftp_mkdir" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let path = string_arg(&arguments, "path", "path")?.to_string();
+            let connection_id = sftp_connection(sftp, session_id)?;
+            state.authorize_sftp(
+                &connection_id,
+                true,
+                &format!("创建 SFTP 目录 {path}"),
+            )?;
+            sftp.create_dir(session_id, path.clone()).await?;
+            state.record_agent_event(
+                Some(&connection_id),
+                format!("MCP 创建 SFTP 目录 {path}"),
+            );
+            Ok(json!({ "sessionId": session_id, "path": path, "created": true }))
+        }
+        "sftp_remove" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let path = string_arg(&arguments, "path", "path")?.to_string();
+            let is_dir = arguments
+                .get("is_dir")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let recursive = arguments
+                .get("recursive")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if is_dir && !recursive {
+                return Err("删除目录需要显式传入 recursive=true".into());
+            }
+            let connection_id = sftp_connection(sftp, session_id)?;
+            state.authorize_sftp(
+                &connection_id,
+                true,
+                &format!("删除 SFTP 路径 {path}"),
+            )?;
+            sftp.remove(session_id, path.clone(), is_dir).await?;
+            state.record_agent_event(
+                Some(&connection_id),
+                format!(
+                    "MCP 删除 SFTP {} {path}",
+                    if is_dir { "目录" } else { "文件" }
+                ),
+            );
+            Ok(json!({ "sessionId": session_id, "path": path, "removed": true }))
+        }
+        "sftp_rename" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let old_path = string_arg(&arguments, "old_path", "oldPath")?.to_string();
+            let new_path = string_arg(&arguments, "new_path", "newPath")?.to_string();
+            let connection_id = sftp_connection(sftp, session_id)?;
+            state.authorize_sftp(
+                &connection_id,
+                true,
+                &format!("重命名 SFTP 路径 {old_path} -> {new_path}"),
+            )?;
+            sftp.rename(session_id, old_path.clone(), new_path.clone())
+                .await?;
+            state.record_agent_event(
+                Some(&connection_id),
+                format!("MCP 重命名 SFTP 路径 {old_path} -> {new_path}"),
+            );
+            Ok(json!({
+                "sessionId": session_id,
+                "oldPath": old_path,
+                "newPath": new_path,
+                "renamed": true
+            }))
+        }
         other => Err(format!("未知 MCP 工具: {other}")),
     }
 }
@@ -345,6 +671,11 @@ async fn finish_outcome(
             ))
         }
     }
+}
+
+fn sftp_connection(sftp: &SftpManager, session_id: &str) -> Result<String, String> {
+    sftp.connection_id(session_id)
+        .ok_or_else(|| format!("SFTP 会话 {session_id} 不存在或已关闭"))
 }
 
 fn string_arg<'a>(

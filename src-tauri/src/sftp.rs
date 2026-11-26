@@ -17,6 +17,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
+use crate::encoding::base64_encode;
 use crate::ssh::{self, AuthenticatedSession, ConnectParams};
 
 pub const EVENT_PROGRESS: &str = "sftp:progress";
@@ -47,6 +48,17 @@ pub struct SftpEntryInfo {
 pub struct SftpListing {
     pub path: String,
     pub entries: Vec<SftpEntryInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpFileContent {
+    pub path: String,
+    pub size: u64,
+    pub truncated: bool,
+    /// `utf-8` when the bytes are valid UTF-8, otherwise `base64`.
+    pub encoding: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -151,6 +163,116 @@ impl SftpManager {
                 path: canonical,
                 entries,
             })
+        })
+        .await
+    }
+
+    pub async fn stat(&self, session_id: &str, path: String) -> Result<SftpEntryInfo, String> {
+        if path.trim().is_empty() {
+            return Err("路径不能为空".into());
+        }
+        let sftp = self.sftp(session_id)?;
+        on_runtime(async move {
+            let metadata = sftp
+                .metadata(path.clone())
+                .await
+                .map_err(|error| format!("无法读取远端路径 {path}：{error}"))?;
+            let file_type = metadata.file_type();
+            let name = path.rsplit('/').next().unwrap_or("").to_string();
+            Ok(SftpEntryInfo {
+                name: if name.is_empty() { path.clone() } else { name },
+                path,
+                is_dir: file_type.is_dir(),
+                is_symlink: file_type.is_symlink(),
+                size: metadata.len(),
+                modified: metadata.modified().ok().map(format_time),
+                permissions: metadata.permissions.map(|permissions| permissions & 0o777),
+            })
+        })
+        .await
+    }
+
+    /// Read at most `max_bytes` from a remote file. Text is returned as UTF-8;
+    /// anything else is base64 so binary files survive the round trip.
+    pub async fn read_file(
+        &self,
+        session_id: &str,
+        path: String,
+        max_bytes: usize,
+    ) -> Result<SftpFileContent, String> {
+        if path.trim().is_empty() {
+            return Err("路径不能为空".into());
+        }
+        let max_bytes = max_bytes.max(1);
+        let sftp = self.sftp(session_id)?;
+        on_runtime(async move {
+            let metadata = sftp
+                .metadata(path.clone())
+                .await
+                .map_err(|error| format!("无法读取文件信息 {path}：{error}"))?;
+            let size = metadata.len();
+            let mut remote = sftp
+                .open(path.clone())
+                .await
+                .map_err(|error| format!("无法打开远端文件 {path}：{error}"))?;
+            let mut buffer = Vec::new();
+            let mut limited = (&mut remote).take(max_bytes as u64 + 1);
+            limited
+                .read_to_end(&mut buffer)
+                .await
+                .map_err(|error| format!("读取远端文件失败：{error}"))?;
+            drop(limited);
+            let _ = remote.close().await;
+
+            let truncated = buffer.len() > max_bytes;
+            if truncated {
+                buffer.truncate(max_bytes);
+                // A byte limit can split a multi-byte character; drop the
+                // partial tail so text files stay readable as UTF-8.
+                for _ in 0..3 {
+                    if std::str::from_utf8(&buffer).is_ok() {
+                        break;
+                    }
+                    buffer.pop();
+                }
+            }
+            let (encoding, content) = match String::from_utf8(buffer) {
+                Ok(text) => ("utf-8".to_string(), text),
+                Err(error) => ("base64".to_string(), base64_encode(error.as_bytes())),
+            };
+            Ok(SftpFileContent {
+                path,
+                size,
+                truncated,
+                encoding,
+                content,
+            })
+        })
+        .await
+    }
+
+    /// Create or overwrite a remote file with the supplied bytes.
+    pub async fn write_file(
+        &self,
+        session_id: &str,
+        path: String,
+        data: Vec<u8>,
+    ) -> Result<u64, String> {
+        if path.trim().is_empty() {
+            return Err("路径不能为空".into());
+        }
+        let sftp = self.sftp(session_id)?;
+        on_runtime(async move {
+            let mut remote = sftp
+                .create(path.clone())
+                .await
+                .map_err(|error| format!("无法创建远端文件 {path}：{error}"))?;
+            remote
+                .write_all(&data)
+                .await
+                .map_err(|error| format!("写入远端文件失败：{error}"))?;
+            let _ = remote.close().await;
+            Ok(data.len() as u64)
         })
         .await
     }

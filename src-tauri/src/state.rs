@@ -13,8 +13,8 @@ use crate::forwards::{ForwardRule, ForwardRuleInput, ForwardStore};
 use crate::mcp;
 use crate::models::{
     ApprovalDecision, ApprovalRequest, AuditEntry, AuditSource, AuthKind, CommandOutcome,
-    CommandRequest, CommandResult, Connection, ConnectionInput, HostKeyTrust, McpServerInfo,
-    PolicyAction, PolicyDecision, RiskLevel, SessionInfo,
+    CommandRequest, CommandResult, Connection, ConnectionInput, Environment, HostKeyTrust,
+    McpAccessMode, McpServerInfo, PolicyAction, PolicyDecision, RiskLevel, SessionInfo,
 };
 use crate::policy::PolicyEngine;
 use crate::redaction::Redactor;
@@ -172,6 +172,65 @@ impl AppState {
             None,
             detail,
         ));
+    }
+
+    /// Record an MCP-originated SFTP action in the audit log.
+    pub fn record_agent_event(&self, connection_id: Option<&str>, detail: impl Into<String>) {
+        let connection = connection_id.and_then(|id| self.get_connection(id).ok());
+        let _ = self.audit.log(make_audit(
+            AuditSource::Agent,
+            connection.as_ref(),
+            None,
+            None,
+            PolicyAction::Allow,
+            None,
+            None,
+            None,
+            detail,
+        ));
+    }
+
+    /// SFTP permission derived from the connection's MCP access and
+    /// environment. Reads are low risk; writes/deletes follow the command
+    /// matrix (staging/prod would need a human approval, which stdio cannot
+    /// provide).
+    pub fn authorize_sftp(
+        &self,
+        connection_id: &str,
+        write: bool,
+        action: &str,
+    ) -> Result<Connection, String> {
+        let connection = self.get_connection(connection_id)?;
+        let denial = match connection.mcp_access {
+            McpAccessMode::Disabled => Some("该连接未授权给 MCP".to_string()),
+            McpAccessMode::ReadOnly if write => {
+                Some("该连接对 MCP 为只读模式，不允许 SFTP 写入或删除".to_string())
+            }
+            McpAccessMode::StandardControlled
+                if write && connection.environment != Environment::Dev =>
+            {
+                Some(format!(
+                    "{} 环境的 SFTP 写操作需要人工审批，stdio 模式无法审批，已自动拒绝",
+                    connection.environment.label()
+                ))
+            }
+            _ => None,
+        };
+        if let Some(reason) = denial {
+            let _ = self.audit.log(make_audit(
+                AuditSource::Agent,
+                Some(&connection),
+                None,
+                None,
+                PolicyAction::Block,
+                None,
+                None,
+                None,
+                format!("{action} 被拒绝：{reason}"),
+            ));
+            return Err(reason);
+        }
+        Ok(connection)
     }
 
     pub fn preview_command(
@@ -441,6 +500,11 @@ impl AppState {
         // Agent channels are only requested by interactive terminal sessions.
         params.agent_forwarding = false;
         Ok(params)
+    }
+
+    /// Connection parameters for a file-transfer-only SSH session.
+    pub fn sftp_params(&self, connection_id: &str) -> Result<ConnectParams, String> {
+        self.forward_params(connection_id)
     }
 
     pub fn list_audit(&self, limit: usize) -> Vec<AuditEntry> {

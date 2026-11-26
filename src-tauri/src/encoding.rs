@@ -32,9 +32,46 @@ pub fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+/// Decode standard base64 (RFC 4648) with optional padding. Whitespace is
+/// ignored; any other character is rejected.
+pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    let mut padding = 0usize;
+    for byte in input.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => {
+                padding += 1;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            other => return Err(format!("无效的 base64 字符：{}", other as char)),
+        };
+        if padding > 0 {
+            return Err("base64 填充符后仍有多余数据".into());
+        }
+        buffer = (buffer << 6) | value as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    if bits >= 6 {
+        return Err("base64 数据长度无效".into());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::base64_encode;
+    use super::{base64_decode, base64_encode};
 
     #[test]
     fn matches_rfc4648_vectors() {
@@ -63,5 +100,25 @@ mod tests {
         let second = base64_encode(&[0xB8, 0xAD]);
         assert_eq!(first, "5A==");
         assert_eq!(second, "uK0=");
+    }
+
+    #[test]
+    fn base64_round_trips_bytes() {
+        for input in [
+            b"".as_slice(),
+            b"f".as_slice(),
+            b"fo".as_slice(),
+            b"foo".as_slice(),
+            b"\x00\xff\x10binary".as_slice(),
+        ] {
+            let encoded = base64_encode(input);
+            assert_eq!(base64_decode(&encoded).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn base64_decoder_rejects_invalid_input() {
+        assert!(base64_decode("not base64!").is_err());
+        assert!(base64_decode("Zg==Zg==").is_err());
     }
 }

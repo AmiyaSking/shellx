@@ -239,6 +239,11 @@ export default function ConnectionModal({
               </select>
             </label>
 
+            <p className="muted small span-2">
+              「只读」允许 MCP 读取命令与 SFTP 文件；「受控」在 dev 环境还允许
+              SFTP 写入/删除，staging/prod 的写操作需要人工审批（stdio 模式会自动拒绝）。
+            </p>
+
             {form.authKind === "agent" && (
               <p className="muted small span-2">
                 Agent 模式使用本机 OpenSSH Agent 或 Pageant；若未运行，请改用密码或私钥。

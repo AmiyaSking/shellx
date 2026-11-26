@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 use crate::mcp;
+use crate::sftp::SftpManager;
 use crate::state::AppState;
 
 /// Latest MCP revision we implement.
@@ -26,19 +27,21 @@ pub fn run() -> Result<(), String> {
     let data_dir = data_dir_from_args(std::env::args().skip(1))?;
     let state = AppState::load(data_dir)
         .map_err(|error| format!("无法初始化 ShellX 数据目录：{error}"))?;
-    serve(&state)
+    let sftp = SftpManager::new();
+    serve(&state, &sftp)
 }
 
 /// Read requests from stdin and write responses to stdout until EOF.
-pub fn serve(state: &AppState) -> Result<(), String> {
+pub fn serve(state: &AppState, sftp: &SftpManager) -> Result<(), String> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    serve_io(state, stdin.lock(), stdout.lock())
+    serve_io(state, sftp, stdin.lock(), stdout.lock())
 }
 
 /// Transport loop with injectable IO, used by tests.
 pub fn serve_io<R: BufRead, W: Write>(
     state: &AppState,
+    sftp: &SftpManager,
     mut reader: R,
     mut writer: W,
 ) -> Result<(), String> {
@@ -55,7 +58,7 @@ pub fn serve_io<R: BufRead, W: Write>(
         if trimmed.is_empty() {
             continue;
         }
-        if let Some(response) = runtime.block_on(handle_line(state, trimmed)) {
+        if let Some(response) = runtime.block_on(handle_line(state, sftp, trimmed)) {
             let encoded = serde_json::to_string(&response)
                 .map_err(|error| format!("序列化 MCP 响应失败：{error}"))?;
             writeln!(writer, "{encoded}").map_err(|error| {
@@ -70,7 +73,11 @@ pub fn serve_io<R: BufRead, W: Write>(
 }
 
 /// Parse and handle one line. Returns `None` for notifications.
-pub async fn handle_line(state: &AppState, line: &str) -> Option<Value> {
+pub async fn handle_line(
+    state: &AppState,
+    sftp: &SftpManager,
+    line: &str,
+) -> Option<Value> {
     let request: Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(error) => {
@@ -81,11 +88,15 @@ pub async fn handle_line(state: &AppState, line: &str) -> Option<Value> {
             ))
         }
     };
-    handle_request(state, request).await
+    handle_request(state, sftp, request).await
 }
 
 /// Handle one JSON-RPC message. Notifications (no `id`) produce no response.
-pub async fn handle_request(state: &AppState, request: Value) -> Option<Value> {
+pub async fn handle_request(
+    state: &AppState,
+    sftp: &SftpManager,
+    request: Value,
+) -> Option<Value> {
     if !request.is_object() {
         return Some(error_response(
             Value::Null,
@@ -104,7 +115,9 @@ pub async fn handle_request(state: &AppState, request: Value) -> Option<Value> {
         "initialize" => Some(ok_response(id, initialize_result(&request))),
         "ping" => Some(ok_response(id, json!({}))),
         "tools/list" => Some(ok_response(id, json!({ "tools": mcp::tool_definitions() }))),
-        "tools/call" => Some(call_tool(state, id, request.get("params")).await),
+        "tools/call" => {
+            Some(call_tool(state, sftp, id, request.get("params")).await)
+        }
         "resources/list" => match mcp::resource_definitions(state) {
             Ok(resources) => Some(ok_response(id, json!({ "resources": resources }))),
             Err(error) => Some(error_response(id, -32603, error)),
@@ -158,7 +171,12 @@ fn read_resource(state: &AppState, id: Value, params: Option<&Value>) -> Value {
     }
 }
 
-async fn call_tool(state: &AppState, id: Value, params: Option<&Value>) -> Value {
+async fn call_tool(
+    state: &AppState,
+    sftp: &SftpManager,
+    id: Value,
+    params: Option<&Value>,
+) -> Value {
     let Some(name) = params
         .and_then(|params| params.get("name"))
         .and_then(Value::as_str)
@@ -170,7 +188,7 @@ async fn call_tool(state: &AppState, id: Value, params: Option<&Value>) -> Value
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    match mcp::dispatch_tool(state, name, arguments).await {
+    match mcp::dispatch_tool(state, sftp, name, arguments).await {
         Ok(value) => tool_result(id, value, false),
         Err(message) => tool_result(id, Value::String(message), true),
     }
@@ -260,13 +278,17 @@ fn platform_data_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::models::ConnectionInput;
+    use crate::sftp::SftpManager;
     use crate::ssh::{connect_authenticated, Credential};
-    use crate::ssh_test_server::{start_test_server, trusted_params, TestAuthMode};
+    use crate::ssh_test_server::{
+        start_sftp_test_server, start_test_server, trusted_params, TestAuthMode,
+    };
     use std::time::Duration;
 
     struct TestState {
         dir: PathBuf,
         state: AppState,
+        sftp: SftpManager,
     }
 
     impl Drop for TestState {
@@ -282,7 +304,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create MCP test data dir");
         let state = AppState::load(dir.clone()).expect("load app state");
-        TestState { dir, state }
+        TestState {
+            dir,
+            state,
+            sftp: SftpManager::new(),
+        }
     }
 
     fn save_connection(
@@ -315,7 +341,7 @@ mod tests {
     async fn initialize_reports_capabilities_and_protocol() {
         let fixture = test_state();
         let response = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
         )
         .await
@@ -333,7 +359,7 @@ mod tests {
     async fn older_protocol_version_is_echoed_when_supported() {
         let fixture = test_state();
         let response = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#,
         )
         .await
@@ -346,7 +372,7 @@ mod tests {
         let fixture = test_state();
         assert!(
             handle_line(
-                &fixture.state,
+                &fixture.state, &fixture.sftp,
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
             )
             .await
@@ -358,7 +384,7 @@ mod tests {
     async fn tools_list_exposes_the_catalog() {
         let fixture = test_state();
         let response = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
         )
         .await
@@ -376,7 +402,7 @@ mod tests {
     async fn resources_expose_sessions_audit_and_templates() {
         let fixture = test_state();
         let response = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":20,"method":"resources/list"}"#,
         )
         .await
@@ -392,7 +418,7 @@ mod tests {
         assert!(uris.contains(&"shellx://audit"));
 
         let templates = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":21,"method":"resources/templates/list"}"#,
         )
         .await
@@ -403,7 +429,7 @@ mod tests {
         );
 
         let read = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":22,"method":"resources/read","params":{"uri":"shellx://sessions"}}"#,
         )
         .await
@@ -415,7 +441,7 @@ mod tests {
         assert!(body["sessions"].is_array());
 
         let audit = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":23,"method":"resources/read","params":{"uri":"shellx://audit"}}"#,
         )
         .await
@@ -433,7 +459,7 @@ mod tests {
     async fn unknown_resource_returns_resource_error() {
         let fixture = test_state();
         let response = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":24,"method":"resources/read","params":{"uri":"shellx://nope"}}"#,
         )
         .await
@@ -441,7 +467,7 @@ mod tests {
         assert_eq!(response["error"]["code"], -32002);
 
         let missing = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":25,"method":"resources/read","params":{}}"#,
         )
         .await
@@ -462,7 +488,7 @@ mod tests {
         save_connection(&fixture.state, "127.0.0.1", 22, "dev", "disabled");
 
         let response = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_servers","arguments":{}}}"#,
         )
         .await
@@ -480,7 +506,7 @@ mod tests {
         let fixture = test_state();
         let connection = save_connection(&fixture.state, "127.0.0.1", 9, "dev", "disabled");
         let response = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 5,
@@ -507,7 +533,7 @@ mod tests {
         let fixture = test_state();
         let connection = save_connection(&fixture.state, "127.0.0.1", 9, "prod", "standard_controlled");
         let response = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 6,
@@ -567,7 +593,7 @@ mod tests {
         drop(trusted);
 
         let response = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 7,
@@ -594,7 +620,7 @@ mod tests {
         let session_id = result["sessionId"].as_str().expect("session id").to_string();
 
         let page = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 8,
@@ -615,7 +641,7 @@ mod tests {
 
         let expected_uri = format!("shellx://sessions/{session_id}/output");
         let resources = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":26,"method":"resources/list"}"#,
         )
         .await
@@ -630,7 +656,7 @@ mod tests {
         );
 
         let resource = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 27,
@@ -648,7 +674,7 @@ mod tests {
             .contains("hello-from-mcp"));
 
         let closed = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 9,
@@ -690,7 +716,7 @@ mod tests {
         // Start without waiting: the call returns as soon as the remote
         // command is running.
         let started = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 11,
@@ -715,7 +741,7 @@ mod tests {
         assert_eq!(started["running"], true);
 
         let page = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 12,
@@ -734,7 +760,7 @@ mod tests {
         assert_eq!(page["exitCode"], Value::Null);
 
         let signal = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 13,
@@ -753,7 +779,7 @@ mod tests {
         let mut finished = None;
         for _ in 0..50 {
             let response = handle_line(
-                &fixture.state,
+                &fixture.state, &fixture.sftp,
                 &json!({
                     "jsonrpc": "2.0",
                     "id": 14,
@@ -779,7 +805,7 @@ mod tests {
         assert_eq!(finished["exitCode"], 130);
 
         let closed = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             &json!({
                 "jsonrpc": "2.0",
                 "id": 15,
@@ -797,9 +823,387 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sftp_read_write_round_trip_over_mcp() {
+        let fixture = test_state();
+        let root = fixture.dir.join("sftp-root");
+        std::fs::create_dir_all(&root).expect("create sftp root");
+        std::fs::write(root.join("hello.txt"), b"hello").expect("seed file");
+
+        let server =
+            start_sftp_test_server(TestAuthMode::Password("secret".into()), root.clone())
+                .await;
+        let connection = save_connection(
+            &fixture.state,
+            "127.0.0.1",
+            server.port,
+            "dev",
+            "standard_controlled",
+        );
+        fixture.state.cache_password_for_test(&connection, "secret");
+        let trust = trusted_params(
+            &server,
+            &fixture.state.known_hosts_path(),
+            Credential::Password("secret".into()),
+        )
+        .await;
+        drop(connect_authenticated(&trust).await.expect("trust host key"));
+
+        let opened = handle_line(
+            &fixture.state, &fixture.sftp,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 30,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_open",
+                    "arguments": { "connection_id": connection }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("sftp_open response");
+        assert_eq!(opened["result"]["isError"], false, "{}", tool_text(&opened));
+        let opened: Value = serde_json::from_str(tool_text(&opened)).expect("parse open");
+        let session_id = opened["sessionId"].as_str().expect("session id").to_string();
+        assert!(opened["listing"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "hello.txt"));
+
+        let read = handle_line(
+            &fixture.state, &fixture.sftp,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 31,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_read_file",
+                    "arguments": { "session_id": session_id, "path": "/hello.txt" }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("sftp_read_file response");
+        assert_eq!(read["result"]["isError"], false, "{}", tool_text(&read));
+        let file: Value = serde_json::from_str(tool_text(&read)).expect("parse file");
+        assert_eq!(file["content"], "hello");
+        assert_eq!(file["encoding"], "utf-8");
+        assert_eq!(file["size"], 5);
+
+        let write = handle_line(
+            &fixture.state, &fixture.sftp,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 32,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_write_file",
+                    "arguments": {
+                        "session_id": session_id,
+                        "path": "/agent.txt",
+                        "content": "written by agent\n"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("sftp_write_file response");
+        assert_eq!(write["result"]["isError"], false, "{}", tool_text(&write));
+        assert_eq!(
+            std::fs::read_to_string(root.join("agent.txt")).expect("read written file"),
+            "written by agent\n"
+        );
+
+        let stat = handle_line(
+            &fixture.state, &fixture.sftp,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 33,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_stat",
+                    "arguments": { "session_id": session_id, "path": "/agent.txt" }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("sftp_stat response");
+        let stat: Value = serde_json::from_str(tool_text(&stat)).expect("parse stat");
+        assert_eq!(stat["size"], 17);
+        assert_eq!(stat["isDir"], false);
+
+        let mkdir = handle_line(
+            &fixture.state, &fixture.sftp,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 34,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_mkdir",
+                    "arguments": { "session_id": session_id, "path": "/agent-dir" }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("sftp_mkdir response");
+        assert_eq!(mkdir["result"]["isError"], false, "{}", tool_text(&mkdir));
+        assert!(root.join("agent-dir").is_dir());
+
+        let renamed = handle_line(
+            &fixture.state, &fixture.sftp,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 35,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_rename",
+                    "arguments": {
+                        "session_id": session_id,
+                        "old_path": "/agent.txt",
+                        "new_path": "/agent-dir/agent.txt"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("sftp_rename response");
+        assert_eq!(renamed["result"]["isError"], false, "{}", tool_text(&renamed));
+        assert!(root.join("agent-dir").join("agent.txt").is_file());
+
+        let removed_file = handle_line(
+            &fixture.state, &fixture.sftp,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 36,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_remove",
+                    "arguments": {
+                        "session_id": session_id,
+                        "path": "/agent-dir/agent.txt"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("sftp_remove file response");
+        assert_eq!(
+            removed_file["result"]["isError"], false,
+            "{}",
+            tool_text(&removed_file)
+        );
+        assert!(!root.join("agent-dir").join("agent.txt").exists());
+
+        let removed_dir = handle_line(
+            &fixture.state, &fixture.sftp,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 37,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_remove",
+                    "arguments": {
+                        "session_id": session_id,
+                        "path": "/agent-dir",
+                        "is_dir": true,
+                        "recursive": true
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("sftp_remove dir response");
+        assert_eq!(
+            removed_dir["result"]["isError"], false,
+            "{}",
+            tool_text(&removed_dir)
+        );
+        assert!(!root.join("agent-dir").exists());
+
+        let closed = handle_line(
+            &fixture.state, &fixture.sftp,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 38,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_close",
+                    "arguments": { "session_id": session_id }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("sftp_close response");
+        assert_eq!(closed["result"]["isError"], false);
+
+        let audit = fixture.state.list_audit(50);
+        assert!(
+            audit
+                .iter()
+                .any(|entry| entry.detail.contains("MCP 写入 SFTP 文件 /agent.txt")),
+            "SFTP writes must be audited"
+        );
+
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn sftp_write_permissions_follow_mcp_access_and_environment() {
+        let fixture = test_state();
+        let root = fixture.dir.join("sftp-root");
+        std::fs::create_dir_all(&root).expect("create sftp root");
+        std::fs::write(root.join("hello.txt"), b"hello").expect("seed file");
+        let server =
+            start_sftp_test_server(TestAuthMode::Password("secret".into()), root.clone())
+                .await;
+        let trust = trusted_params(
+            &server,
+            &fixture.state.known_hosts_path(),
+            Credential::Password("secret".into()),
+        )
+        .await;
+        drop(connect_authenticated(&trust).await.expect("trust host key"));
+
+        for (index, (environment, access, expected)) in [
+            ("dev", "read_only", "只读"),
+            ("staging", "standard_controlled", "自动拒绝"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let connection = save_connection(
+                &fixture.state,
+                "127.0.0.1",
+                server.port,
+                environment,
+                access,
+            );
+            fixture.state.cache_password_for_test(&connection, "secret");
+
+            let opened = handle_line(
+                &fixture.state, &fixture.sftp,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 40 + index,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "sftp_open",
+                        "arguments": { "connection_id": connection }
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .expect("sftp_open response");
+            assert_eq!(opened["result"]["isError"], false, "{}", tool_text(&opened));
+            let opened: Value = serde_json::from_str(tool_text(&opened)).expect("parse open");
+            let session_id = opened["sessionId"].as_str().expect("session id").to_string();
+
+            // Reads are low risk and allowed for both read-only and controlled
+            // connections, regardless of environment.
+            let read = handle_line(
+                &fixture.state, &fixture.sftp,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 45 + index,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "sftp_read_file",
+                        "arguments": { "session_id": session_id, "path": "/hello.txt" }
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .expect("read response");
+            assert_eq!(read["result"]["isError"], false, "{}", tool_text(&read));
+
+            let denied = handle_line(
+                &fixture.state, &fixture.sftp,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 50 + index,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "sftp_write_file",
+                        "arguments": {
+                            "session_id": session_id,
+                            "path": "/denied.txt",
+                            "content": "nope"
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .expect("denied write response");
+            assert_eq!(denied["result"]["isError"], true);
+            assert!(
+                tool_text(&denied).contains(expected),
+                "expected {expected}, got {}",
+                tool_text(&denied)
+            );
+            assert!(!root.join("denied.txt").exists());
+
+            handle_line(
+                &fixture.state, &fixture.sftp,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 60 + index,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "sftp_close",
+                        "arguments": { "session_id": session_id }
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .expect("sftp_close response");
+        }
+
+        let disabled = save_connection(
+            &fixture.state,
+            "127.0.0.1",
+            server.port,
+            "dev",
+            "disabled",
+        );
+        let denied = handle_line(
+            &fixture.state, &fixture.sftp,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 70,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_open",
+                    "arguments": { "connection_id": disabled }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("disabled open response");
+        assert_eq!(denied["result"]["isError"], true);
+        assert!(tool_text(&denied).contains("未授权"));
+
+        drop(server);
+    }
+
+    #[tokio::test]
     async fn malformed_json_returns_parse_error() {
         let fixture = test_state();
-        let response = handle_line(&fixture.state, "{not json")
+        let response = handle_line(&fixture.state, &fixture.sftp, "{not json")
             .await
             .expect("parse error response");
         assert_eq!(response["error"]["code"], -32700);
@@ -809,7 +1213,7 @@ mod tests {
     async fn unknown_method_returns_method_not_found() {
         let fixture = test_state();
         let response = handle_line(
-            &fixture.state,
+            &fixture.state, &fixture.sftp,
             r#"{"jsonrpc":"2.0","id":10,"method":"bogus/method"}"#,
         )
         .await
@@ -838,7 +1242,7 @@ mod tests {
             "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n"
         );
         let mut output = Vec::new();
-        serve_io(&fixture.state, input.as_bytes(), &mut output).expect("serve stdio");
+        serve_io(&fixture.state, &fixture.sftp, input.as_bytes(), &mut output).expect("serve stdio");
 
         let text = String::from_utf8(output).expect("utf-8 output");
         let lines: Vec<&str> = text.lines().collect();

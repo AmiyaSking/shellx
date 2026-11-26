@@ -46,7 +46,7 @@ ShellX 面向两类使用者：
 | 旧算法兼容 | ✅ 已实现 | 每连接可选 ssh-rsa / SHA-1 KEX/MAC / CBC / 3DES |
 | SSH Agent 转发 | ✅ 已实现 | 每连接可选，OpenSSH Agent / `SSH_AUTH_SOCK` |
 | X11 转发 | 🚧 暂未实现 | Windows 场景价值较低 |
-| 本地 MCP stdio 传输 | ✅ 已实现 | `shellx --mcp-stdio`；JSON-RPC 2.0，工具调用走策略/审批/审计 |
+| 本地 MCP stdio 传输 | ✅ 已实现 | `shellx --mcp-stdio`；JSON-RPC 2.0，命令与 SFTP 工具调用走策略/审计 |
 
 > 桌面版连接真实服务器；浏览器 `npm run dev` 会使用内置 Mock 后端，界面显示「浏览器 Mock 模式」。
 
@@ -187,7 +187,7 @@ cargo test
 - **前端**：Vitest + jsdom，覆盖设置持久化/默认值迁移与工作区序列化；`npm test`
 - **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法、SFTP 传输取消等单元测试；`cargo test`
 - **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发、`exec` 输出/退出码/超时/运行中信号，以及 SFTP 目录列举、创建/重命名/递归删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
-- **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`wait=false` 后台执行、`read_output` 分页与状态轮询、`send_signal`、`close_session` 与 `resources/*` 资源读取
+- **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`wait=false` 后台执行、`read_output` 分页与状态轮询、`send_signal`、`close_session`、SFTP 读写/建目录/重命名/递归删除、只读与 staging 写拦截、`resources/*` 资源读取
 - **CI**：`.github/workflows/ci.yml` 在 Windows 上执行前端测试/构建 + `cargo test` / `cargo check`
 - 系统凭据存储的读写测试标记为 `#[ignore]`，需要手动运行：
   `cargo test keyring_roundtrip -- --ignored`
@@ -215,6 +215,12 @@ Tauri 应用数据目录（标识符 `com.shellx.app`）下：
 | `read_output` | 低 | 已实现：按行分页读取会话输出，附带 `running` / `exitCode` 状态 |
 | `send_signal` | 中 | 已实现：向运行中的命令发送 `INT` / `TERM` / `KILL` 等信号 |
 | `close_session` | 中 | 已实现：关闭指定命令会话（运行中的命令会先收到 `KILL`） |
+| `sftp_open` / `sftp_close` | 低 | 已实现：打开/关闭 MCP 进程内的 SFTP 会话 |
+| `sftp_list` / `sftp_stat` | 低 | 已实现：远端目录列举与路径元信息 |
+| `sftp_read_file` | 低 | 已实现：读取远端文件，默认最多 64 KiB，UTF-8 或 base64 |
+| `sftp_write_file` | 中 | 已实现：创建/覆盖远端文件（最大 1 MiB） |
+| `sftp_mkdir` / `sftp_rename` | 中 | 已实现：创建目录 / 重命名远端路径 |
+| `sftp_remove` | 中 | 已实现：删除远端文件；删除目录需显式 `recursive=true` |
 
 以 stdio 方式启动（MCP 客户端会自行拉起该进程）：
 
@@ -244,6 +250,9 @@ shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
 - 同一连接同一时间只运行一条命令；需要并行执行时请先在桌面端确认主机密钥并建立多个连接。
 - 主机密钥必须先在桌面端终端连接中确认；stdio 进程与桌面版共用 `known_hosts`、`connections.json` 与审计目录。
 - stdio 模式没有人工审批窗口：需要审批的命令会被**自动拒绝**并写入审计日志，请先在桌面端批准执行或改用低风险命令。
+- SFTP 工具沿用连接的 `mcpAccess`：`read_only` 只能读取；`standard_controlled` 在 dev 环境允许写入/删除，staging/prod 的写操作按命令矩阵需要审批，stdio 模式会自动拒绝并写审计。
+- SFTP 单次读取默认 64 KiB、最大 512 KiB；单次写入最大 1 MiB；删除目录必须显式传 `recursive=true`。
+- SFTP 工具只操作远端路径，不接受本地文件路径；主机密钥同样必须先在桌面端确认，2FA 在 stdio 模式下不可用。
 
 ### MCP 资源（只读）
 
@@ -273,7 +282,7 @@ shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
 - 「登录后启动命令」会在 shell 建立后自动输入并回车，请只配置可信命令。
 - keyboard-interactive/2FA 使用全局认证弹窗，终端、端口转发、SFTP 和跳板机连接都可复用；多个并发认证请求会排队显示，连接取消或超时会自动关闭对应弹窗。
 - 「兼容旧算法」默认关闭，开启后会加入 ssh-rsa、SHA-1 KEX/MAC、CBC 与 3DES；仅用于老旧服务器/网络设备，会降低连接安全性。
-- SFTP 会话独立于终端会话；主机密钥必须先在终端连接中确认。上传会覆盖同名远端文件；删除目录会递归删除其中的全部内容（会先弹出确认）；上传/下载可随时取消，取消后可能留下部分本地或远端文件；重命名采用 SFTP RENAME，目标存在时的行为取决于服务器。
+- SFTP 会话独立于终端会话；MCP 的 SFTP 会话运行在 stdio 进程内，与桌面端 SFTP 面板互不共享，需通过 `sftp_open` 单独建立；主机密钥必须先在终端连接中确认。上传会覆盖同名远端文件；删除目录会递归删除其中的全部内容（会先弹出确认）；上传/下载可随时取消，取消后可能留下部分本地或远端文件；重命名采用 SFTP RENAME，目标存在时的行为取决于服务器。
 - 端口转发规则在「转发」面板管理；主机密钥必须先在终端连接中确认。每条运行中的规则使用独立 SSH 连接，不共享终端会话。
 - `-R` 的非回环监听需要服务器端允许 `GatewayPorts`；`-D` 当前为无认证 SOCKS5，建议只监听 `127.0.0.1`。
 - SSH config 导入为一次性预览：`Include` 不会展开，`Match` 与通配符 Host 会跳过；`ProxyJump` 仅在目标同时被导入或已存在时映射，多级跳转按直连导入并提示。
