@@ -161,6 +161,8 @@ pub struct ConnectParams {
     pub startup_command: String,
     /// Opt in to weak legacy algorithms (ssh-rsa, SHA-1 KEX/MAC, CBC ciphers).
     pub legacy_algorithms: bool,
+    /// Ask the server to allow relaying agent channels back to the local agent.
+    pub agent_forwarding: bool,
     pub cols: u32,
     pub rows: u32,
 }
@@ -182,6 +184,7 @@ impl ConnectParams {
             encoding: "utf-8".to_string(),
             startup_command: String::new(),
             legacy_algorithms: false,
+            agent_forwarding: false,
             cols: 80,
             rows: 24,
         }
@@ -318,6 +321,7 @@ struct HostKeyState {
     /// Fingerprint the user confirmed for this attempt, if any.
     expected_fingerprint: Option<String>,
     remote_forwards: Arc<Vec<RemoteForward>>,
+    agent_forwarding: bool,
     host_key: Option<HostKey>,
     /// Set when we refuse the server, so the real error survives `connect()`.
     rejection: Option<SshError>,
@@ -336,6 +340,7 @@ impl HostKeyHandler {
         known_hosts_path: PathBuf,
         expected_fingerprint: Option<String>,
         remote_forwards: Vec<RemoteForward>,
+        agent_forwarding: bool,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(HostKeyState {
@@ -344,6 +349,7 @@ impl HostKeyHandler {
                 known_hosts_path,
                 expected_fingerprint,
                 remote_forwards: Arc::new(remote_forwards),
+                agent_forwarding,
                 host_key: None,
                 rejection: None,
             })),
@@ -495,6 +501,83 @@ impl client::Handler for HostKeyHandler {
         });
         Ok(())
     }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: Channel<Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), russh::Error> {
+        let enabled = match self.state.lock() {
+            Ok(state) => state.agent_forwarding,
+            Err(_) => false,
+        };
+        if !enabled {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        }
+
+        reply.accept().await;
+        let mut stream = channel.into_stream();
+        tokio::spawn(async move {
+            match connect_local_agent().await {
+                Ok(mut agent) => {
+                    let _ = tokio::io::copy_bidirectional(&mut stream, &mut agent).await;
+                }
+                Err(error) => {
+                    eprintln!("[shellx] SSH Agent 转发失败：{error}");
+                }
+            }
+        });
+        Ok(())
+    }
+}
+
+trait RelayStream:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send
+{
+}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> RelayStream
+    for T
+{
+}
+
+#[cfg(windows)]
+async fn connect_local_agent() -> Result<Box<dyn RelayStream>, String> {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    loop {
+        match tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(r"\\.\pipe\openssh-ssh-agent")
+        {
+            Ok(client) => return Ok(Box::new(client)),
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "无法连接本机 OpenSSH Agent：{error}"
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn connect_local_agent() -> Result<Box<dyn RelayStream>, String> {
+    let path = std::env::var("SSH_AUTH_SOCK")
+        .map_err(|_| "SSH_AUTH_SOCK 未设置".to_string())?;
+    let stream = tokio::net::UnixStream::connect(path)
+        .await
+        .map_err(|error| format!("无法连接本机 SSH Agent：{error}"))?;
+    Ok(Box::new(stream))
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn connect_local_agent() -> Result<Box<dyn RelayStream>, String> {
+    Err("当前平台不支持 SSH Agent 转发".to_string())
 }
 
 /// Write side of an open PTY: cheap to share, used by the Tauri commands.
@@ -541,6 +624,7 @@ pub async fn connect_authenticated(
         params.known_hosts_path.clone(),
         trusted_fingerprint(&params.trusted_host_keys, &params.host, params.port),
         params.remote_forwards.clone(),
+        params.agent_forwarding,
     );
 
     let mut jump_session: Option<client::Handle<HostKeyHandler>> = None;
@@ -552,6 +636,7 @@ pub async fn connect_authenticated(
             params.known_hosts_path.clone(),
             trusted_fingerprint(&params.trusted_host_keys, &jump.host, jump.port),
             Vec::new(),
+            false,
         );
         let mut jump_handle = match client::connect(
             config.clone(),
@@ -661,6 +746,15 @@ impl PtyConn {
             .await
             .map_err(|error| SshError::Channel(error.to_string()))?;
         let (read, write) = channel.split();
+
+        if params.agent_forwarding {
+            write
+                .agent_forward(true)
+                .await
+                .map_err(|error| {
+                    SshError::Channel(format!("请求 SSH Agent 转发失败：{error}"))
+                })?;
+        }
 
         write
             .request_pty(false, &params.term, params.cols, params.rows, 0, 0, &[])

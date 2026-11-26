@@ -29,6 +29,7 @@ export interface Connection {
   encoding: string;
   startupCommand: string;
   legacyAlgorithms: boolean;
+  forwardAgent: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -50,6 +51,7 @@ export interface ConnectionInput {
   encoding: string;
   startupCommand: string;
   legacyAlgorithms: boolean;
+  forwardAgent: boolean;
   password?: string | null;
   passphrase?: string | null;
 }

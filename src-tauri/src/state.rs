@@ -315,7 +315,9 @@ impl AppState {
     /// Connection parameters for a forwarding-only SSH session. The host key
     /// must already be trusted (confirmed by a previous terminal connection).
     pub fn forward_params(&self, connection_id: &str) -> Result<ConnectParams, String> {
-        let (_, params) = self.pty_params(connection_id, 80, 24, Vec::new())?;
+        let (_, mut params) = self.pty_params(connection_id, 80, 24, Vec::new())?;
+        // Agent channels are only requested by interactive terminal sessions.
+        params.agent_forwarding = false;
         Ok(params)
     }
 
@@ -400,6 +402,7 @@ impl AppState {
                 encoding: connection.encoding.clone(),
                 startup_command: connection.startup_command.clone(),
                 legacy_algorithms: connection.legacy_algorithms,
+                agent_forwarding: connection.forward_agent,
                 cols: cols.max(1),
                 rows: rows.max(1),
             },

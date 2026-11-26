@@ -110,6 +110,8 @@ pub struct Connection {
     pub startup_command: String,
     #[serde(default)]
     pub legacy_algorithms: bool,
+    #[serde(default)]
+    pub forward_agent: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -144,6 +146,8 @@ pub struct ConnectionInput {
     pub startup_command: String,
     #[serde(default)]
     pub legacy_algorithms: bool,
+    #[serde(default)]
+    pub forward_agent: bool,
     /// Plaintext secrets from the form. They are written to the OS credential
     /// store and never persisted in connections.json. An empty value leaves the
     /// previously saved secret untouched.

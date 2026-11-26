@@ -100,6 +100,7 @@ impl ConnectionStore {
             },
             startup_command: input.startup_command.trim().to_string(),
             legacy_algorithms: input.legacy_algorithms,
+            forward_agent: input.forward_agent,
             created_at,
             updated_at: now,
         };

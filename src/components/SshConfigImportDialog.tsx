@@ -46,6 +46,7 @@ function buildInput(
     encoding: "utf-8",
     startupCommand: "",
     legacyAlgorithms: false,
+    forwardAgent: false,
     password: null,
     passphrase: null,
   };

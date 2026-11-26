@@ -37,6 +37,7 @@ interface FormState {
   encoding: string;
   startupCommand: string;
   legacyAlgorithms: boolean;
+  forwardAgent: boolean;
 }
 
 function initialForm(connection: Connection | null): FormState {
@@ -59,6 +60,7 @@ function initialForm(connection: Connection | null): FormState {
     encoding: connection?.encoding ?? "utf-8",
     startupCommand: connection?.startupCommand ?? "",
     legacyAlgorithms: connection?.legacyAlgorithms ?? false,
+    forwardAgent: connection?.forwardAgent ?? false,
   };
 }
 
@@ -125,6 +127,7 @@ export default function ConnectionModal({
         encoding: form.encoding,
         startupCommand: form.startupCommand.trim(),
         legacyAlgorithms: form.legacyAlgorithms,
+        forwardAgent: form.forwardAgent,
         password: form.password || null,
         passphrase: form.passphrase || null,
       });
@@ -333,6 +336,16 @@ export default function ConnectionModal({
               />
               <span>
                 兼容旧算法（ssh-rsa、SHA-1 KEX/MAC、CBC/3DES）。仅用于老旧设备，会降低连接安全性。
+              </span>
+            </label>
+            <label className="span-2 checkbox-field">
+              <input
+                type="checkbox"
+                checked={form.forwardAgent}
+                onChange={(event) => set("forwardAgent", event.target.checked)}
+              />
+              <span>
+                转发 SSH Agent（OpenSSH Agent / SSH_AUTH_SOCK）。远端可在会话期间使用本机密钥，请谨慎开启。
               </span>
             </label>
             <label className="span-2">

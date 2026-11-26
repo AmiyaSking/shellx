@@ -41,7 +41,8 @@ ShellX 面向两类使用者：
 | 每连接 TERM / 编码 / 启动命令 | ✅ 已实现 | UTF-8 / GBK / GB18030 / Big5，登录后自动执行 |
 | keyboard-interactive / 2FA | ✅ 已实现 | 终端连接时弹窗输入 OTP/口令，跳板机同样支持 |
 | 旧算法兼容 | ✅ 已实现 | 每连接可选 ssh-rsa / SHA-1 KEX/MAC / CBC / 3DES |
-| Agent/X11 转发 | 🚧 待补齐 | |
+| SSH Agent 转发 | ✅ 已实现 | 每连接可选，OpenSSH Agent / `SSH_AUTH_SOCK` |
+| X11 转发 | 🚧 暂未实现 | Windows 场景价值较低 |
 | 本地 MCP stdio 传输 | 🚧 待接入 | 工具目录、JSON Schema、分发器已就绪 |
 
 > 桌面版连接真实服务器；浏览器 `npm run dev` 会使用内置 Mock 后端，界面显示「浏览器 Mock 模式」。
@@ -204,14 +205,15 @@ stdio JSON-RPC 循环将以 `shellx --mcp-stdio` 形式接入；`src-tauri/src/m
 
 1. **第一阶段（连接可靠性）**：✅ 真实 SSH/PTY、SSH Agent、单级跳板机、系统钥匙串、主机密钥确认、连接超时/取消、PTY 会话审计。
 2. **第二阶段（终端体验）**：✅ 搜索、可点击链接、Unicode 宽度、GPU 渲染、快捷键、同主机多开、动态标题、响铃提示、设置页、右键菜单、多行粘贴确认、标签重命名/拖拽、多窗格分屏、可拖动分隔条、工作区恢复、终端输出日志；🚧 嵌套分屏。
-3. **第三阶段（专业能力）**：✅ OpenSSH config 导入、端口转发（-L / -R / -D）、SFTP 文件浏览/上传/下载、每连接 TERM/编码/启动命令、keyboard-interactive/2FA、旧算法兼容；🚧 Agent/X11 转发。
+3. **第三阶段（专业能力）**：✅ OpenSSH config 导入、端口转发（-L / -R / -D）、SFTP 文件浏览/上传/下载、每连接 TERM/编码/启动命令、keyboard-interactive/2FA、旧算法兼容、SSH Agent 转发；🚧 X11 转发。
 4. **第四阶段（工程化）**：MCP stdio 传输、输出批处理与背压、集成测试/CI、规则配置界面。
 
 ## 说明
 
 - 凭据保存在系统凭据存储；Linux 当前使用内核 keyring，重启后可能需要重新输入，后续可切换到 Secret Service。
 - 浏览器 Mock 模式不会建立任何网络连接；桌面版才会连接真实服务器。
-- 当前暂不支持多级跳板机、嵌套混合分屏、Agent/X11 转发。
+- 当前暂不支持多级跳板机、嵌套混合分屏、X11 转发。
+- SSH Agent 转发只对交互式终端会话请求；端口转发/SFTP 不会请求 Agent 通道。Windows 转发依赖 OpenSSH Authentication Agent 服务，Pageant 仅用于认证、不支持转发。
 - 每连接可设置 TERM 类型与字符编码（UTF-8 / GBK / GB18030 / Big5），修改后在下一次连接生效；输出日志记录远端原始编码字节。
 - 「登录后启动命令」会在 shell 建立后自动输入并回车，请只配置可信命令。
 - keyboard-interactive/2FA 目前只在终端连接中弹窗；端口转发与 SFTP 使用独立 SSH 连接，遇到强制 2FA 的服务器会提示先在终端连接。
