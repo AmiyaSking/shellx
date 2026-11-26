@@ -226,6 +226,11 @@ export const api = {
       ? invoke<void>("sftp_remove", { sessionId, path, isDir })
       : mock.sftpRemove(path, isDir),
 
+  sftpCancel: (sessionId: string): Promise<boolean> =>
+    isTauri()
+      ? invoke<boolean>("sftp_cancel", { sessionId })
+      : Promise.resolve(false),
+
   sftpRename: (
     sessionId: string,
     oldPath: string,

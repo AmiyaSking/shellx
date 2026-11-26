@@ -1495,6 +1495,13 @@ body.is-resizing-panes-column * {
   gap: 5px;
 }
 
+.sftp-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .sftp-progress-track {
   height: 5px;
   border-radius: 999px;

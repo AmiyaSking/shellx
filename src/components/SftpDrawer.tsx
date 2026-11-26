@@ -245,13 +245,10 @@ export default function SftpDrawer({
 
   const removeEntry = async (entry: SftpEntry) => {
     if (!sessionRef.current || !listing) return;
-    if (
-      !window.confirm(
-        `删除${entry.isDir ? "目录" : "文件"}「${entry.name}」？${
-          entry.isDir ? "目录必须为空。" : ""
-        }`,
-      )
-    ) {
+    const question = entry.isDir
+      ? `删除目录「${entry.name}」及其中的全部内容？此操作不可撤销。`
+      : `删除文件「${entry.name}」？`;
+    if (!window.confirm(question)) {
       return;
     }
     setBusyPath(entry.path);
@@ -264,6 +261,16 @@ export default function SftpDrawer({
       setError(String(err));
     } finally {
       setBusyPath(null);
+    }
+  };
+
+  const cancelTransfer = async () => {
+    if (!sessionRef.current) return;
+    try {
+      const requested = await api.sftpCancel(sessionRef.current);
+      if (requested) setNotice("已请求取消传输，当前分块完成后停止。");
+    } catch (err) {
+      setError(String(err));
     }
   };
 
@@ -406,13 +413,21 @@ export default function SftpDrawer({
                     }
                   />
                 </div>
-                <span className="muted small">
-                  {progress.direction === "upload" ? "上传" : "下载"}{" "}
-                  {humanSize(progress.transferred)}
-                  {progress.total > 0
-                    ? ` / ${humanSize(progress.total)} · ${progressPercent}%`
-                    : ""}
-                </span>
+                <div className="sftp-progress-meta">
+                  <span className="muted small">
+                    {progress.direction === "upload" ? "上传" : "下载"}{" "}
+                    {humanSize(progress.transferred)}
+                    {progress.total > 0
+                      ? ` / ${humanSize(progress.total)} · ${progressPercent}%`
+                      : ""}
+                  </span>
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => void cancelTransfer()}
+                  >
+                    取消
+                  </button>
+                </div>
               </div>
             )}
 

@@ -86,6 +86,7 @@ pub fn run() {
             commands::sftp_mkdir,
             commands::sftp_remove,
             commands::sftp_rename,
+            commands::sftp_cancel,
             commands::sftp_close,
         ])
         .build(tauri::generate_context!())

@@ -40,7 +40,7 @@ ShellX 面向两类使用者：
 | 终端输出批处理与背压 | ✅ 已实现 | 约 8ms / 64KiB 合并事件；1MiB 未确认窗口，UI 落后时反向节流远端 |
 | OpenSSH config 导入 | ✅ 已实现 | `~/.ssh/config` 预览选择导入，支持单级 ProxyJump 映射 |
 | 端口转发（-L / -R / -D） | ✅ 已实现 | 规则持久化，手动启动/停止，每规则独立 SSH 连接 |
-| SFTP 文件浏览 / 上传 / 下载 | ✅ 已实现 | 独立会话、目录操作、流式传输与进度显示 |
+| SFTP 文件浏览 / 上传 / 下载 | ✅ 已实现 | 独立会话、目录操作（目录递归删除）、流式传输、进度显示与取消 |
 | 每连接 TERM / 编码 / 启动命令 | ✅ 已实现 | UTF-8 / GBK / GB18030 / Big5，登录后自动执行 |
 | keyboard-interactive / 2FA | ✅ 已实现 | 全局弹窗；终端、端口转发、SFTP、跳板机均支持 |
 | 旧算法兼容 | ✅ 已实现 | 每连接可选 ssh-rsa / SHA-1 KEX/MAC / CBC / 3DES |
@@ -185,8 +185,8 @@ cargo test
 ### 测试与 CI
 
 - **前端**：Vitest + jsdom，覆盖设置持久化/默认值迁移与工作区序列化；`npm test`
-- **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法等单元测试；`cargo test`
-- **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发、`exec` 输出/退出码/超时/运行中信号，以及 SFTP 目录列举、创建/重命名/删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
+- **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法、SFTP 传输取消等单元测试；`cargo test`
+- **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发、`exec` 输出/退出码/超时/运行中信号，以及 SFTP 目录列举、创建/重命名/递归删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
 - **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`wait=false` 后台执行、`read_output` 分页与状态轮询、`send_signal` 与 `close_session`
 - **CI**：`.github/workflows/ci.yml` 在 Windows 上执行前端测试/构建 + `cargo test` / `cargo check`
 - 系统凭据存储的读写测试标记为 `#[ignore]`，需要手动运行：
@@ -263,7 +263,7 @@ shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
 - 「登录后启动命令」会在 shell 建立后自动输入并回车，请只配置可信命令。
 - keyboard-interactive/2FA 使用全局认证弹窗，终端、端口转发、SFTP 和跳板机连接都可复用；多个并发认证请求会排队显示，连接取消或超时会自动关闭对应弹窗。
 - 「兼容旧算法」默认关闭，开启后会加入 ssh-rsa、SHA-1 KEX/MAC、CBC 与 3DES；仅用于老旧服务器/网络设备，会降低连接安全性。
-- SFTP 会话独立于终端会话；主机密钥必须先在终端连接中确认。上传会覆盖同名远端文件；删除目录要求目录为空，暂不支持递归删除；重命名采用 SFTP RENAME，目标存在时的行为取决于服务器。
+- SFTP 会话独立于终端会话；主机密钥必须先在终端连接中确认。上传会覆盖同名远端文件；删除目录会递归删除其中的全部内容（会先弹出确认）；上传/下载可随时取消，取消后可能留下部分本地或远端文件；重命名采用 SFTP RENAME，目标存在时的行为取决于服务器。
 - 端口转发规则在「转发」面板管理；主机密钥必须先在终端连接中确认。每条运行中的规则使用独立 SSH 连接，不共享终端会话。
 - `-R` 的非回环监听需要服务器端允许 `GatewayPorts`；`-D` 当前为无认证 SOCKS5，建议只监听 `127.0.0.1`。
 - SSH config 导入为一次性预览：`Include` 不会展开，`Match` 与通配符 Host 会跳过；`ProxyJump` 仅在目标同时被导入或已存在时映射，多级跳转按直连导入并提示。

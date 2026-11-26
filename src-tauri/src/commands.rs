@@ -522,6 +522,11 @@ pub async fn sftp_rename(
 }
 
 #[tauri::command]
+pub fn sftp_cancel(sftp: State<'_, SftpManager>, session_id: String) -> bool {
+    sftp.cancel_transfer(&session_id)
+}
+
+#[tauri::command]
 pub async fn sftp_close(
     state: State<'_, AppState>,
     sftp: State<'_, SftpManager>,

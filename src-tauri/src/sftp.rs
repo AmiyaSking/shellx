@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -65,6 +66,8 @@ struct SftpEntry {
 #[derive(Default)]
 pub struct SftpManager {
     sessions: Mutex<HashMap<String, Arc<SftpEntry>>>,
+    /// Cancellation flag for the transfer currently running on a session.
+    transfers: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl SftpManager {
@@ -163,8 +166,11 @@ impl SftpManager {
             return Err("本地保存路径不能为空".into());
         }
         let sftp = self.sftp(session_id)?;
-        let session_id = session_id.to_string();
-        on_runtime(async move {
+        let cancel = self.begin_transfer(session_id)?;
+        let transfer_session = session_id.to_string();
+        let session_for_task = transfer_session.clone();
+        let cancel_for_task = cancel.clone();
+        let result = on_runtime(async move {
             let total = sftp
                 .metadata(remote_path.clone())
                 .await
@@ -182,14 +188,18 @@ impl SftpManager {
                 &mut local,
                 total,
                 &app,
-                &session_id,
+                &session_for_task,
                 "download",
+                cancel_for_task,
             )
-            .await?;
+            .await;
+            // Close the remote handle even when the transfer was cancelled.
             let _ = remote.close().await;
-            Ok(bytes)
+            bytes
         })
-        .await
+        .await;
+        self.end_transfer(&transfer_session, &cancel);
+        result
     }
 
     pub async fn upload(
@@ -200,8 +210,11 @@ impl SftpManager {
         remote_path: String,
     ) -> Result<u64, String> {
         let sftp = self.sftp(session_id)?;
-        let session_id = session_id.to_string();
-        on_runtime(async move {
+        let cancel = self.begin_transfer(session_id)?;
+        let transfer_session = session_id.to_string();
+        let session_for_task = transfer_session.clone();
+        let cancel_for_task = cancel.clone();
+        let result = on_runtime(async move {
             let total = tokio::fs::metadata(&local_path)
                 .await
                 .map(|metadata| metadata.len())
@@ -218,14 +231,18 @@ impl SftpManager {
                 &mut remote,
                 total,
                 &app,
-                &session_id,
+                &session_for_task,
                 "upload",
+                cancel_for_task,
             )
-            .await?;
+            .await;
+            // Close the remote handle even when the transfer was cancelled.
             let _ = remote.close().await;
-            Ok(bytes)
+            bytes
         })
-        .await
+        .await;
+        self.end_transfer(&transfer_session, &cancel);
+        result
     }
 
     pub async fn create_dir(&self, session_id: &str, path: String) -> Result<(), String> {
@@ -253,9 +270,7 @@ impl SftpManager {
         let sftp = self.sftp(session_id)?;
         on_runtime(async move {
             if is_dir {
-                sftp.remove_dir(path)
-                    .await
-                    .map_err(|error| format!("删除目录失败（目录必须为空）：{error}"))
+                remove_dir_recursive(&sftp, &path).await
             } else {
                 sftp.remove_file(path)
                     .await
@@ -284,6 +299,7 @@ impl SftpManager {
     }
 
     pub async fn close(&self, session_id: &str) -> bool {
+        self.cancel_transfer(session_id);
         let entry = self
             .sessions
             .lock()
@@ -302,6 +318,47 @@ impl SftpManager {
         true
     }
 
+    fn begin_transfer(&self, session_id: &str) -> Result<Arc<AtomicBool>, String> {
+        let mut transfers = self
+            .transfers
+            .lock()
+            .map_err(|_| "SFTP 传输表内部状态损坏".to_string())?;
+        if transfers.contains_key(session_id) {
+            return Err("该 SFTP 会话已有传输正在进行".into());
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        transfers.insert(session_id.to_string(), flag.clone());
+        Ok(flag)
+    }
+
+    fn end_transfer(&self, session_id: &str, cancel: &Arc<AtomicBool>) {
+        if let Ok(mut transfers) = self.transfers.lock() {
+            if transfers
+                .get(session_id)
+                .is_some_and(|stored| Arc::ptr_eq(stored, cancel))
+            {
+                transfers.remove(session_id);
+            }
+        }
+    }
+
+    /// Ask the transfer running on `session_id` to stop after the current
+    /// chunk. Returns `false` when no transfer is active.
+    pub fn cancel_transfer(&self, session_id: &str) -> bool {
+        let flag = self
+            .transfers
+            .lock()
+            .ok()
+            .and_then(|transfers| transfers.get(session_id).cloned());
+        match flag {
+            Some(flag) => {
+                flag.store(true, Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn connection_id(&self, session_id: &str) -> Option<String> {
         self.sessions
             .lock()
@@ -310,6 +367,11 @@ impl SftpManager {
     }
 
     pub fn shutdown(&self) -> usize {
+        if let Ok(transfers) = self.transfers.lock() {
+            for flag in transfers.values() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
         let count = self
             .sessions
             .lock()
@@ -368,6 +430,39 @@ fn format_time(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339()
 }
 
+/// Delete a directory tree without following symlinks.
+async fn remove_dir_recursive(sftp: &SftpSession, root: &str) -> Result<(), String> {
+    let mut pending = vec![root.to_string()];
+    let mut directories = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let read_dir = sftp
+            .read_dir(&dir)
+            .await
+            .map_err(|error| format!("读取目录 {dir} 失败：{error}"))?;
+        directories.push(dir.clone());
+        for entry in read_dir {
+            let path = entry.path();
+            let file_type = entry.file_type();
+            if file_type.is_dir() && !file_type.is_symlink() {
+                pending.push(path);
+            } else {
+                sftp.remove_file(path.clone())
+                    .await
+                    .map_err(|error| format!("删除文件 {path} 失败：{error}"))?;
+            }
+        }
+    }
+
+    // `directories` is in discovery order (parents first), so reverse it to
+    // remove children before their parent.
+    for dir in directories.into_iter().rev() {
+        sftp.remove_dir(dir.clone())
+            .await
+            .map_err(|error| format!("删除目录 {dir} 失败：{error}"))?;
+    }
+    Ok(())
+}
+
 async fn copy_with_progress<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -375,6 +470,7 @@ async fn copy_with_progress<R, W>(
     app: &AppHandle,
     session_id: &str,
     direction: &str,
+    cancel: Arc<AtomicBool>,
 ) -> Result<u64, String>
 where
     R: AsyncRead + Unpin,
@@ -386,6 +482,9 @@ where
     emit_progress(app, session_id, direction, 0, total);
 
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("传输已取消".to_string());
+        }
         let read = reader
             .read(&mut buffer)
             .await
@@ -404,6 +503,9 @@ where
         }
     }
 
+    if cancel.load(Ordering::Relaxed) {
+        return Err("传输已取消".to_string());
+    }
     let _ = writer.flush().await;
     emit_progress(app, session_id, direction, transferred, total);
     Ok(transferred)
@@ -560,6 +662,56 @@ mod tests {
         drop(server);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&known_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn real_sftp_recursively_removes_non_empty_directories() {
+        let (dir, root) = seed_root();
+        std::fs::create_dir_all(root.join("tree").join("a")).expect("create tree");
+        std::fs::write(root.join("tree").join("a").join("b.txt"), b"b")
+            .expect("seed deep file");
+        std::fs::write(root.join("tree").join("c.txt"), b"c").expect("seed top file");
+
+        let server =
+            start_sftp_test_server(TestAuthMode::Password("secret".into()), root.clone())
+                .await;
+        let (known_dir, known_hosts) = temp_known_hosts();
+        let manager = SftpManager::new();
+        let opened = open_session(&manager, &server, &known_hosts, "sftp-it-2").await;
+        assert!(opened.listing.entries.iter().any(|entry| entry.name == "tree"));
+
+        manager
+            .remove("sftp-it-2", "/tree".into(), true)
+            .await
+            .expect("recursively remove directory");
+        assert!(!root.join("tree").exists());
+        assert!(!root.join("tree").join("a").join("b.txt").exists());
+        assert!(
+            root.join("sub").join("nested.txt").exists(),
+            "sibling directories must be untouched"
+        );
+
+        assert!(manager.close("sftp-it-2").await);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&known_dir).ok();
+    }
+
+    #[test]
+    fn transfer_cancellation_is_scoped_to_the_session() {
+        let manager = SftpManager::new();
+        let flag = manager.begin_transfer("s1").expect("begin transfer");
+        assert!(
+            manager.begin_transfer("s1").is_err(),
+            "a session can only run one transfer at a time"
+        );
+        assert!(!manager.cancel_transfer("other-session"));
+        assert!(manager.cancel_transfer("s1"));
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+
+        manager.end_transfer("s1", &flag);
+        let next = manager.begin_transfer("s1").expect("begin a new transfer");
+        assert!(!next.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     #[tokio::test]
