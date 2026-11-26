@@ -99,6 +99,7 @@ impl ConnectionStore {
                 input.encoding.trim().to_lowercase()
             },
             startup_command: input.startup_command.trim().to_string(),
+            legacy_algorithms: input.legacy_algorithms,
             created_at,
             updated_at: now,
         };

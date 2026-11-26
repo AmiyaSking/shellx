@@ -108,6 +108,8 @@ pub struct Connection {
     pub encoding: String,
     #[serde(default)]
     pub startup_command: String,
+    #[serde(default)]
+    pub legacy_algorithms: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -140,6 +142,8 @@ pub struct ConnectionInput {
     pub encoding: String,
     #[serde(default)]
     pub startup_command: String,
+    #[serde(default)]
+    pub legacy_algorithms: bool,
     /// Plaintext secrets from the form. They are written to the OS credential
     /// store and never persisted in connections.json. An empty value leaves the
     /// previously saved secret untouched.

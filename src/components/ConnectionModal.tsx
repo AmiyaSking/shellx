@@ -36,6 +36,7 @@ interface FormState {
   term: string;
   encoding: string;
   startupCommand: string;
+  legacyAlgorithms: boolean;
 }
 
 function initialForm(connection: Connection | null): FormState {
@@ -57,6 +58,7 @@ function initialForm(connection: Connection | null): FormState {
     term: connection?.term ?? "xterm-256color",
     encoding: connection?.encoding ?? "utf-8",
     startupCommand: connection?.startupCommand ?? "",
+    legacyAlgorithms: connection?.legacyAlgorithms ?? false,
   };
 }
 
@@ -122,6 +124,7 @@ export default function ConnectionModal({
         term: form.term.trim() || "xterm-256color",
         encoding: form.encoding,
         startupCommand: form.startupCommand.trim(),
+        legacyAlgorithms: form.legacyAlgorithms,
         password: form.password || null,
         passphrase: form.passphrase || null,
       });
@@ -319,6 +322,18 @@ export default function ConnectionModal({
                 onChange={(event) => set("startupCommand", event.target.value)}
                 placeholder="例如 cd /srv/app（连接后自动执行，留空则不执行）"
               />
+            </label>
+            <label className="span-2 checkbox-field">
+              <input
+                type="checkbox"
+                checked={form.legacyAlgorithms}
+                onChange={(event) =>
+                  set("legacyAlgorithms", event.target.checked)
+                }
+              />
+              <span>
+                兼容旧算法（ssh-rsa、SHA-1 KEX/MAC、CBC/3DES）。仅用于老旧设备，会降低连接安全性。
+              </span>
             </label>
             <label className="span-2">
               <span>标签（逗号分隔）</span>

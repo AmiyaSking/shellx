@@ -45,6 +45,7 @@ function buildInput(
     term: "xterm-256color",
     encoding: "utf-8",
     startupCommand: "",
+    legacyAlgorithms: false,
     password: null,
     passphrase: null,
   };

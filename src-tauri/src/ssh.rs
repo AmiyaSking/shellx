@@ -10,6 +10,7 @@
 //! `known_hosts` file; afterwards a changed key is a hard failure, never a prompt
 //! we silently accept.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::fs;
 use std::future::Future;
@@ -158,6 +159,8 @@ pub struct ConnectParams {
     pub encoding: String,
     /// Optional command typed into the shell right after login.
     pub startup_command: String,
+    /// Opt in to weak legacy algorithms (ssh-rsa, SHA-1 KEX/MAC, CBC ciphers).
+    pub legacy_algorithms: bool,
     pub cols: u32,
     pub rows: u32,
 }
@@ -178,6 +181,7 @@ impl ConnectParams {
             term: DEFAULT_TERM.to_string(),
             encoding: "utf-8".to_string(),
             startup_command: String::new(),
+            legacy_algorithms: false,
             cols: 80,
             rows: 24,
         }
@@ -188,6 +192,39 @@ fn trusted_fingerprint(trusted: &[HostKeyTrust], host: &str, port: u16) -> Optio
     trusted
         .iter()
         .find_map(|entry| entry.fingerprint_for(host, port).map(str::to_string))
+}
+
+/// Prepend weak algorithms that older servers/network devices still require.
+/// Only called when the connection explicitly opts in.
+fn apply_legacy_algorithms(preferred: &mut russh::Preferred) {
+    let mut kex = vec![
+        russh::kex::DH_G14_SHA1,
+        russh::kex::DH_G1_SHA1,
+        russh::kex::DH_GEX_SHA1,
+    ];
+    kex.extend(preferred.kex.iter().cloned());
+    preferred.kex = Cow::Owned(kex);
+
+    let mut keys = vec![russh::keys::Algorithm::Rsa { hash: None }];
+    for key in preferred.key.iter() {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    preferred.key = Cow::Owned(keys);
+
+    let mut ciphers = vec![
+        russh::cipher::AES_128_CBC,
+        russh::cipher::AES_192_CBC,
+        russh::cipher::AES_256_CBC,
+        russh::cipher::TRIPLE_DES_CBC,
+    ];
+    ciphers.extend(preferred.cipher.iter().cloned());
+    preferred.cipher = Cow::Owned(ciphers);
+
+    let mut macs = vec![russh::mac::HMAC_SHA1, russh::mac::HMAC_SHA1_ETM];
+    macs.extend(preferred.mac.iter().cloned());
+    preferred.mac = Cow::Owned(macs);
 }
 
 /// What we learned about the server's key during the handshake.
@@ -487,12 +524,16 @@ pub struct AuthenticatedSession {
 pub async fn connect_authenticated(
     params: &ConnectParams,
 ) -> Result<AuthenticatedSession, SshError> {
-    let config = Arc::new(client::Config {
+    let mut config = client::Config {
         keepalive_interval: Some(Duration::from_secs(30)),
         keepalive_max: 3,
         nodelay: true,
         ..Default::default()
-    });
+    };
+    if params.legacy_algorithms {
+        apply_legacy_algorithms(&mut config.preferred);
+    }
+    let config = Arc::new(config);
 
     let target_handler = HostKeyHandler::new(
         params.host.clone(),
@@ -1124,6 +1165,30 @@ mod tests {
         assert_eq!(params.term, DEFAULT_TERM);
         assert!(params.jump.is_none());
         assert!(params.trusted_host_keys.is_empty());
+    }
+
+    #[test]
+    fn legacy_algorithms_are_prepended_without_duplicates() {
+        let mut preferred = russh::Preferred::DEFAULT;
+        apply_legacy_algorithms(&mut preferred);
+        assert_eq!(preferred.kex[0], russh::kex::DH_G14_SHA1);
+        assert!(preferred.kex.contains(&russh::kex::DH_G1_SHA1));
+        assert_eq!(preferred.cipher[0], russh::cipher::AES_128_CBC);
+        assert!(preferred.cipher.contains(&russh::cipher::TRIPLE_DES_CBC));
+        assert_eq!(preferred.mac[0], russh::mac::HMAC_SHA1);
+        assert_eq!(
+            preferred.key[0],
+            russh::keys::Algorithm::Rsa { hash: None }
+        );
+        assert_eq!(
+            preferred
+                .key
+                .iter()
+                .filter(|key| **key == russh::keys::Algorithm::Rsa { hash: None })
+                .count(),
+            1,
+            "ssh-rsa must not be listed twice"
+        );
     }
 
     #[test]

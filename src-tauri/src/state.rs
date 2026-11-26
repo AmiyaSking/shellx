@@ -399,6 +399,7 @@ impl AppState {
                 },
                 encoding: connection.encoding.clone(),
                 startup_command: connection.startup_command.clone(),
+                legacy_algorithms: connection.legacy_algorithms,
                 cols: cols.max(1),
                 rows: rows.max(1),
             },

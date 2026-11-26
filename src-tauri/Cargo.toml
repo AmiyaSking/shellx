@@ -25,7 +25,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 # SSH transport for the interactive terminal.
 # `ring` instead of the default `aws-lc-rs`: aws-lc-sys needs NASM at build time.
-russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa", "des"] }
 russh-sftp = "4"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros", "fs"] }
 # Passwords and key passphrases go to the OS credential store, never to disk.
