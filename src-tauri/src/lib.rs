@@ -48,6 +48,7 @@ pub fn run() {
             commands::pty_close,
             commands::pty_close_all,
             commands::pty_active_sessions,
+            commands::set_session_logging,
             commands::forget_host_key,
         ])
         .build(tauri::generate_context!())

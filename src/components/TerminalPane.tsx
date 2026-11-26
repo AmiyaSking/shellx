@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
@@ -39,6 +45,7 @@ interface Props {
   visible: boolean;
   focused: boolean;
   canSplit?: boolean;
+  style?: CSSProperties;
   onFocus?: () => void;
   onTitleChange?: (title: string) => void;
   onBell?: () => void;
@@ -100,6 +107,7 @@ export default function TerminalPane({
   visible,
   focused,
   canSplit = false,
+  style,
   onFocus,
   onTitleChange,
   onBell,
@@ -821,6 +829,7 @@ export default function TerminalPane({
   return (
     <div
       className={`terminal-pane ${focused ? "is-focused" : ""}`}
+      style={style}
       onMouseDownCapture={() => onFocus?.()}
     >
       <div className="terminal-toolbar">

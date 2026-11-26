@@ -1,6 +1,20 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import { api, isTauri } from "./lib/api";
+import {
+  loadSettings,
+  SETTINGS_EVENT,
+  type AppSettings,
+} from "./lib/settings";
 import type { Connection, ConnectionInput, McpServerInfo } from "./lib/types";
+import { loadWorkspace, saveWorkspace } from "./lib/workspace";
 import AuditDrawer from "./components/AuditDrawer";
 import ConnectionModal from "./components/ConnectionModal";
 import SettingsDrawer from "./components/SettingsDrawer";
@@ -16,6 +30,52 @@ let paneSeq = 0;
 const newTabId = () => `tab_${Date.now().toString(36)}_${(++tabSeq).toString(36)}`;
 const newPaneId = () => `pane_${Date.now().toString(36)}_${(++paneSeq).toString(36)}`;
 
+function buildRestoredWorkspace(
+  connections: Connection[],
+): { tabs: TerminalTab[]; activeIndex: number } | null {
+  const stored = loadWorkspace();
+  if (!stored) return null;
+  const knownConnections = new Set(
+    connections.map((connection) => connection.id),
+  );
+  const tabs: TerminalTab[] = [];
+
+  for (const storedTab of stored.tabs) {
+    const panes: TerminalPaneState[] = [];
+    const paneSizes: number[] = [];
+    for (const storedPane of storedTab.panes) {
+      if (!knownConnections.has(storedPane.connectionId)) continue;
+      panes.push({
+        id: newPaneId(),
+        connectionId: storedPane.connectionId,
+      });
+      paneSizes.push(storedPane.size);
+    }
+    if (panes.length === 0) continue;
+    const activePaneIndex = Math.min(
+      Math.max(storedTab.activePaneIndex, 0),
+      panes.length - 1,
+    );
+    tabs.push({
+      id: newTabId(),
+      panes,
+      paneSizes,
+      layout: storedTab.layout,
+      activePaneId: panes[activePaneIndex].id,
+      customTitle: storedTab.customTitle,
+    });
+  }
+
+  if (tabs.length === 0) return null;
+  return {
+    tabs,
+    activeIndex: Math.min(
+      Math.max(stored.activeTabIndex, 0),
+      tabs.length - 1,
+    ),
+  };
+}
+
 export default function App() {
   const [connections, setConnections] = useState<Connection[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -28,17 +88,23 @@ export default function App() {
   >(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
+  const [workspaceReady, setWorkspaceReady] = useState(false);
+  const workspaceRestoredRef = useRef(false);
 
   const connectionById = useMemo(
     () => new Map(connections.map((connection) => [connection.id, connection])),
     [connections],
   );
 
-  const refreshConnections = useCallback(async () => {
+  const refreshConnections = useCallback(async (): Promise<Connection[]> => {
     try {
-      setConnections(await api.listConnections());
+      const list = await api.listConnections();
+      setConnections(list);
+      return list;
     } catch (err) {
       setError(String(err));
+      return [];
     }
   }, []);
 
@@ -52,10 +118,48 @@ export default function App() {
 
   useEffect(() => {
     void (async () => {
-      await Promise.all([refreshConnections(), refreshMcpInfo()]);
+      const list = await refreshConnections();
+      await refreshMcpInfo();
+
+      if (!workspaceRestoredRef.current) {
+        workspaceRestoredRef.current = true;
+        if (loadSettings().restoreWorkspace) {
+          const restored = buildRestoredWorkspace(list);
+          if (restored) {
+            setTabs(restored.tabs);
+            setActiveTabId(
+              restored.tabs[restored.activeIndex]?.id ??
+                restored.tabs[0]?.id ??
+                null,
+            );
+          }
+        }
+      }
+
+      setWorkspaceReady(true);
       setLoading(false);
     })();
   }, [refreshConnections, refreshMcpInfo]);
+
+  useEffect(() => {
+    if (!workspaceReady) return;
+    if (!settings.restoreWorkspace && tabs.length === 0) return;
+    const timer = window.setTimeout(() => {
+      saveWorkspace(tabs, activeTabId);
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [activeTabId, settings.restoreWorkspace, tabs, workspaceReady]);
+
+  useEffect(() => {
+    void api.setSessionLogging(loadSettings().sessionLogging).catch(() => {});
+    const handler = (event: Event) => {
+      const next = (event as CustomEvent<AppSettings>).detail;
+      setSettings(next);
+      void api.setSessionLogging(next.sessionLogging).catch(() => {});
+    };
+    window.addEventListener(SETTINGS_EVENT, handler);
+    return () => window.removeEventListener(SETTINGS_EVENT, handler);
+  }, []);
 
   const selectTab = useCallback((tabId: string) => {
     setActiveTabId(tabId);
@@ -82,6 +186,7 @@ export default function App() {
     const tab: TerminalTab = {
       id: newTabId(),
       panes: [pane],
+      paneSizes: [1],
       layout: "row",
       activePaneId: pane.id,
     };
@@ -163,11 +268,14 @@ export default function App() {
           const index = item.panes.findIndex((pane) => pane.id === paneId);
           const panes = item.panes.filter((pane) => pane.id !== paneId);
           if (panes.length === 0) return item;
+          const paneSizes = item.panes
+            .map((_, paneIndex) => item.paneSizes[paneIndex] ?? 1)
+            .filter((_, paneIndex) => paneIndex !== index);
           const activePaneId =
             item.activePaneId === paneId
               ? panes[Math.max(0, index - 1)]?.id ?? panes[0].id
               : item.activePaneId;
-          return { ...item, panes, activePaneId };
+          return { ...item, panes, paneSizes, activePaneId };
         }),
       );
     },
@@ -193,6 +301,12 @@ export default function App() {
             ? {
                 ...item,
                 panes: [...item.panes, pane],
+                paneSizes: [
+                  ...item.panes.map(
+                    (_, index) => item.paneSizes[index] ?? 1,
+                  ),
+                  1,
+                ],
                 layout: direction,
                 activePaneId: pane.id,
               }
@@ -200,6 +314,105 @@ export default function App() {
         ),
       );
       setActiveTabId(tabId);
+    },
+    [tabs],
+  );
+
+  const equalizePanes = useCallback((tabId: string) => {
+    setTabs((current) =>
+      current.map((tab) =>
+        tab.id === tabId
+          ? { ...tab, paneSizes: tab.panes.map(() => 1) }
+          : tab,
+      ),
+    );
+  }, []);
+
+  const beginResize = useCallback(
+    (
+      event: ReactMouseEvent<HTMLDivElement>,
+      tabId: string,
+      dividerIndex: number,
+    ) => {
+      event.preventDefault();
+      const tab = tabs.find((item) => item.id === tabId);
+      const container = event.currentTarget.parentElement;
+      if (!tab || !container || tab.panes.length < 2) return;
+
+      const paneElements = Array.from(
+        container.querySelectorAll<HTMLElement>(
+          ":scope > .terminal-pane",
+        ),
+      );
+      const first = paneElements[dividerIndex - 1];
+      const second = paneElements[dividerIndex];
+      if (!first || !second) return;
+
+      const row = tab.layout === "row";
+      const firstRect = first.getBoundingClientRect();
+      const secondRect = second.getBoundingClientRect();
+      const startPos = row ? event.clientX : event.clientY;
+      const firstSize = row ? firstRect.width : firstRect.height;
+      const pairTotal =
+        firstSize + (row ? secondRect.width : secondRect.height);
+      if (pairTotal <= 0) return;
+
+      const sizes = tab.panes.map(
+        (_, index) => tab.paneSizes[index] ?? 1,
+      );
+      const pairWeight =
+        sizes[dividerIndex - 1] + sizes[dividerIndex];
+      let latest = [...sizes];
+      let frame = 0;
+
+      const onMove = (moveEvent: MouseEvent) => {
+        const current = row ? moveEvent.clientX : moveEvent.clientY;
+        const ratio = Math.min(
+          0.88,
+          Math.max(0.12, (firstSize + current - startPos) / pairTotal),
+        );
+        const firstWeight = pairWeight * ratio;
+        latest = sizes.map((weight, index) => {
+          if (index === dividerIndex - 1) return firstWeight;
+          if (index === dividerIndex) return pairWeight - firstWeight;
+          return weight;
+        });
+        if (frame === 0) {
+          frame = requestAnimationFrame(() => {
+            frame = 0;
+            setTabs((currentTabs) =>
+              currentTabs.map((item) =>
+                item.id === tabId
+                  ? { ...item, paneSizes: latest }
+                  : item,
+              ),
+            );
+          });
+        }
+      };
+
+      const onUp = () => {
+        window.removeEventListener("mousemove", onMove);
+        window.removeEventListener("mouseup", onUp);
+        if (frame !== 0) cancelAnimationFrame(frame);
+        document.body.classList.remove(
+          "is-resizing-panes",
+          "is-resizing-panes-row",
+          "is-resizing-panes-column",
+        );
+        setTabs((currentTabs) =>
+          currentTabs.map((item) =>
+            item.id === tabId ? { ...item, paneSizes: latest } : item,
+          ),
+        );
+      };
+
+      document.body.classList.add("is-resizing-panes");
+      document.body.classList.add(
+        row ? "is-resizing-panes-row" : "is-resizing-panes-column",
+      );
+      window.addEventListener("mousemove", onMove);
+      window.addEventListener("mouseup", onUp);
     },
     [tabs],
   );
@@ -242,16 +455,23 @@ export default function App() {
         await api.deleteConnection(connection.id);
         setTabs((current) => {
           const next = current.flatMap((tab) => {
-            const panes = tab.panes.filter(
-              (pane) => pane.connectionId !== connection.id,
-            );
-            if (panes.length === 0) return [];
+            const kept = tab.panes
+              .map((pane, index) => ({
+                pane,
+                size: tab.paneSizes[index] ?? 1,
+              }))
+              .filter(
+                ({ pane }) => pane.connectionId !== connection.id,
+              );
+            if (kept.length === 0) return [];
+            const panes = kept.map(({ pane }) => pane);
+            const paneSizes = kept.map(({ size }) => size);
             const activePaneId = panes.some(
               (pane) => pane.id === tab.activePaneId,
             )
               ? tab.activePaneId
               : panes[0].id;
-            return [{ ...tab, panes, activePaneId }];
+            return [{ ...tab, panes, paneSizes, activePaneId }];
           });
           setActiveTabId((active) => {
             if (active && next.some((tab) => tab.id === active)) return active;
@@ -462,28 +682,48 @@ export default function App() {
                   tab.id === activeTabId ? "is-active" : ""
                 }`}
               >
-                {tab.panes.map((pane) => {
+                {tab.panes.map((pane, paneIndex) => {
                   const connection = connectionById.get(pane.connectionId);
                   if (!connection) return null;
                   return (
-                    <TerminalPane
-                      key={pane.id}
-                      connection={connection}
-                      visible={tab.id === activeTabId}
-                      focused={
-                        tab.id === activeTabId &&
-                        pane.id === tab.activePaneId
-                      }
-                      canSplit={tab.panes.length < 4}
-                      onFocus={() => focusPane(tab.id, pane.id)}
-                      onTitleChange={(title) => updateTabTitle(tab.id, title)}
-                      onBell={() => markTabAttention(tab.id)}
-                      onSplitRow={() => splitPane(tab.id, pane.id, "row")}
-                      onSplitColumn={() =>
-                        splitPane(tab.id, pane.id, "column")
-                      }
-                      onClosePane={() => closePane(tab.id, pane.id)}
-                    />
+                    <Fragment key={pane.id}>
+                      {paneIndex > 0 && (
+                        <div
+                          className={`pane-divider pane-divider-${tab.layout}`}
+                          title="拖动调整比例，双击均分"
+                          onMouseDown={(event) =>
+                            beginResize(event, tab.id, paneIndex)
+                          }
+                          onDoubleClick={() => equalizePanes(tab.id)}
+                        />
+                      )}
+                      <TerminalPane
+                        connection={connection}
+                        visible={tab.id === activeTabId}
+                        focused={
+                          tab.id === activeTabId &&
+                          pane.id === tab.activePaneId
+                        }
+                        canSplit={tab.panes.length < 4}
+                        style={{
+                          flexGrow: tab.paneSizes[paneIndex] ?? 1,
+                          flexBasis: 0,
+                          flexShrink: 1,
+                        }}
+                        onFocus={() => focusPane(tab.id, pane.id)}
+                        onTitleChange={(title) =>
+                          updateTabTitle(tab.id, title)
+                        }
+                        onBell={() => markTabAttention(tab.id)}
+                        onSplitRow={() =>
+                          splitPane(tab.id, pane.id, "row")
+                        }
+                        onSplitColumn={() =>
+                          splitPane(tab.id, pane.id, "column")
+                        }
+                        onClosePane={() => closePane(tab.id, pane.id)}
+                      />
+                    </Fragment>
                   );
                 })}
               </div>

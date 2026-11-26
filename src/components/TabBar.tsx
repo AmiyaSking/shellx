@@ -9,6 +9,8 @@ export interface TerminalPaneState {
 export interface TerminalTab {
   id: string;
   panes: TerminalPaneState[];
+  /** Flex weight per pane; same length as `panes`. */
+  paneSizes: number[];
   /** Split direction for two or more panes. */
   layout: "row" | "column";
   activePaneId: string;

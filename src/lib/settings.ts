@@ -6,6 +6,10 @@ export interface AppSettings {
   pasteWarning: boolean;
   /** Copy the terminal selection to the clipboard as soon as it changes. */
   copyOnSelect: boolean;
+  /** Reopen saved tabs/panes and reconnect on startup. */
+  restoreWorkspace: boolean;
+  /** Write raw PTY output to the app data directory. */
+  sessionLogging: boolean;
 }
 
 const KEY = "shellx.settings.v1";
@@ -18,6 +22,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   cursorBlink: true,
   pasteWarning: true,
   copyOnSelect: false,
+  restoreWorkspace: false,
+  sessionLogging: false,
 };
 
 function clamp(value: number, min: number, max: number): number {
@@ -50,6 +56,14 @@ function normalize(input: Partial<AppSettings> | null | undefined): AppSettings 
       typeof input?.copyOnSelect === "boolean"
         ? input.copyOnSelect
         : DEFAULT_SETTINGS.copyOnSelect,
+    restoreWorkspace:
+      typeof input?.restoreWorkspace === "boolean"
+        ? input.restoreWorkspace
+        : DEFAULT_SETTINGS.restoreWorkspace,
+    sessionLogging:
+      typeof input?.sessionLogging === "boolean"
+        ? input.sessionLogging
+        : DEFAULT_SETTINGS.sessionLogging,
   };
 }
 

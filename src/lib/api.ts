@@ -109,6 +109,11 @@ export const api = {
 
   ptyActiveSessions: (): Promise<number> =>
     isTauri() ? invoke<number>("pty_active_sessions") : Promise.resolve(0),
+
+  setSessionLogging: (enabled: boolean): Promise<void> =>
+    isTauri()
+      ? invoke<void>("set_session_logging", { enabled })
+      : Promise.resolve(),
 };
 
 /* ------------------------------------------------------------------ */

@@ -130,8 +130,44 @@ export default function SettingsDrawer({ onClose }: Props) {
             </label>
           </section>
 
+          <section className="settings-section">
+            <h3>会话与日志</h3>
+
+            <label className="settings-row settings-check">
+              <span className="settings-copy">
+                <strong>启动时恢复工作区</strong>
+                <span className="muted small">
+                  记住标签、分屏与自定义标题，启动后自动重连
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={settings.restoreWorkspace}
+                onChange={(event) =>
+                  update({ restoreWorkspace: event.target.checked })
+                }
+              />
+            </label>
+
+            <label className="settings-row settings-check">
+              <span className="settings-copy">
+                <strong>记录终端输出</strong>
+                <span className="muted small">
+                  原始 PTY 输出写入应用数据目录 sessions/日期/会话ID.log
+                </span>
+              </span>
+              <input
+                type="checkbox"
+                checked={settings.sessionLogging}
+                onChange={(event) =>
+                  update({ sessionLogging: event.target.checked })
+                }
+              />
+            </label>
+          </section>
+
           <p className="settings-note">
-            设置立即生效并应用到所有终端标签。图标、主题与快捷键自定义将在后续版本加入。
+            设置立即生效并应用到所有终端标签。会话日志可能包含敏感输出，请谨慎开启。图标、主题与快捷键自定义将在后续版本加入。
           </p>
 
           <div className="settings-foot">

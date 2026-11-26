@@ -10,11 +10,16 @@
 //! purpose, so it is never dropped inside an async context.
 
 use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::Utc;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{oneshot, Notify};
 use tokio::task::JoinHandle;
@@ -141,6 +146,14 @@ struct PtyEntry {
 pub struct PtyManager {
     entries: Mutex<HashMap<String, PtyEntry>>,
     cancellations: Mutex<HashMap<String, Arc<Notify>>>,
+    session_logging: Arc<AtomicBool>,
+}
+
+fn close_session_log(log: &mut Option<BufWriter<File>>) {
+    if let Some(mut writer) = log.take() {
+        let _ = writeln!(writer, "\n# closed at {}", Utc::now().to_rfc3339());
+        let _ = writer.flush();
+    }
 }
 
 impl PtyManager {
@@ -150,6 +163,15 @@ impl PtyManager {
 
     pub fn active_count(&self) -> usize {
         self.entries.lock().map(|guard| guard.len()).unwrap_or(0)
+    }
+
+    pub fn set_session_logging(&self, enabled: bool) {
+        self.session_logging.store(enabled, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)] // used by tests; useful for a future status indicator
+    pub fn session_logging_enabled(&self) -> bool {
+        self.session_logging.load(Ordering::Relaxed)
     }
 
     #[allow(dead_code)] // kept for the verification harness and future session UI
@@ -199,6 +221,22 @@ impl PtyManager {
         params: ConnectParams,
         cancel: Arc<Notify>,
     ) -> Result<HostKey, SshError> {
+        let log_path: Option<PathBuf> = app.path().app_data_dir().ok().map(|dir| {
+            dir.join("sessions")
+                .join(Utc::now().format("%Y-%m-%d").to_string())
+                .join(format!("{session_id}.log"))
+        });
+        let log_header = format!(
+            "# ShellX terminal session\n# id: {session_id}\n# connection: {} ({})\n# target: {}@{}:{}\n# started: {}\n",
+            meta.connection_alias,
+            meta.connection_id,
+            params.username,
+            params.host,
+            params.port,
+            Utc::now().to_rfc3339()
+        );
+        let logging = self.session_logging.clone();
+
         let (conn, mut reader) = run_ssh(async move {
             tokio::select! {
                 result = tokio::time::timeout(OPEN_TIMEOUT, PtyConn::open(params)) => {
@@ -222,9 +260,40 @@ impl PtyManager {
         let pump_app = app.clone();
         let runtime = runtime().map_err(SshError::Connect)?;
         let task = runtime.spawn(async move {
+            let mut log: Option<BufWriter<File>> = None;
+            let mut log_attempted = false;
+
             loop {
                 match reader.next_event().await {
                     PtyEvent::Data(bytes) => {
+                        if logging.load(Ordering::Relaxed) && !log_attempted {
+                            log_attempted = true;
+                            if let Some(path) = &log_path {
+                                if let Some(parent) = path.parent() {
+                                    let _ = fs::create_dir_all(parent);
+                                }
+                                match OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(path)
+                                {
+                                    Ok(mut file) => {
+                                        let _ = writeln!(file, "{log_header}");
+                                        log = Some(BufWriter::new(file));
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "[shellx] 无法创建会话日志 {}: {error}",
+                                            path.display()
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(writer) = log.as_mut() {
+                            let _ = writer.write_all(&bytes);
+                        }
+
                         let payload = PtyOutputPayload {
                             session_id: pump_id.clone(),
                             data: base64_encode(&bytes),
@@ -242,6 +311,7 @@ impl PtyManager {
                                 exit_code: Some(exit_code),
                             },
                         );
+                        close_session_log(&mut log);
                     }
                     PtyEvent::Closed => {
                         let _ = pump_app.emit(
@@ -255,6 +325,8 @@ impl PtyManager {
                     }
                 }
             }
+
+            close_session_log(&mut log);
         });
 
         let mut entries = lock(&self.entries).map_err(SshError::Connect)?;
@@ -416,6 +488,16 @@ mod tests {
         manager.register_cancel("pending-1").unwrap();
         assert_eq!(manager.shutdown(), 0);
         assert!(!manager.cancel("pending-1"));
+    }
+
+    #[test]
+    fn session_logging_toggle_is_shared_with_sessions() {
+        let manager = PtyManager::new();
+        assert!(!manager.session_logging_enabled());
+        manager.set_session_logging(true);
+        assert!(manager.session_logging_enabled());
+        manager.set_session_logging(false);
+        assert!(!manager.session_logging_enabled());
     }
 
     #[test]

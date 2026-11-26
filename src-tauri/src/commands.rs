@@ -231,3 +231,8 @@ pub fn pty_close_all(
 pub fn pty_active_sessions(pty: State<'_, PtyManager>) -> usize {
     pty.active_count()
 }
+
+#[tauri::command]
+pub fn set_session_logging(pty: State<'_, PtyManager>, enabled: bool) {
+    pty.set_session_logging(enabled);
+}
