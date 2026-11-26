@@ -8,6 +8,14 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Terminal } from "@xterm/xterm";
 import { api, isTauri } from "../lib/api";
+import { readClipboardText, writeClipboardText } from "../lib/clipboard";
+import {
+  DEFAULT_SETTINGS,
+  loadSettings,
+  saveSettings,
+  SETTINGS_EVENT,
+  type AppSettings,
+} from "../lib/settings";
 import {
   ENV_LABELS,
   MCP_ACCESS_LABELS,
@@ -24,24 +32,13 @@ import {
 } from "../lib/types";
 import ApprovalDialog from "./ApprovalDialog";
 import HostKeyDialog from "./HostKeyDialog";
+import PasteConfirmDialog from "./PasteConfirmDialog";
 
 interface Props {
   connection: Connection;
   active: boolean;
   onTitleChange?: (title: string) => void;
   onBell?: () => void;
-}
-
-const DEFAULT_FONT_SIZE = 13;
-
-function loadFontSize(): number {
-  try {
-    const saved = Number(window.localStorage.getItem("shellx.fontSize"));
-    if (Number.isFinite(saved) && saved >= 10 && saved <= 24) return saved;
-  } catch {
-    // localStorage is optional; fall through to the default.
-  }
-  return DEFAULT_FONT_SIZE;
 }
 
 function openExternalUrl(uri: string) {
@@ -105,6 +102,8 @@ export default function TerminalPane({
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const onTitleChangeRef = useRef<Props["onTitleChange"]>(onTitleChange);
   const onBellRef = useRef<Props["onBell"]>(onBell);
+  const settingsRef = useRef<AppSettings>(loadSettings());
+  const requestPasteRef = useRef<(text: string) => void>(() => {});
   const sessionRef = useRef<string | null>(null);
   const connectionRef = useRef(connection);
   const sizeRef = useRef<{ cols: number; rows: number } | null>(null);
@@ -127,6 +126,11 @@ export default function TerminalPane({
   const [hostKeyIssue, setHostKeyIssue] = useState<HostKeyPrompt | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [pendingPaste, setPendingPaste] = useState<string | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(
+    null,
+  );
+  const [hasSelection, setHasSelection] = useState(false);
 
   const [agentMode, setAgentMode] = useState(false);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
@@ -176,6 +180,77 @@ export default function TerminalPane({
     searchAddonRef.current?.clearDecorations();
     terminalRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const next = (event as CustomEvent<AppSettings>).detail;
+      settingsRef.current = next;
+      const term = terminalRef.current;
+      if (!term) return;
+      term.options.fontSize = next.fontSize;
+      term.options.scrollback = next.scrollback;
+      term.options.cursorBlink = next.cursorBlink;
+      try {
+        fitAddonRef.current?.fit();
+      } catch {
+        // Hidden pane; the active-tab fit will catch up.
+      }
+      const sessionId = sessionRef.current;
+      if (sessionId) {
+        void api.ptyResize(sessionId, term.cols, term.rows).catch(() => {});
+      }
+    };
+    window.addEventListener(SETTINGS_EVENT, handler);
+    return () => window.removeEventListener(SETTINGS_EVENT, handler);
+  }, []);
+
+  const pasteText = useCallback((text: string) => {
+    if (!text) return;
+    const term = terminalRef.current;
+    if (!term) return;
+    if (PTY_CAPABLE && sessionRef.current) {
+      void api.ptyWrite(sessionRef.current, text).catch(() => {});
+      return;
+    }
+    if (!PTY_CAPABLE) {
+      inputRef.current += text;
+      term.write(text);
+    }
+  }, []);
+
+  const requestPaste = useCallback(
+    (text: string) => {
+      if (!text) return;
+      const settings = settingsRef.current;
+      if (
+        settings.pasteWarning &&
+        (/[\r\n]/.test(text) || text.length > 2000)
+      ) {
+        setPendingPaste(text);
+        return;
+      }
+      pasteText(text);
+    },
+    [pasteText],
+  );
+
+  useEffect(() => {
+    requestPasteRef.current = requestPaste;
+  }, [requestPaste]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setContextMenu(null);
+    };
+    window.addEventListener("mousedown", close);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", close);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [contextMenu]);
 
   /* ---------------- browser mock REPL (unchanged behaviour) ---------------- */
 
@@ -258,10 +333,10 @@ export default function TerminalPane({
     if (!container) return;
 
     const term = new Terminal({
-      cursorBlink: true,
-      fontSize: loadFontSize(),
+      cursorBlink: settingsRef.current.cursorBlink,
+      fontSize: settingsRef.current.fontSize,
       lineHeight: 1.35,
-      scrollback: 5000,
+      scrollback: settingsRef.current.scrollback,
       allowProposedApi: true,
       convertEol: false,
       fontFamily:
@@ -308,6 +383,28 @@ export default function TerminalPane({
     });
     const bellSub = term.onBell(() => onBellRef.current?.());
 
+    let selectionTimer: number | undefined;
+    const selectionSub = term.onSelectionChange(() => {
+      const selection = term.getSelection();
+      setHasSelection(Boolean(selection));
+      if (!settingsRef.current.copyOnSelect || !selection) return;
+      window.clearTimeout(selectionTimer);
+      selectionTimer = window.setTimeout(() => {
+        void writeClipboardText(selection);
+      }, 120);
+    });
+
+    // xterm routes browser paste through its hidden textarea; intercept it so
+    // multi-line pastes can be reviewed before they reach the remote shell.
+    const onNativePaste = (event: ClipboardEvent) => {
+      const text = event.clipboardData?.getData("text/plain") ?? "";
+      if (!text) return;
+      event.preventDefault();
+      event.stopPropagation();
+      requestPasteRef.current(text);
+    };
+    container.addEventListener("paste", onNativePaste, true);
+
     const conn = connectionRef.current;
 
     const safeFit = () => {
@@ -327,13 +424,8 @@ export default function TerminalPane({
 
     const applyFontSize = (size: number) => {
       const clamped = Math.max(10, Math.min(24, size));
-      term.options.fontSize = clamped;
-      try {
-        window.localStorage.setItem("shellx.fontSize", String(clamped));
-      } catch {
-        // Settings persistence is best-effort.
-      }
-      safeFit();
+      // saveSettings broadcasts to every terminal, including this one.
+      saveSettings({ ...settingsRef.current, fontSize: clamped });
     };
 
     const raf = requestAnimationFrame(safeFit);
@@ -493,38 +585,30 @@ export default function TerminalPane({
       }
       if (mod && event.shiftKey && (key === "+" || key === "=")) {
         event.preventDefault();
-        applyFontSize((term.options.fontSize ?? DEFAULT_FONT_SIZE) + 1);
+        applyFontSize((term.options.fontSize ?? DEFAULT_SETTINGS.fontSize) + 1);
         return false;
       }
       if (mod && event.shiftKey && key === "-") {
         event.preventDefault();
-        applyFontSize((term.options.fontSize ?? DEFAULT_FONT_SIZE) - 1);
+        applyFontSize((term.options.fontSize ?? DEFAULT_SETTINGS.fontSize) - 1);
         return false;
       }
       if (mod && event.shiftKey && key === "0") {
         event.preventDefault();
-        applyFontSize(DEFAULT_FONT_SIZE);
+        applyFontSize(DEFAULT_SETTINGS.fontSize);
         return false;
       }
 
       if (mod && event.shiftKey && key === "c") {
         const selection = term.getSelection();
         if (selection) {
-          void navigator.clipboard.writeText(selection);
+          void writeClipboardText(selection);
           return false;
         }
         return true;
       }
       if (mod && event.shiftKey && key === "v") {
-        void navigator.clipboard.readText().then((text) => {
-          if (!text) return;
-          if (sessionId) {
-            void api.ptyWrite(sessionId, text).catch(() => {});
-          } else if (!PTY_CAPABLE) {
-            inputRef.current += text;
-            term.write(text);
-          }
-        });
+        void readClipboardText().then((text) => requestPasteRef.current(text));
         return false;
       }
       return true;
@@ -587,6 +671,9 @@ export default function TerminalPane({
       dataSub.dispose();
       titleSub.dispose();
       bellSub.dispose();
+      selectionSub.dispose();
+      window.clearTimeout(selectionTimer);
+      container.removeEventListener("paste", onNativePaste, true);
       searchAddonRef.current = null;
       unlisteners.forEach((unlisten) => unlisten());
       unlisteners = [];
@@ -689,6 +776,34 @@ export default function TerminalPane({
     } catch (err) {
       setErrorText(String(err));
     }
+  };
+
+  const copySelection = () => {
+    const selection = terminalRef.current?.getSelection();
+    if (selection) void writeClipboardText(selection);
+    setContextMenu(null);
+  };
+
+  const pasteFromClipboard = () => {
+    setContextMenu(null);
+    void readClipboardText().then((text) => {
+      if (text) requestPaste(text);
+    });
+  };
+
+  const selectAllTerminal = () => {
+    terminalRef.current?.selectAll();
+    setContextMenu(null);
+  };
+
+  const clearTerminal = () => {
+    terminalRef.current?.clear();
+    setContextMenu(null);
+  };
+
+  const openSearchFromMenu = () => {
+    setContextMenu(null);
+    setSearchOpen(true);
   };
 
   return (
@@ -815,7 +930,61 @@ export default function TerminalPane({
         </div>
       )}
 
-      <div className="xterm-host" ref={containerRef} />
+      <div
+        className="xterm-host"
+        ref={containerRef}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          setContextMenu({
+            x: Math.min(event.clientX, window.innerWidth - 200),
+            y: Math.min(event.clientY, window.innerHeight - 230),
+          });
+        }}
+      />
+
+      {contextMenu && (
+        <div
+          className="terminal-context-menu"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            disabled={!hasSelection}
+            onClick={copySelection}
+          >
+            复制
+          </button>
+          <button type="button" onClick={pasteFromClipboard}>
+            粘贴
+          </button>
+          <button type="button" onClick={selectAllTerminal}>
+            全选
+          </button>
+          <button type="button" onClick={openSearchFromMenu}>
+            搜索
+          </button>
+          <button type="button" onClick={clearTerminal}>
+            清屏
+          </button>
+        </div>
+      )}
+
+      {pendingPaste !== null && (
+        <PasteConfirmDialog
+          text={pendingPaste}
+          onCancel={() => {
+            setPendingPaste(null);
+            terminalRef.current?.focus();
+          }}
+          onConfirm={() => {
+            const text = pendingPaste;
+            setPendingPaste(null);
+            pasteText(text);
+            terminalRef.current?.focus();
+          }}
+        />
+      )}
 
       {pendingHostKey && (
         <HostKeyDialog

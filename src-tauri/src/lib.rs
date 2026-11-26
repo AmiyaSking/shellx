@@ -21,6 +21,7 @@ use state::AppState;
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             let state = AppState::load(data_dir)?;

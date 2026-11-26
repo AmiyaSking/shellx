@@ -3,6 +3,7 @@ import { api, isTauri } from "./lib/api";
 import type { Connection, ConnectionInput, McpServerInfo } from "./lib/types";
 import AuditDrawer from "./components/AuditDrawer";
 import ConnectionModal from "./components/ConnectionModal";
+import SettingsDrawer from "./components/SettingsDrawer";
 import Sidebar from "./components/Sidebar";
 import TabBar, { type TerminalTab } from "./components/TabBar";
 import TerminalPane from "./components/TerminalPane";
@@ -15,6 +16,7 @@ export default function App() {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [auditOpen, setAuditOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [mcpInfo, setMcpInfo] = useState<McpServerInfo | null>(null);
   const [modal, setModal] = useState<
     { mode: "create" } | { mode: "edit"; connection: Connection } | null
@@ -109,6 +111,30 @@ export default function App() {
     [activeTabId],
   );
 
+  const renameTab = useCallback((tabId: string, title: string) => {
+    const cleaned = title.trim().slice(0, 80);
+    setTabs((current) =>
+      current.map((tab) =>
+        tab.id === tabId
+          ? { ...tab, customTitle: cleaned || undefined }
+          : tab,
+      ),
+    );
+  }, []);
+
+  const moveTab = useCallback((fromTabId: string, toTabId: string) => {
+    if (fromTabId === toTabId) return;
+    setTabs((current) => {
+      const from = current.findIndex((tab) => tab.id === fromTabId);
+      const to = current.findIndex((tab) => tab.id === toTabId);
+      if (from < 0 || to < 0) return current;
+      const next = [...current];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+  }, []);
+
   const handleSaved = useCallback(
     async (input: ConnectionInput) => {
       try {
@@ -166,7 +192,7 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const mod = event.ctrlKey || event.metaKey;
-      if (!mod || modal || auditOpen) return;
+      if (!mod || modal || auditOpen || settingsOpen) return;
       const target = event.target as HTMLElement | null;
       const typing =
         target !== null &&
@@ -217,6 +243,7 @@ export default function App() {
     duplicateActiveTab,
     modal,
     selectTab,
+    settingsOpen,
     tabs,
   ]);
 
@@ -234,7 +261,22 @@ export default function App() {
           {!isTauri() && <span className="chip chip-mock">浏览器 Mock 模式</span>}
           <span className="chip">{connections.length} 个连接</span>
           <span className="chip">{tabs.length} 个会话页</span>
-          <button className="btn btn-ghost" onClick={() => setAuditOpen(true)}>
+          <button
+            className="btn btn-ghost"
+            onClick={() => {
+              setSettingsOpen(true);
+              setAuditOpen(false);
+            }}
+          >
+            设置
+          </button>
+          <button
+            className="btn btn-ghost"
+            onClick={() => {
+              setAuditOpen(true);
+              setSettingsOpen(false);
+            }}
+          >
             审计日志
           </button>
         </div>
@@ -268,6 +310,8 @@ export default function App() {
             onSelect={selectTab}
             onClose={closeTab}
             onNew={duplicateActiveTab}
+            onRename={renameTab}
+            onMove={moveTab}
           />
 
           <div className="terminal-area">
@@ -303,6 +347,7 @@ export default function App() {
       </div>
 
       {auditOpen && <AuditDrawer onClose={() => setAuditOpen(false)} />}
+      {settingsOpen && <SettingsDrawer onClose={() => setSettingsOpen(false)} />}
 
       {modal && (
         <ConnectionModal
