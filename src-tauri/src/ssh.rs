@@ -20,7 +20,10 @@ use russh::client::{self, Msg};
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::agent::AgentIdentity;
 use russh::keys::{self as rkeys, ssh_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Disconnect, Sig};
+use russh::{
+    Channel, ChannelMsg, ChannelOpenFailure, ChannelReadHalf, ChannelWriteHalf,
+    Disconnect, Sig,
+};
 
 use crate::models::HostKeyTrust;
 
@@ -64,6 +67,16 @@ pub struct JumpHost {
     pub credential: Credential,
 }
 
+/// A remote (-R) forward: the server listens and sends channels to a local
+/// target through this connection.
+#[derive(Clone, Debug)]
+pub struct RemoteForward {
+    pub remote_address: String,
+    pub remote_port: u32,
+    pub local_host: String,
+    pub local_port: u16,
+}
+
 #[derive(Clone, Debug)]
 pub struct ConnectParams {
     pub host: String,
@@ -71,6 +84,8 @@ pub struct ConnectParams {
     pub username: String,
     pub credential: Credential,
     pub jump: Option<JumpHost>,
+    /// Remote forwarding targets for server-initiated channels.
+    pub remote_forwards: Vec<RemoteForward>,
     /// Fingerprints the user already confirmed in the host-key dialog. A first
     /// connection without a matching entry fails with `HostKeyUnknown`.
     pub trusted_host_keys: Vec<HostKeyTrust>,
@@ -91,6 +106,7 @@ impl ConnectParams {
             username: username.into(),
             credential: Credential::Agent,
             jump: None,
+            remote_forwards: Vec::new(),
             trusted_host_keys: Vec::new(),
             known_hosts_path: PathBuf::from("known_hosts"),
             term: DEFAULT_TERM.to_string(),
@@ -196,6 +212,7 @@ struct HostKeyState {
     known_hosts_path: PathBuf,
     /// Fingerprint the user confirmed for this attempt, if any.
     expected_fingerprint: Option<String>,
+    remote_forwards: Arc<Vec<RemoteForward>>,
     host_key: Option<HostKey>,
     /// Set when we refuse the server, so the real error survives `connect()`.
     rejection: Option<SshError>,
@@ -213,6 +230,7 @@ impl HostKeyHandler {
         port: u16,
         known_hosts_path: PathBuf,
         expected_fingerprint: Option<String>,
+        remote_forwards: Vec<RemoteForward>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(HostKeyState {
@@ -220,6 +238,7 @@ impl HostKeyHandler {
                 port,
                 known_hosts_path,
                 expected_fingerprint,
+                remote_forwards: Arc::new(remote_forwards),
                 host_key: None,
                 rejection: None,
             })),
@@ -309,6 +328,68 @@ impl client::Handler for HostKeyHandler {
         });
         Ok(true)
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), russh::Error> {
+        let target = match self.state.lock() {
+            Ok(state) => state
+                .remote_forwards
+                .iter()
+                .find(|forward| {
+                    forward.remote_port == connected_port
+                        && (forward.remote_address == connected_address
+                            || forward.remote_address == "0.0.0.0"
+                            || forward.remote_address == "::"
+                            || connected_address == "0.0.0.0"
+                            || connected_address == "::")
+                })
+                .or_else(|| {
+                    state
+                        .remote_forwards
+                        .iter()
+                        .find(|forward| forward.remote_port == connected_port)
+                })
+                .cloned(),
+            Err(_) => None,
+        };
+
+        let Some(target) = target else {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+
+        reply.accept().await;
+        let mut stream = channel.into_stream();
+        tokio::spawn(async move {
+            match tokio::net::TcpStream::connect((
+                target.local_host.as_str(),
+                target.local_port,
+            ))
+            .await
+            {
+                Ok(mut socket) => {
+                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut stream).await;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[shellx] 远程转发无法连接本地目标 {}:{}：{error}",
+                        target.local_host, target.local_port
+                    );
+                }
+            }
+        });
+        Ok(())
+    }
 }
 
 /// Write side of an open PTY: cheap to share, used by the Tauri commands.
@@ -326,116 +407,143 @@ pub struct PtyReader {
     read: ChannelReadHalf,
 }
 
-impl PtyConn {
-    /// Connect, authenticate and open an interactive shell with a PTY.
-    pub async fn open(params: ConnectParams) -> Result<(PtyConn, PtyReader), SshError> {
-        let config = Arc::new(client::Config {
-            keepalive_interval: Some(Duration::from_secs(30)),
-            keepalive_max: 3,
-            nodelay: true,
-            ..Default::default()
-        });
+/// An authenticated SSH connection without a terminal channel. Port
+/// forwarding keeps this handle alive for the lifetime of its listeners.
+pub struct AuthenticatedSession {
+    pub handle: client::Handle<HostKeyHandler>,
+    pub host_key: HostKey,
+    pub jump_handle: Option<client::Handle<HostKeyHandler>>,
+}
 
-        let target_handler = HostKeyHandler::new(
-            params.host.clone(),
-            params.port,
+/// Connect, verify the host key and authenticate, without opening a shell.
+pub async fn connect_authenticated(
+    params: &ConnectParams,
+) -> Result<AuthenticatedSession, SshError> {
+    let config = Arc::new(client::Config {
+        keepalive_interval: Some(Duration::from_secs(30)),
+        keepalive_max: 3,
+        nodelay: true,
+        ..Default::default()
+    });
+
+    let target_handler = HostKeyHandler::new(
+        params.host.clone(),
+        params.port,
+        params.known_hosts_path.clone(),
+        trusted_fingerprint(&params.trusted_host_keys, &params.host, params.port),
+        params.remote_forwards.clone(),
+    );
+
+    let mut jump_session: Option<client::Handle<HostKeyHandler>> = None;
+
+    let connect_result = if let Some(jump) = &params.jump {
+        let jump_handler = HostKeyHandler::new(
+            jump.host.clone(),
+            jump.port,
             params.known_hosts_path.clone(),
-            trusted_fingerprint(&params.trusted_host_keys, &params.host, params.port),
+            trusted_fingerprint(&params.trusted_host_keys, &jump.host, jump.port),
+            Vec::new(),
         );
-
-        let mut jump_session: Option<client::Handle<HostKeyHandler>> = None;
-
-        let connect_result = if let Some(jump) = &params.jump {
-            let jump_handler = HostKeyHandler::new(
-                jump.host.clone(),
-                jump.port,
-                params.known_hosts_path.clone(),
-                trusted_fingerprint(&params.trusted_host_keys, &jump.host, jump.port),
-            );
-            let mut jump_handle = match client::connect(
-                config.clone(),
-                (jump.host.as_str(), jump.port),
-                jump_handler.clone(),
-            )
-            .await
-            {
-                Ok(handle) => handle,
-                Err(error) => {
-                    let (_, rejection) = jump_handler.snapshot();
-                    return Err(rejection.unwrap_or_else(|| {
-                        SshError::Connect(format!(
-                            "无法连接跳板机 {}:{}：{error}",
-                            jump.host, jump.port
-                        ))
-                    }));
-                }
-            };
-
-            let (_, rejection) = jump_handler.snapshot();
-            if let Some(error) = rejection {
-                return Err(error);
-            }
-
-            authenticate(
-                &mut jump_handle,
-                &jump.username,
-                &jump.host,
-                &jump.credential,
-            )
-            .await
-            .map_err(|error| match error {
-                SshError::Auth { detail, .. } => SshError::Auth {
-                    username: jump.username.clone(),
-                    host: jump.host.clone(),
-                    detail: format!("跳板机认证失败：{detail}"),
-                },
-                other => other,
-            })?;
-
-            let channel = jump_handle
-                .channel_open_direct_tcpip(params.host.clone(), params.port as u32, "127.0.0.1", 0)
-                .await
-                .map_err(|error| {
-                    SshError::Channel(format!(
-                        "无法通过跳板机打开到 {}:{} 的通道：{error}",
-                        params.host, params.port
-                    ))
-                })?;
-            let stream = channel.into_stream();
-            jump_session = Some(jump_handle);
-            client::connect_stream(config.clone(), stream, target_handler.clone()).await
-        } else {
-            client::connect(
-                config.clone(),
-                (params.host.as_str(), params.port),
-                target_handler.clone(),
-            )
-            .await
-        };
-
-        let mut session = match connect_result {
-            Ok(session) => session,
+        let mut jump_handle = match client::connect(
+            config.clone(),
+            (jump.host.as_str(), jump.port),
+            jump_handler.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
             Err(error) => {
-                // Prefer the reason we recorded over russh's generic version.
-                let (_, rejection) = target_handler.snapshot();
-                return Err(rejection.unwrap_or_else(|| SshError::Connect(error.to_string())));
+                let (_, rejection) = jump_handler.snapshot();
+                return Err(rejection.unwrap_or_else(|| {
+                    SshError::Connect(format!(
+                        "无法连接跳板机 {}:{}：{error}",
+                        jump.host, jump.port
+                    ))
+                }));
             }
         };
 
-        let (host_key, rejection) = target_handler.snapshot();
+        let (_, rejection) = jump_handler.snapshot();
         if let Some(error) = rejection {
             return Err(error);
         }
-        let host_key =
-            host_key.ok_or_else(|| SshError::Connect("握手完成但没有收到主机公钥".to_string()))?;
 
         authenticate(
-            &mut session,
-            &params.username,
-            &params.host,
-            &params.credential,
+            &mut jump_handle,
+            &jump.username,
+            &jump.host,
+            &jump.credential,
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            SshError::Auth { detail, .. } => SshError::Auth {
+                username: jump.username.clone(),
+                host: jump.host.clone(),
+                detail: format!("跳板机认证失败：{detail}"),
+            },
+            other => other,
+        })?;
+
+        let channel = jump_handle
+            .channel_open_direct_tcpip(params.host.clone(), params.port as u32, "127.0.0.1", 0)
+            .await
+            .map_err(|error| {
+                SshError::Channel(format!(
+                    "无法通过跳板机打开到 {}:{} 的通道：{error}",
+                    params.host, params.port
+                ))
+            })?;
+        let stream = channel.into_stream();
+        jump_session = Some(jump_handle);
+        client::connect_stream(config.clone(), stream, target_handler.clone()).await
+    } else {
+        client::connect(
+            config.clone(),
+            (params.host.as_str(), params.port),
+            target_handler.clone(),
+        )
+        .await
+    };
+
+    let mut session = match connect_result {
+        Ok(session) => session,
+        Err(error) => {
+            // Prefer the reason we recorded over russh's generic version.
+            let (_, rejection) = target_handler.snapshot();
+            return Err(rejection.unwrap_or_else(|| SshError::Connect(error.to_string())));
+        }
+    };
+
+    let (host_key, rejection) = target_handler.snapshot();
+    if let Some(error) = rejection {
+        return Err(error);
+    }
+    let host_key =
+        host_key.ok_or_else(|| SshError::Connect("握手完成但没有收到主机公钥".to_string()))?;
+
+    authenticate(
+        &mut session,
+        &params.username,
+        &params.host,
+        &params.credential,
+    )
+    .await?;
+
+    Ok(AuthenticatedSession {
+        handle: session,
+        host_key,
+        jump_handle: jump_session,
+    })
+}
+
+impl PtyConn {
+    /// Connect, authenticate and open an interactive shell with a PTY.
+    pub async fn open(params: ConnectParams) -> Result<(PtyConn, PtyReader), SshError> {
+        let AuthenticatedSession {
+            handle: session,
+            host_key,
+            jump_handle,
+        } = connect_authenticated(&params).await?;
 
         let channel = session
             .channel_open_session()
@@ -457,7 +565,7 @@ impl PtyConn {
                 host_key,
                 write,
                 session: Mutex::new(Some(session)),
-                _jump_session: jump_session,
+                _jump_session: jump_handle,
             },
             PtyReader { read },
         ))

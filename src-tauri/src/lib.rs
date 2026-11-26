@@ -2,6 +2,7 @@ mod audit;
 mod commands;
 mod connections;
 mod encoding;
+mod forwards;
 mod mcp;
 mod models;
 mod policy;
@@ -28,6 +29,7 @@ pub fn run() {
             let state = AppState::load(data_dir)?;
             app.manage(state);
             app.manage(pty::PtyManager::new());
+            app.manage(forwards::ForwardManager::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -52,6 +54,12 @@ pub fn run() {
             commands::set_session_logging,
             commands::forget_host_key,
             commands::preview_ssh_config,
+            commands::list_forward_rules,
+            commands::save_forward_rule,
+            commands::delete_forward_rule,
+            commands::start_forward,
+            commands::stop_forward,
+            commands::list_forward_statuses,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ShellX");
@@ -59,6 +67,7 @@ pub fn run() {
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
             app_handle.state::<pty::PtyManager>().shutdown();
+            app_handle.state::<forwards::ForwardManager>().shutdown();
         }
     });
 }

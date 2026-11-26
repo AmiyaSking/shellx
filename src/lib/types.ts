@@ -179,6 +179,37 @@ export interface SshConfigPreview {
   defaultUser: string;
 }
 
+export type ForwardKind = "local" | "remote" | "dynamic";
+
+export interface ForwardRule {
+  id: string;
+  connectionId: string;
+  kind: ForwardKind;
+  bindHost: string;
+  bindPort: number;
+  targetHost: string;
+  targetPort: number;
+  remark: string;
+}
+
+export interface ForwardRuleInput {
+  id?: string | null;
+  connectionId: string;
+  kind: ForwardKind;
+  bindHost: string;
+  bindPort: number;
+  targetHost: string;
+  targetPort: number;
+  remark: string;
+}
+
+export interface ForwardStatus {
+  ruleId: string;
+  running: boolean;
+  boundPort?: number | null;
+  error?: string | null;
+}
+
 /** A fingerprint the user confirmed in the first-connect dialog. */
 export interface HostKeyTrust {
   host: string;

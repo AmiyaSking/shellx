@@ -5,6 +5,9 @@ use crate::models::{
     AuditEntry, AuditSource, CommandOutcome, CommandRequest, Connection, ConnectionInput,
     HostKeyTrust, McpServerInfo, PolicyDecision, SessionInfo,
 };
+use crate::forwards::{
+    ForwardKind, ForwardManager, ForwardRule, ForwardRuleInput, ForwardStatus,
+};
 use crate::pty::{PtyManager, PtyOpenError, PtyOpened, SessionMeta};
 use crate::ssh;
 use crate::ssh_config::{self, SshConfigPreview};
@@ -241,4 +244,104 @@ pub fn set_session_logging(pty: State<'_, PtyManager>, enabled: bool) {
 #[tauri::command]
 pub fn preview_ssh_config() -> Result<SshConfigPreview, String> {
     ssh_config::preview_default()
+}
+
+// ---------------------------------------------------------------------------
+// Local / dynamic port forwarding
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn list_forward_rules(
+    state: State<'_, AppState>,
+) -> Result<Vec<ForwardRule>, String> {
+    state.list_forward_rules()
+}
+
+#[tauri::command]
+pub fn save_forward_rule(
+    state: State<'_, AppState>,
+    input: ForwardRuleInput,
+) -> Result<ForwardRule, String> {
+    state.save_forward_rule(input)
+}
+
+#[tauri::command]
+pub fn delete_forward_rule(
+    state: State<'_, AppState>,
+    forwards: State<'_, ForwardManager>,
+    id: String,
+) -> Result<(), String> {
+    let rule = state.get_forward_rule(&id).ok();
+    forwards.stop(&id);
+    state.delete_forward_rule(&id)?;
+    if let Some(rule) = rule {
+        state.record_pty_event(
+            Some(&rule.connection_id),
+            format!("端口转发规则已删除：{}", rule.remark),
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn start_forward(
+    state: State<'_, AppState>,
+    forwards: State<'_, ForwardManager>,
+    id: String,
+) -> Result<ForwardStatus, String> {
+    let rule = state.get_forward_rule(&id)?;
+    let params = state.forward_params(&rule.connection_id)?;
+    let detail = format!(
+        "端口转发启动：{} {}:{} -> {}:{}",
+        match rule.kind {
+            ForwardKind::Local => "本地",
+            ForwardKind::Remote => "远程",
+            ForwardKind::Dynamic => "SOCKS5",
+        },
+        rule.bind_host,
+        rule.bind_port,
+        rule.target_host,
+        rule.target_port
+    );
+    match forwards.start(rule.clone(), params).await {
+        Ok(status) => {
+            state.record_pty_event(Some(&rule.connection_id), detail);
+            Ok(status)
+        }
+        Err(error) => {
+            state.record_pty_event(
+                Some(&rule.connection_id),
+                format!("端口转发启动失败：{error}"),
+            );
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn stop_forward(
+    state: State<'_, AppState>,
+    forwards: State<'_, ForwardManager>,
+    id: String,
+) -> Result<bool, String> {
+    let rule = state.get_forward_rule(&id).ok();
+    let stopped = forwards.stop(&id);
+    if stopped {
+        if let Some(rule) = rule {
+            state.record_pty_event(
+                Some(&rule.connection_id),
+                format!("端口转发已停止：{}", rule.remark),
+            );
+        }
+    }
+    Ok(stopped)
+}
+
+#[tauri::command]
+pub fn list_forward_statuses(
+    state: State<'_, AppState>,
+    forwards: State<'_, ForwardManager>,
+) -> Result<Vec<ForwardStatus>, String> {
+    let rules = state.list_forward_rules()?;
+    Ok(forwards.statuses(&rules))
 }

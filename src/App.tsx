@@ -17,6 +17,7 @@ import type { Connection, ConnectionInput, McpServerInfo } from "./lib/types";
 import { loadWorkspace, saveWorkspace } from "./lib/workspace";
 import AuditDrawer from "./components/AuditDrawer";
 import ConnectionModal from "./components/ConnectionModal";
+import ForwardDrawer from "./components/ForwardDrawer";
 import SettingsDrawer from "./components/SettingsDrawer";
 import Sidebar from "./components/Sidebar";
 import SshConfigImportDialog from "./components/SshConfigImportDialog";
@@ -84,6 +85,7 @@ export default function App() {
   const [auditOpen, setAuditOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
+  const [forwardOpen, setForwardOpen] = useState(false);
   const [mcpInfo, setMcpInfo] = useState<McpServerInfo | null>(null);
   const [modal, setModal] = useState<
     { mode: "create" } | { mode: "edit"; connection: Connection } | null
@@ -537,7 +539,7 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const mod = event.ctrlKey || event.metaKey;
-      if (!mod || modal || auditOpen || settingsOpen) return;
+      if (!mod || modal || auditOpen || settingsOpen || forwardOpen) return;
       const target = event.target as HTMLElement | null;
       const typing =
         target !== null &&
@@ -598,6 +600,7 @@ export default function App() {
     auditOpen,
     closeActivePane,
     duplicateActiveTab,
+    forwardOpen,
     modal,
     selectTab,
     settingsOpen,
@@ -622,8 +625,19 @@ export default function App() {
           <button
             className="btn btn-ghost"
             onClick={() => {
+              setForwardOpen(true);
+              setAuditOpen(false);
+              setSettingsOpen(false);
+            }}
+          >
+            转发
+          </button>
+          <button
+            className="btn btn-ghost"
+            onClick={() => {
               setSettingsOpen(true);
               setAuditOpen(false);
+              setForwardOpen(false);
             }}
           >
             设置
@@ -633,6 +647,7 @@ export default function App() {
             onClick={() => {
               setAuditOpen(true);
               setSettingsOpen(false);
+              setForwardOpen(false);
             }}
           >
             审计日志
@@ -750,6 +765,12 @@ export default function App() {
 
       {auditOpen && <AuditDrawer onClose={() => setAuditOpen(false)} />}
       {settingsOpen && <SettingsDrawer onClose={() => setSettingsOpen(false)} />}
+      {forwardOpen && (
+        <ForwardDrawer
+          connections={connections}
+          onClose={() => setForwardOpen(false)}
+        />
+      )}
 
       {importOpen && (
         <SshConfigImportDialog

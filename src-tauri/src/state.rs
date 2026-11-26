@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::audit::AuditLogger;
 use crate::connections::ConnectionStore;
+use crate::forwards::{ForwardRule, ForwardRuleInput, ForwardStore};
 use crate::mcp;
 use crate::models::{
     ApprovalDecision, ApprovalRequest, AuditEntry, AuditSource, AuthKind, CommandOutcome,
@@ -29,6 +30,7 @@ struct PendingApproval {
 pub struct AppState {
     data_dir: PathBuf,
     connections: Mutex<ConnectionStore>,
+    forwards: Mutex<ForwardStore>,
     sessions: Mutex<SessionManager>,
     approvals: Mutex<HashMap<String, PendingApproval>>,
     vault: SecretVault,
@@ -47,6 +49,7 @@ impl AppState {
         let state = Self {
             data_dir: data_dir.clone(),
             connections: Mutex::new(ConnectionStore::load(&data_dir)),
+            forwards: Mutex::new(ForwardStore::load(&data_dir)),
             sessions: Mutex::new(SessionManager::default()),
             approvals: Mutex::new(HashMap::new()),
             vault: SecretVault::new(),
@@ -287,6 +290,35 @@ impl AppState {
         )
     }
 
+    pub fn list_forward_rules(&self) -> Result<Vec<ForwardRule>, String> {
+        Ok(lock(&self.forwards)?.list())
+    }
+
+    pub fn get_forward_rule(&self, id: &str) -> Result<ForwardRule, String> {
+        lock(&self.forwards)?
+            .get(id)
+            .ok_or_else(|| "转发规则不存在".to_string())
+    }
+
+    pub fn save_forward_rule(
+        &self,
+        input: ForwardRuleInput,
+    ) -> Result<ForwardRule, String> {
+        self.get_connection(&input.connection_id)?;
+        lock(&self.forwards)?.upsert(input)
+    }
+
+    pub fn delete_forward_rule(&self, id: &str) -> Result<(), String> {
+        lock(&self.forwards)?.remove(id)
+    }
+
+    /// Connection parameters for a forwarding-only SSH session. The host key
+    /// must already be trusted (confirmed by a previous terminal connection).
+    pub fn forward_params(&self, connection_id: &str) -> Result<ConnectParams, String> {
+        let (_, params) = self.pty_params(connection_id, 80, 24, Vec::new())?;
+        Ok(params)
+    }
+
     pub fn list_audit(&self, limit: usize) -> Vec<AuditEntry> {
         self.audit.recent(limit)
     }
@@ -356,6 +388,7 @@ impl AppState {
                 username: connection.username.clone(),
                 credential,
                 jump,
+                remote_forwards: Vec::new(),
                 trusted_host_keys,
                 known_hosts_path: self.known_hosts_path(),
                 term: ssh::DEFAULT_TERM.to_string(),

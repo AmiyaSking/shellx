@@ -7,6 +7,9 @@ import type {
   CommandResult,
   Connection,
   ConnectionInput,
+  ForwardRule,
+  ForwardRuleInput,
+  ForwardStatus,
   HostKeyTrust,
   McpServerInfo,
   PolicyAction,
@@ -120,6 +123,36 @@ export const api = {
     isTauri()
       ? invoke<SshConfigPreview>("preview_ssh_config")
       : mock.previewSshConfig(),
+
+  listForwardRules: (): Promise<ForwardRule[]> =>
+    isTauri()
+      ? invoke<ForwardRule[]>("list_forward_rules")
+      : mock.listForwardRules(),
+
+  saveForwardRule: (input: ForwardRuleInput): Promise<ForwardRule> =>
+    isTauri()
+      ? invoke<ForwardRule>("save_forward_rule", { input })
+      : mock.saveForwardRule(input),
+
+  deleteForwardRule: (id: string): Promise<void> =>
+    isTauri()
+      ? invoke<void>("delete_forward_rule", { id })
+      : mock.deleteForwardRule(id),
+
+  startForward: (id: string): Promise<ForwardStatus> =>
+    isTauri()
+      ? invoke<ForwardStatus>("start_forward", { id })
+      : mock.startForward(id),
+
+  stopForward: (id: string): Promise<boolean> =>
+    isTauri()
+      ? invoke<boolean>("stop_forward", { id })
+      : mock.stopForward(id),
+
+  listForwardStatuses: (): Promise<ForwardStatus[]> =>
+    isTauri()
+      ? invoke<ForwardStatus[]>("list_forward_statuses")
+      : mock.listForwardStatuses(),
 };
 
 /* ------------------------------------------------------------------ */
@@ -191,6 +224,29 @@ const mockState = {
     { request: ApprovalRequest; command: string; source: CommandRequest["source"] }
   >(),
   audit: [] as AuditEntry[],
+  forwardRules: [
+    {
+      id: "fwd_demo_local",
+      connectionId: "conn_dev_box",
+      kind: "local",
+      bindHost: "127.0.0.1",
+      bindPort: 8080,
+      targetHost: "127.0.0.1",
+      targetPort: 80,
+      remark: "本地 Web 调试",
+    },
+    {
+      id: "fwd_demo_socks",
+      connectionId: "conn_staging_api",
+      kind: "dynamic",
+      bindHost: "127.0.0.1",
+      bindPort: 1080,
+      targetHost: "",
+      targetPort: 0,
+      remark: "SOCKS5 代理",
+    },
+  ] as ForwardRule[],
+  forwardStatuses: new Map<string, ForwardStatus>(),
 };
 
 const HIGH_RISK = [
@@ -473,6 +529,70 @@ const mock = {
 
   async listAuditEntries(limit: number) {
     return mockState.audit.slice(0, limit);
+  },
+
+  async listForwardRules(): Promise<ForwardRule[]> {
+    return [...mockState.forwardRules];
+  },
+
+  async saveForwardRule(input: ForwardRuleInput): Promise<ForwardRule> {
+    const existing = input.id
+      ? mockState.forwardRules.find((rule) => rule.id === input.id)
+      : undefined;
+    const rule: ForwardRule = {
+      id: existing?.id ?? nextId("fwd"),
+      connectionId: input.connectionId,
+      kind: input.kind,
+      bindHost: input.bindHost,
+      bindPort: input.bindPort,
+      targetHost: input.kind !== "dynamic" ? input.targetHost : "",
+      targetPort: input.kind !== "dynamic" ? input.targetPort : 0,
+      remark: input.remark,
+    };
+    mockState.forwardRules = existing
+      ? mockState.forwardRules.map((item) =>
+          item.id === rule.id ? rule : item,
+        )
+      : [...mockState.forwardRules, rule];
+    return rule;
+  },
+
+  async deleteForwardRule(id: string) {
+    mockState.forwardRules = mockState.forwardRules.filter(
+      (rule) => rule.id !== id,
+    );
+    mockState.forwardStatuses.delete(id);
+  },
+
+  async startForward(id: string): Promise<ForwardStatus> {
+    const rule = mockState.forwardRules.find((item) => item.id === id);
+    if (!rule) throw new Error("转发规则不存在");
+    const status: ForwardStatus = {
+      ruleId: id,
+      running: true,
+      boundPort: rule.bindPort === 0 ? 18080 : rule.bindPort,
+      error: null,
+    };
+    mockState.forwardStatuses.set(id, status);
+    return status;
+  },
+
+  async stopForward(id: string) {
+    const had = mockState.forwardStatuses.has(id);
+    mockState.forwardStatuses.delete(id);
+    return had;
+  },
+
+  async listForwardStatuses(): Promise<ForwardStatus[]> {
+    return mockState.forwardRules.map(
+      (rule) =>
+        mockState.forwardStatuses.get(rule.id) ?? {
+          ruleId: rule.id,
+          running: false,
+          boundPort: null,
+          error: null,
+        },
+    );
   },
 
   async previewSshConfig(): Promise<SshConfigPreview> {

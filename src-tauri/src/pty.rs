@@ -403,7 +403,8 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, String> {
 }
 
 /// The process-wide PTY runtime, leaked so it outlives every session.
-fn runtime() -> Result<&'static Runtime, String> {
+/// Port forwarding reuses it for its listeners and tunnel tasks.
+pub(crate) fn runtime() -> Result<&'static Runtime, String> {
     static CELL: Mutex<Option<&'static Runtime>> = Mutex::new(None);
     let mut guard = CELL.lock().map_err(|_| "PTY 运行时锁不可用".to_string())?;
     if let Some(existing) = *guard {
