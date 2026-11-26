@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
+use encoding_rs::{Decoder, Encoding, UTF_8};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::runtime::{Builder, Runtime};
@@ -138,6 +139,7 @@ struct PtyEntry {
     conn: Arc<PtyConn>,
     task: JoinHandle<()>,
     meta: SessionMeta,
+    encoding: &'static Encoding,
 }
 
 /// Holds every live PTY session and the in-flight connection attempts that can
@@ -221,6 +223,7 @@ impl PtyManager {
         params: ConnectParams,
         cancel: Arc<Notify>,
     ) -> Result<HostKey, SshError> {
+        let encoding = resolve_encoding(&params.encoding);
         let log_path: Option<PathBuf> = app.path().app_data_dir().ok().map(|dir| {
             dir.join("sessions")
                 .join(Utc::now().format("%Y-%m-%d").to_string())
@@ -262,6 +265,11 @@ impl PtyManager {
         let task = runtime.spawn(async move {
             let mut log: Option<BufWriter<File>> = None;
             let mut log_attempted = false;
+            let mut decoder: Option<Decoder> = if std::ptr::eq(encoding, UTF_8) {
+                None
+            } else {
+                Some(encoding.new_decoder())
+            };
 
             loop {
                 match reader.next_event().await {
@@ -294,16 +302,24 @@ impl PtyManager {
                             let _ = writer.write_all(&bytes);
                         }
 
-                        let payload = PtyOutputPayload {
-                            session_id: pump_id.clone(),
-                            data: base64_encode(&bytes),
+                        let output = if let Some(decoder) = decoder.as_mut() {
+                            decode_chunk(decoder, &bytes)
+                        } else {
+                            bytes
                         };
-                        // A failed emit means the window is gone: stop reading.
-                        if pump_app.emit(EVENT_OUTPUT, payload).is_err() {
-                            break;
+                        if !output.is_empty() {
+                            let payload = PtyOutputPayload {
+                                session_id: pump_id.clone(),
+                                data: base64_encode(&output),
+                            };
+                            // A failed emit means the window is gone: stop reading.
+                            if pump_app.emit(EVENT_OUTPUT, payload).is_err() {
+                                break;
+                            }
                         }
                     }
                     PtyEvent::Exit(exit_code) => {
+                        emit_decoder_tail(&pump_app, &pump_id, decoder.as_mut());
                         let _ = pump_app.emit(
                             EVENT_EXIT,
                             PtyExitPayload {
@@ -314,6 +330,7 @@ impl PtyManager {
                         close_session_log(&mut log);
                     }
                     PtyEvent::Closed => {
+                        emit_decoder_tail(&pump_app, &pump_id, decoder.as_mut());
                         let _ = pump_app.emit(
                             EVENT_CLOSED,
                             PtyClosedPayload {
@@ -330,14 +347,29 @@ impl PtyManager {
         });
 
         let mut entries = lock(&self.entries).map_err(SshError::Connect)?;
-        if let Some(previous) = entries.insert(session_id, PtyEntry { conn, task, meta }) {
+        if let Some(previous) = entries.insert(
+            session_id,
+            PtyEntry {
+                conn,
+                task,
+                meta,
+                encoding,
+            },
+        ) {
             previous.task.abort();
         }
         Ok(host_key)
     }
 
     pub async fn write(&self, session_id: &str, data: Vec<u8>) -> Result<(), String> {
-        let conn = self.conn(session_id)?;
+        let (conn, encoding) = {
+            let guard = lock(&self.entries)?;
+            let entry = guard
+                .get(session_id)
+                .ok_or_else(|| format!("会话 {session_id} 不存在或已断开"))?;
+            (entry.conn.clone(), entry.encoding)
+        };
+        let data = encode_input(encoding, data);
         run(async move { conn.write(&data).await }).await
     }
 
@@ -448,6 +480,56 @@ where
     run_ssh(future).await.map_err(|error| error.to_string())
 }
 
+fn resolve_encoding(label: &str) -> &'static Encoding {
+    Encoding::for_label(label.trim().as_bytes()).unwrap_or(UTF_8)
+}
+
+fn encode_input(encoding: &'static Encoding, data: Vec<u8>) -> Vec<u8> {
+    if std::ptr::eq(encoding, UTF_8) {
+        return data;
+    }
+    let text = String::from_utf8_lossy(&data);
+    let (encoded, _, _) = encoding.encode(&text);
+    encoded.into_owned()
+}
+
+fn decode_chunk(decoder: &mut Decoder, bytes: &[u8]) -> Vec<u8> {
+    // encoding_rs writes into the String's spare capacity; an empty String has
+    // none. Reserve for the worst case of three UTF-8 bytes per input byte
+    // (unmappable/invalid input becomes U+FFFD).
+    let mut text = String::with_capacity(bytes.len() * 4 + 16);
+    let (_result, _read, _replaced) =
+        decoder.decode_to_string(bytes, &mut text, false);
+    text.into_bytes()
+}
+
+fn flush_decoder(decoder: &mut Decoder) -> Vec<u8> {
+    let mut text = String::with_capacity(16);
+    let (_result, _read, _replaced) = decoder.decode_to_string(&[], &mut text, true);
+    text.into_bytes()
+}
+
+fn emit_decoder_tail(
+    app: &AppHandle,
+    session_id: &str,
+    decoder: Option<&mut Decoder>,
+) {
+    let Some(decoder) = decoder else {
+        return;
+    };
+    let tail = flush_decoder(decoder);
+    if tail.is_empty() {
+        return;
+    }
+    let _ = app.emit(
+        EVENT_OUTPUT,
+        PtyOutputPayload {
+            session_id: session_id.to_string(),
+            data: base64_encode(&tail),
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,6 +571,27 @@ mod tests {
         manager.register_cancel("pending-1").unwrap();
         assert_eq!(manager.shutdown(), 0);
         assert!(!manager.cancel("pending-1"));
+    }
+
+    #[test]
+    fn gbk_input_and_output_roundtrip_across_chunks() {
+        let encoding = resolve_encoding("gbk");
+        let utf8 = "中文".as_bytes().to_vec();
+        let encoded = encode_input(encoding, utf8.clone());
+        assert_ne!(encoded, utf8, "GBK bytes differ from UTF-8 bytes");
+
+        let mut decoder = encoding.new_decoder();
+        let mut output = decode_chunk(&mut decoder, &encoded[..1]);
+        output.extend(decode_chunk(&mut decoder, &encoded[1..]));
+        output.extend(flush_decoder(&mut decoder));
+        assert_eq!(String::from_utf8(output).unwrap(), "中文");
+    }
+
+    #[test]
+    fn unknown_encoding_falls_back_to_utf8() {
+        assert!(std::ptr::eq(resolve_encoding("not-a-real-encoding"), UTF_8));
+        let input = "hello".as_bytes().to_vec();
+        assert_eq!(encode_input(resolve_encoding("not-a-real-encoding"), input.clone()), input);
     }
 
     #[test]

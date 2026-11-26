@@ -74,6 +74,14 @@ pub struct AuthMethod {
     pub private_key_path: Option<String>,
 }
 
+fn default_term() -> String {
+    "xterm-256color".to_string()
+}
+
+fn default_encoding() -> String {
+    "utf-8".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Connection {
@@ -94,6 +102,12 @@ pub struct Connection {
     pub jump_host: Option<String>,
     #[serde(default)]
     pub remark: String,
+    #[serde(default = "default_term")]
+    pub term: String,
+    #[serde(default = "default_encoding")]
+    pub encoding: String,
+    #[serde(default)]
+    pub startup_command: String,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -120,6 +134,12 @@ pub struct ConnectionInput {
     pub jump_host: Option<String>,
     #[serde(default)]
     pub remark: String,
+    #[serde(default = "default_term")]
+    pub term: String,
+    #[serde(default = "default_encoding")]
+    pub encoding: String,
+    #[serde(default)]
+    pub startup_command: String,
     /// Plaintext secrets from the form. They are written to the OS credential
     /// store and never persisted in connections.json. An empty value leaves the
     /// previously saved secret untouched.

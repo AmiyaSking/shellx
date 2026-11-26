@@ -25,6 +25,9 @@ export interface Connection {
   mcpAccess: McpAccessMode;
   jumpHost?: string | null;
   remark: string;
+  term: string;
+  encoding: string;
+  startupCommand: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -42,6 +45,9 @@ export interface ConnectionInput {
   mcpAccess: McpAccessMode;
   jumpHost?: string | null;
   remark: string;
+  term: string;
+  encoding: string;
+  startupCommand: string;
   password?: string | null;
   passphrase?: string | null;
 }

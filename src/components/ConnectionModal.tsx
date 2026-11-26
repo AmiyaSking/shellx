@@ -33,6 +33,9 @@ interface FormState {
   mcpAccess: McpAccessMode;
   jumpHost: string;
   remark: string;
+  term: string;
+  encoding: string;
+  startupCommand: string;
 }
 
 function initialForm(connection: Connection | null): FormState {
@@ -51,6 +54,9 @@ function initialForm(connection: Connection | null): FormState {
     mcpAccess: connection?.mcpAccess ?? "disabled",
     jumpHost: connection?.jumpHost ?? "",
     remark: connection?.remark ?? "",
+    term: connection?.term ?? "xterm-256color",
+    encoding: connection?.encoding ?? "utf-8",
+    startupCommand: connection?.startupCommand ?? "",
   };
 }
 
@@ -113,6 +119,9 @@ export default function ConnectionModal({
         mcpAccess: form.mcpAccess,
         jumpHost: form.jumpHost || null,
         remark: form.remark.trim(),
+        term: form.term.trim() || "xterm-256color",
+        encoding: form.encoding,
+        startupCommand: form.startupCommand.trim(),
         password: form.password || null,
         passphrase: form.passphrase || null,
       });
@@ -274,6 +283,42 @@ export default function ConnectionModal({
                   </option>
                 ))}
               </select>
+            </label>
+            <label>
+              <span>终端类型（TERM）</span>
+              <input
+                value={form.term}
+                onChange={(event) => set("term", event.target.value)}
+                list="term-options"
+                placeholder="xterm-256color"
+              />
+              <datalist id="term-options">
+                <option value="xterm-256color" />
+                <option value="xterm" />
+                <option value="screen-256color" />
+                <option value="vt100" />
+                <option value="ansi" />
+              </datalist>
+            </label>
+            <label>
+              <span>字符编码</span>
+              <select
+                value={form.encoding}
+                onChange={(event) => set("encoding", event.target.value)}
+              >
+                <option value="utf-8">UTF-8</option>
+                <option value="gbk">GBK / GB2312</option>
+                <option value="gb18030">GB18030</option>
+                <option value="big5">Big5</option>
+              </select>
+            </label>
+            <label className="span-2">
+              <span>登录后启动命令</span>
+              <input
+                value={form.startupCommand}
+                onChange={(event) => set("startupCommand", event.target.value)}
+                placeholder="例如 cd /srv/app（连接后自动执行，留空则不执行）"
+              />
             </label>
             <label className="span-2">
               <span>标签（逗号分隔）</span>

@@ -88,6 +88,17 @@ impl ConnectionStore {
             mcp_access: input.mcp_access,
             jump_host: input.jump_host,
             remark: input.remark,
+            term: if input.term.trim().is_empty() {
+                "xterm-256color".to_string()
+            } else {
+                input.term.trim().to_string()
+            },
+            encoding: if input.encoding.trim().is_empty() {
+                "utf-8".to_string()
+            } else {
+                input.encoding.trim().to_lowercase()
+            },
+            startup_command: input.startup_command.trim().to_string(),
             created_at,
             updated_at: now,
         };

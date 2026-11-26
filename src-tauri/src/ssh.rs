@@ -93,6 +93,10 @@ pub struct ConnectParams {
     /// separate file so ShellX never silently rewrites the user's OpenSSH state).
     pub known_hosts_path: PathBuf,
     pub term: String,
+    /// Remote character encoding label understood by `encoding_rs`.
+    pub encoding: String,
+    /// Optional command typed into the shell right after login.
+    pub startup_command: String,
     pub cols: u32,
     pub rows: u32,
 }
@@ -110,6 +114,8 @@ impl ConnectParams {
             trusted_host_keys: Vec::new(),
             known_hosts_path: PathBuf::from("known_hosts"),
             term: DEFAULT_TERM.to_string(),
+            encoding: "utf-8".to_string(),
+            startup_command: String::new(),
             cols: 80,
             rows: 24,
         }
@@ -559,6 +565,20 @@ impl PtyConn {
             .request_shell(true)
             .await
             .map_err(|error| SshError::Channel(error.to_string()))?;
+
+        if !params.startup_command.trim().is_empty() {
+            let encoding = encoding_rs::Encoding::for_label(
+                params.encoding.trim().as_bytes(),
+            )
+            .unwrap_or(encoding_rs::UTF_8);
+            let (encoded, _, _) = encoding.encode(params.startup_command.trim());
+            let mut data = encoded.into_owned();
+            data.push(b'\r');
+            write
+                .data_bytes(data)
+                .await
+                .map_err(|error| SshError::Channel(error.to_string()))?;
+        }
 
         Ok((
             PtyConn {

@@ -391,7 +391,13 @@ impl AppState {
                 remote_forwards: Vec::new(),
                 trusted_host_keys,
                 known_hosts_path: self.known_hosts_path(),
-                term: ssh::DEFAULT_TERM.to_string(),
+                term: if connection.term.trim().is_empty() {
+                    ssh::DEFAULT_TERM.to_string()
+                } else {
+                    connection.term.trim().to_string()
+                },
+                encoding: connection.encoding.clone(),
+                startup_command: connection.startup_command.clone(),
                 cols: cols.max(1),
                 rows: rows.max(1),
             },

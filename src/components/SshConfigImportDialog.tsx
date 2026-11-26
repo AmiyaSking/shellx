@@ -42,6 +42,9 @@ function buildInput(
     mcpAccess: "disabled",
     jumpHost: null,
     remark: "从 OpenSSH config 导入",
+    term: "xterm-256color",
+    encoding: "utf-8",
+    startupCommand: "",
     password: null,
     passphrase: null,
   };

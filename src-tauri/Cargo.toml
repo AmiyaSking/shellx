@@ -32,6 +32,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync"
 # Linux uses the kernel keyring here; a Secret Service backend can be enabled
 # later without changing the vault API.
 keyring = { version = "3.6", default-features = false, features = ["windows-native", "apple-native", "linux-native"] }
+encoding_rs = "0.8"
 
 [profile.release]
 codegen-units = 1
