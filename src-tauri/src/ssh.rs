@@ -613,17 +613,100 @@ pub struct ExecOutput {
     pub exit_status: Option<u32>,
 }
 
-/// Run one command through an SSH `exec` request and wait for it to finish.
-///
-/// The connection is opened per command, so an agent call cannot leave a
-/// half-used shell behind. Output is collected until EOF or `timeout`.
-pub async fn exec_command(
+/// Handle used to signal a command that is still running. Cloned freely; all
+/// clones feed the same executor.
+#[derive(Clone)]
+pub struct ExecControl {
+    signals: tokio::sync::mpsc::Sender<Sig>,
+}
+
+impl ExecControl {
+    /// Send a POSIX signal name (`INT`, `TERM`, `KILL`, `9`, …) to the remote
+    /// command.
+    pub async fn signal(&self, name: &str) -> Result<(), String> {
+        let signal = parse_signal(name).map_err(|error| error.to_string())?;
+        self.signals
+            .send(signal)
+            .await
+            .map_err(|_| "命令已经结束".to_string())
+    }
+}
+
+/// A started `exec` request whose output has not been collected yet.
+pub struct RunningExec {
+    channel: Channel<Msg>,
+    signals: tokio::sync::mpsc::Receiver<Sig>,
+    encoding: String,
+    /// Keeps the SSH connection (and its jump-host transport) alive.
+    _session: AuthenticatedSession,
+}
+
+impl RunningExec {
+    /// Wait for the command to finish, forwarding signals from [`ExecControl`]
+    /// while it runs.
+    pub async fn collect_exec(mut self, timeout: Duration) -> Result<ExecOutput, SshError> {
+        enum Event {
+            Message(Option<ChannelMsg>),
+            Signal(Option<Sig>),
+            Deadline,
+        }
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut bytes = Vec::new();
+        let mut exit_status = None;
+        // Once every control handle is gone the receiver stays ready forever;
+        // disable that branch so the loop does not spin.
+        let mut signals_open = true;
+        loop {
+            let event = tokio::select! {
+                message = self.channel.wait() => Event::Message(message),
+                signal = self.signals.recv(), if signals_open => Event::Signal(signal),
+                _ = tokio::time::sleep_until(deadline) => Event::Deadline,
+            };
+            match event {
+                Event::Message(Some(ChannelMsg::Data { data })) => {
+                    bytes.extend_from_slice(&data)
+                }
+                Event::Message(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                    bytes.extend_from_slice(&data)
+                }
+                Event::Message(Some(ChannelMsg::ExitStatus { exit_status: status })) => {
+                    exit_status = Some(status)
+                }
+                Event::Message(Some(_)) => {}
+                Event::Message(None) => break,
+                Event::Signal(Some(signal)) => {
+                    let _ = self.channel.signal(signal).await;
+                }
+                Event::Signal(None) => {
+                    signals_open = false;
+                }
+                Event::Deadline => {
+                    let _ = self.channel.close().await;
+                    return Err(SshError::Timeout(format!(
+                        "命令在 {} 秒内未结束",
+                        timeout.as_secs()
+                    )));
+                }
+            }
+        }
+
+        Ok(ExecOutput {
+            output: decode_output(&bytes, &self.encoding),
+            exit_status,
+        })
+    }
+}
+
+/// Open a dedicated connection and start `command`, returning a control handle
+/// plus the running command. The connection is opened per command, so an agent
+/// call cannot leave a half-used shell behind.
+pub async fn start_exec(
     params: &ConnectParams,
     command: &str,
-    timeout: Duration,
-) -> Result<ExecOutput, SshError> {
+) -> Result<(RunningExec, ExecControl), SshError> {
     let session = connect_authenticated(params).await?;
-    let mut channel = session
+    let channel = session
         .handle
         .channel_open_session()
         .await
@@ -633,34 +716,27 @@ pub async fn exec_command(
         .await
         .map_err(|error| SshError::Channel(format!("无法执行命令：{error}")))?;
 
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut bytes = Vec::new();
-    let mut exit_status = None;
-    loop {
-        match tokio::time::timeout_at(deadline, channel.wait()).await {
-            Err(_) => {
-                let _ = channel.close().await;
-                return Err(SshError::Timeout(format!(
-                    "命令在 {} 秒内未结束：{command}",
-                    timeout.as_secs()
-                )));
-            }
-            Ok(Some(ChannelMsg::Data { data })) => bytes.extend_from_slice(&data),
-            Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
-                bytes.extend_from_slice(&data)
-            }
-            Ok(Some(ChannelMsg::ExitStatus { exit_status: status })) => {
-                exit_status = Some(status)
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-        }
-    }
+    let (signals, receiver) = tokio::sync::mpsc::channel(4);
+    Ok((
+        RunningExec {
+            channel,
+            signals: receiver,
+            encoding: params.encoding.clone(),
+            _session: session,
+        },
+        ExecControl { signals },
+    ))
+}
 
-    Ok(ExecOutput {
-        output: decode_output(&bytes, &params.encoding),
-        exit_status,
-    })
+/// Run one command and wait for it to finish (no signalling).
+#[cfg(test)]
+pub async fn exec_command(
+    params: &ConnectParams,
+    command: &str,
+    timeout: Duration,
+) -> Result<ExecOutput, SshError> {
+    let (running, _control) = start_exec(params, command).await?;
+    running.collect_exec(timeout).await
 }
 
 /// Decode raw command output using the label configured on the connection.
@@ -1509,6 +1585,35 @@ mod tests {
             matches!(timeout, SshError::Timeout(_)),
             "unexpected error: {timeout:?}"
         );
+
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn real_ssh_exec_can_be_signaled_while_running() {
+        let server =
+            start_test_server(TestAuthMode::Password("secret".into())).await;
+        let (dir, known_hosts) = temp_known_hosts();
+        let params = trusted_params(
+            &server,
+            &known_hosts,
+            Credential::Password("secret".into()),
+        )
+        .await;
+
+        let (running, control) = start_exec(&params, "sleep")
+            .await
+            .expect("start sleeping command");
+        control
+            .signal("INT")
+            .await
+            .expect("send SIGINT to the running command");
+        let output = running
+            .collect_exec(Duration::from_secs(5))
+            .await
+            .expect("signalled command should finish");
+        assert_eq!(output.exit_status, Some(130));
 
         drop(server);
         std::fs::remove_dir_all(&dir).ok();

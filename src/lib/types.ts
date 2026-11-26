@@ -137,6 +137,9 @@ export interface SessionInfo {
   status: "active" | "closed";
   outputLines: number;
   outputBytes: number;
+  /** A command started via MCP is still running. */
+  running?: boolean;
+  exitCode?: number | null;
 }
 
 export interface McpToolInfo {

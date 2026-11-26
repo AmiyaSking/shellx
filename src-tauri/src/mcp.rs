@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use crate::models::{
     AuditSource, CommandOutcome, CommandRequest, McpToolInfo, RiskLevel,
 };
-use crate::state::AppState;
+use crate::state::{AppState, CommandStart};
 
 pub struct ToolDef {
     pub name: &'static str,
@@ -21,7 +21,7 @@ pub const TOOL_CATALOG: &[ToolDef] = &[
     },
     ToolDef {
         name: "exec_command",
-        description: "在已授权服务器上执行命令，受策略引擎与审批流约束",
+        description: "在已授权服务器上执行命令，受策略引擎与审批流约束；wait=false 时返回会话 ID 供轮询或中断",
         risk: RiskLevel::Medium,
     },
     ToolDef {
@@ -68,6 +68,10 @@ pub fn tool_definitions() -> Vec<Value> {
                             "minimum": 1,
                             "maximum": 600,
                             "description": "执行超时（秒），默认 30"
+                        },
+                        "wait": {
+                            "type": "boolean",
+                            "description": "true（默认）等待命令结束并返回输出；false 立即返回 session_id，可配合 read_output / send_signal / close_session 使用"
                         }
                     },
                     "required": ["connection_id", "command"],
@@ -154,32 +158,35 @@ pub async fn dispatch_tool(
                 .get("timeout_secs")
                 .or_else(|| arguments.get("timeoutSecs"))
                 .and_then(Value::as_u64);
+            let wait = arguments
+                .get("wait")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
 
-            let outcome = state
-                .run_command(CommandRequest {
+            let start = state
+                .start_command(CommandRequest {
                     connection_id: connection_id.to_string(),
                     command: command.to_string(),
                     source: AuditSource::Agent,
                     timeout_secs,
                 })
                 .await?;
-            match outcome {
-                CommandOutcome::Completed { result } => {
-                    serde_json::to_value(result).map_err(|error| error.to_string())
-                }
-                CommandOutcome::Blocked {
-                    message, audit_id, ..
-                } => Err(format!(
-                    "命令被策略引擎拦截：{message}（审计 ID：{audit_id}）"
-                )),
-                CommandOutcome::PendingApproval { approval } => {
-                    let reason = "MCP stdio 模式没有人工审批界面，已自动拒绝";
-                    let _ = state.deny_approval(&approval.id, reason).await?;
-                    Err(format!(
-                        "命令需要人工审批（{}），但 stdio 传输无法弹出审批窗口，已自动拒绝。\
-                         请在桌面端确认后执行，或改用低风险命令。",
-                        approval.reasons.join("；")
-                    ))
+            match start {
+                CommandStart::Ready(outcome) => finish_outcome(state, outcome).await,
+                CommandStart::Started {
+                    session_id,
+                    completion,
+                } => {
+                    if !wait {
+                        return Ok(json!({
+                            "sessionId": session_id,
+                            "running": true
+                        }));
+                    }
+                    let outcome = completion
+                        .await
+                        .map_err(|_| "命令后台任务意外退出".to_string())??;
+                    finish_outcome(state, outcome).await
                 }
             }
         }
@@ -193,29 +200,63 @@ pub async fn dispatch_tool(
                 .get("limit")
                 .and_then(Value::as_u64)
                 .unwrap_or(200) as usize;
-            let (output, next_offset, eof) =
-                state.read_session_output(session_id, offset, limit)?;
+            let page = state.read_session_output(session_id, offset, limit)?;
             Ok(json!({
                 "sessionId": session_id,
                 "offset": offset,
-                "nextOffset": next_offset,
-                "eof": eof,
-                "output": output
+                "nextOffset": page.next_offset,
+                "eof": page.eof,
+                "running": page.running,
+                "exitCode": page.exit_code,
+                "output": page.text
             }))
         }
-        "send_signal" => Err(
-            "send_signal 需要可中断的长驻会话；当前 exec_command 为同步执行（受 timeout_secs 限制），暂不支持发送信号"
-                .to_string(),
-        ),
+        "send_signal" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let signal = string_arg(&arguments, "signal", "signal")?;
+            state.send_signal(session_id, signal).await?;
+            Ok(json!({
+                "sessionId": session_id,
+                "signal": signal,
+                "sent": true
+            }))
+        }
         "close_session" => {
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
-            if state.close_session(session_id)? {
+            if state.close_session(session_id).await? {
                 Ok(json!({ "sessionId": session_id, "closed": true }))
             } else {
                 Err(format!("会话 {session_id} 不存在"))
             }
         }
         other => Err(format!("未知 MCP 工具: {other}")),
+    }
+}
+
+/// Turn a policy outcome into a tool result. Approval is impossible over
+/// stdio, so pending requests are denied (and audited) instead of hanging.
+async fn finish_outcome(
+    state: &AppState,
+    outcome: CommandOutcome,
+) -> Result<Value, String> {
+    match outcome {
+        CommandOutcome::Completed { result } => {
+            serde_json::to_value(result).map_err(|error| error.to_string())
+        }
+        CommandOutcome::Blocked {
+            message, audit_id, ..
+        } => Err(format!(
+            "命令被策略引擎拦截：{message}（审计 ID：{audit_id}）"
+        )),
+        CommandOutcome::PendingApproval { approval } => {
+            let reason = "MCP stdio 模式没有人工审批界面，已自动拒绝";
+            let _ = state.deny_approval(&approval.id, reason).await?;
+            Err(format!(
+                "命令需要人工审批（{}），但 stdio 传输无法弹出审批窗口，已自动拒绝。\
+                 请在桌面端确认后执行，或改用低风险命令。",
+                approval.reasons.join("；")
+            ))
+        }
     }
 }
 

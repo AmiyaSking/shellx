@@ -77,8 +77,8 @@ pub fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionInfo>, Str
 }
 
 #[tauri::command]
-pub fn close_session(state: State<'_, AppState>, id: String) -> Result<bool, String> {
-    state.close_session(&id)
+pub async fn close_session(state: State<'_, AppState>, id: String) -> Result<bool, String> {
+    state.close_session(&id).await
 }
 
 #[tauri::command]

@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::audit::AuditLogger;
@@ -17,7 +18,7 @@ use crate::models::{
 };
 use crate::policy::PolicyEngine;
 use crate::redaction::Redactor;
-use crate::sessions::SessionManager;
+use crate::sessions::{SessionManager, SessionOutputPage};
 use crate::ssh::{self, ConnectParams, Credential, JumpHost};
 use crate::vault::SecretVault;
 
@@ -28,23 +29,62 @@ struct PendingApproval {
     timeout_secs: Option<u64>,
 }
 
+struct RunningCommand {
+    connection_id: String,
+    control: ssh::ExecControl,
+}
+
+/// Reservation held while a command is connecting, so two concurrent starts
+/// on the same connection cannot race into one session.
+struct StartGuard {
+    starting: Arc<Mutex<HashSet<String>>>,
+    connection_id: String,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if let Ok(mut starting) = self.starting.lock() {
+            starting.remove(&self.connection_id);
+        }
+    }
+}
+
 /// Default and maximum wall-clock budget for one agent command.
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
 const MAX_COMMAND_TIMEOUT_SECS: u64 = 600;
 /// Upper bound on the output returned to an agent or kept in the session ring.
 const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 
-/// Core services shared by the Tauri commands and the (future) MCP transport.
+/// Result of starting a command.
+pub enum CommandStart {
+    /// Policy already produced a final answer (blocked or awaiting approval).
+    Ready(CommandOutcome),
+    /// The command is running; `completion` resolves when it finishes.
+    Started {
+        session_id: String,
+        completion: oneshot::Receiver<Result<CommandOutcome, String>>,
+    },
+}
+
+struct StartedExecution {
+    session_id: String,
+    completion: oneshot::Receiver<Result<CommandOutcome, String>>,
+}
+
+/// Core services shared by the Tauri commands and the MCP transport.
 pub struct AppState {
     data_dir: PathBuf,
     connections: Mutex<ConnectionStore>,
     forwards: Mutex<ForwardStore>,
-    sessions: Mutex<SessionManager>,
+    /// Shared with background command tasks, which outlive one request.
+    sessions: Arc<Mutex<SessionManager>>,
     approvals: Mutex<HashMap<String, PendingApproval>>,
+    running: Arc<Mutex<HashMap<String, RunningCommand>>>,
+    starting: Arc<Mutex<HashSet<String>>>,
     vault: SecretVault,
-    audit: AuditLogger,
+    audit: Arc<AuditLogger>,
     policy: PolicyEngine,
-    redactor: Redactor,
+    redactor: Arc<Redactor>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
@@ -58,12 +98,14 @@ impl AppState {
             data_dir: data_dir.clone(),
             connections: Mutex::new(ConnectionStore::load(&data_dir)),
             forwards: Mutex::new(ForwardStore::load(&data_dir)),
-            sessions: Mutex::new(SessionManager::default()),
+            sessions: Arc::new(Mutex::new(SessionManager::default())),
             approvals: Mutex::new(HashMap::new()),
+            running: Arc::new(Mutex::new(HashMap::new())),
+            starting: Arc::new(Mutex::new(HashSet::new())),
             vault: SecretVault::new(),
-            audit: AuditLogger::new(&data_dir),
+            audit: Arc::new(AuditLogger::new(&data_dir)),
             policy: PolicyEngine,
-            redactor: Redactor::new(),
+            redactor: Arc::new(Redactor::new()),
         };
         let _ = state.audit.log(make_audit(
             AuditSource::System,
@@ -147,7 +189,13 @@ impl AppState {
         ))
     }
 
-    pub async fn run_command(&self, request: CommandRequest) -> Result<CommandOutcome, String> {
+    /// Evaluate policy and, if allowed, start the command. Returning a session
+    /// id before the command finishes lets MCP clients read output or send a
+    /// signal without holding the tool call open.
+    pub async fn start_command(
+        &self,
+        request: CommandRequest,
+    ) -> Result<CommandStart, String> {
         let connection = self.get_connection(&request.connection_id)?;
         let decision = self.policy.evaluate(
             connection.environment,
@@ -158,15 +206,20 @@ impl AppState {
 
         match decision.action {
             PolicyAction::Allow => {
-                self.execute_command(
-                    &connection,
-                    &request.command,
-                    request.source,
-                    decision,
-                    None,
-                    request.timeout_secs,
-                )
-                .await
+                let started = self
+                    .begin_execution(
+                        connection,
+                        request.command,
+                        request.source,
+                        decision,
+                        None,
+                        request.timeout_secs,
+                    )
+                    .await?;
+                Ok(CommandStart::Started {
+                    session_id: started.session_id,
+                    completion: started.completion,
+                })
             }
             PolicyAction::RequireApproval => {
                 let approval = ApprovalRequest {
@@ -200,7 +253,9 @@ impl AppState {
                         timeout_secs: request.timeout_secs,
                     },
                 );
-                Ok(CommandOutcome::PendingApproval { approval })
+                Ok(CommandStart::Ready(CommandOutcome::PendingApproval {
+                    approval,
+                }))
             }
             PolicyAction::Block => {
                 let message = decision.reasons.join("；");
@@ -215,13 +270,39 @@ impl AppState {
                     None,
                     message.clone(),
                 ))?;
-                Ok(CommandOutcome::Blocked {
+                Ok(CommandStart::Ready(CommandOutcome::Blocked {
                     decision,
                     audit_id: entry.id,
                     message,
-                })
+                }))
             }
         }
+    }
+
+    pub async fn run_command(&self, request: CommandRequest) -> Result<CommandOutcome, String> {
+        match self.start_command(request).await? {
+            CommandStart::Ready(outcome) => Ok(outcome),
+            CommandStart::Started { completion, .. } => completion
+                .await
+                .map_err(|_| "命令后台任务意外退出".to_string())?,
+        }
+    }
+
+    /// Send a signal to a command that is still running.
+    pub async fn send_signal(
+        &self,
+        session_id: &str,
+        signal: &str,
+    ) -> Result<(), String> {
+        let control = {
+            lock(&self.running)?
+                .get(session_id)
+                .map(|running| running.control.clone())
+                .ok_or_else(|| {
+                    format!("会话 {session_id} 当前没有正在运行的命令")
+                })?
+        };
+        control.signal(signal).await
     }
 
     pub async fn resolve_approval(
@@ -315,15 +396,20 @@ impl AppState {
 
         // The user explicitly approved this exact command.
         decision.action = PolicyAction::Allow;
-        self.execute_command(
-            &connection,
-            &command,
-            pending.source,
-            decision,
-            Some(ApprovalDecision::Approved),
-            pending.timeout_secs,
-        )
-        .await
+        let started = self
+            .begin_execution(
+                connection,
+                command,
+                pending.source,
+                decision,
+                Some(ApprovalDecision::Approved),
+                pending.timeout_secs,
+            )
+            .await?;
+        started
+            .completion
+            .await
+            .map_err(|_| "命令后台任务意外退出".to_string())?
     }
 
     pub fn list_forward_rules(&self) -> Result<Vec<ForwardRule>, String> {
@@ -365,18 +451,27 @@ impl AppState {
         Ok(lock(&self.sessions)?.list())
     }
 
-    pub fn close_session(&self, id: &str) -> Result<bool, String> {
+    /// Close a command session. A command that is still running is killed
+    /// first; its output is still recorded when the executor finishes.
+    pub async fn close_session(&self, id: &str) -> Result<bool, String> {
+        let control = {
+            lock(&self.running)?
+                .get(id)
+                .map(|running| running.control.clone())
+        };
+        if let Some(control) = control {
+            let _ = control.signal("KILL").await;
+        }
         Ok(lock(&self.sessions)?.close(id))
     }
 
-    /// Paginated access to a command session's output ring. Returns the text,
-    /// the offset to pass next time, and whether the buffer is exhausted.
+    /// Paginated access to a command session's output ring.
     pub fn read_session_output(
         &self,
         session_id: &str,
         offset: usize,
         limit: usize,
-    ) -> Result<(String, usize, bool), String> {
+    ) -> Result<SessionOutputPage, String> {
         lock(&self.sessions)?.read_output(session_id, offset, limit)
     }
 
@@ -499,20 +594,44 @@ impl AppState {
             .ok_or_else(|| "连接不存在".to_string())
     }
 
-    /// Execute one command over a dedicated SSH `exec` channel.
+    /// Reserve a connection for a command that is still connecting.
+    fn reserve_connection(&self, connection_id: &str) -> Result<StartGuard, String> {
+        let mut starting = lock(&self.starting)?;
+        if !starting.insert(connection_id.to_string()) {
+            return Err("该连接已有命令正在执行，请等待结束或先发送信号".into());
+        }
+        Ok(StartGuard {
+            starting: self.starting.clone(),
+            connection_id: connection_id.to_string(),
+        })
+    }
+
+    /// Start one command over a dedicated SSH `exec` channel and return a
+    /// completion handle. The command keeps running in a background task so
+    /// `send_signal` and `read_output` can reach it from later requests.
     ///
     /// The host key must already be trusted (confirmed in the terminal), so an
     /// agent can never silently accept a new key. Policy, approval and audit
     /// have already run by the time this is called.
-    async fn execute_command(
+    async fn begin_execution(
         &self,
-        connection: &Connection,
-        command: &str,
+        connection: Connection,
+        command: String,
         source: AuditSource,
         decision: PolicyDecision,
         approval: Option<ApprovalDecision>,
         timeout_secs: Option<u64>,
-    ) -> Result<CommandOutcome, String> {
+    ) -> Result<StartedExecution, String> {
+        // Command sessions are per connection; refuse a second concurrent
+        // command instead of mixing two output streams in one ring buffer.
+        let _start_guard = self.reserve_connection(&connection.id)?;
+        if lock(&self.running)?
+            .values()
+            .any(|running| running.connection_id == connection.id)
+        {
+            return Err("该连接已有命令正在执行，请等待结束或先发送信号".into());
+        }
+
         let started = Instant::now();
         let (_, mut params) = self.pty_params(&connection.id, 80, 24, Vec::new())?;
         params.agent_forwarding = false;
@@ -522,14 +641,14 @@ impl AppState {
                 .clamp(1, MAX_COMMAND_TIMEOUT_SECS),
         );
 
-        let exec = match ssh::exec_command(&params, command, timeout).await {
-            Ok(exec) => exec,
+        let (running, control) = match ssh::start_exec(&params, &command).await {
+            Ok(started) => started,
             Err(error) => {
                 let detail = format!("命令执行失败：{error}");
                 let _ = self.audit.log(make_audit(
                     source,
-                    Some(connection),
-                    Some(command.to_string()),
+                    Some(&connection),
+                    Some(command.clone()),
                     Some(decision.risk),
                     PolicyAction::Block,
                     approval,
@@ -541,65 +660,111 @@ impl AppState {
             }
         };
 
-        let mut output = exec.output;
-        let truncated = output.len() > MAX_COMMAND_OUTPUT_BYTES;
-        if truncated {
-            let mut cutoff = MAX_COMMAND_OUTPUT_BYTES;
-            while cutoff > 0 && !output.is_char_boundary(cutoff) {
-                cutoff -= 1;
-            }
-            output.truncate(cutoff);
-            output.push_str("\n[输出已截断]");
-        }
-        let output = self.redactor.redact(&output);
-        let exit_code = exec.exit_status.map(|status| status as i32);
-        let duration_ms = started.elapsed().as_millis() as u64;
-
         let session_id = {
             let mut sessions = lock(&self.sessions)?;
-            let id = {
-                let session = sessions.get_or_create(&connection.id, &connection.alias);
-                session.id.clone()
-            };
-            sessions.append_output(&id, &format!("$ {command}\n{output}"));
+            let id = sessions
+                .get_or_create(&connection.id, &connection.alias)
+                .id
+                .clone();
+            sessions.mark_running(&id);
             id
         };
+        lock(&self.running)?.insert(
+            session_id.clone(),
+            RunningCommand {
+                connection_id: connection.id.clone(),
+                control,
+            },
+        );
 
-        let result = CommandResult {
-            id: Uuid::new_v4().to_string(),
+        let (completion_tx, completion) = oneshot::channel();
+        let sessions = self.sessions.clone();
+        let running_map = self.running.clone();
+        let audit = self.audit.clone();
+        let redactor = self.redactor.clone();
+        let task_session_id = session_id.clone();
+        tokio::spawn(async move {
+            let exec = running.collect_exec(timeout).await;
+            if let Ok(mut map) = running_map.lock() {
+                map.remove(&task_session_id);
+            }
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let outcome = match exec {
+                Ok(exec) => {
+                    let exit_code = exec.exit_status.map(|status| status as i32);
+                    let (output, truncated) =
+                        finalize_output(exec.output, redactor.as_ref());
+                    if let Ok(mut sessions) = sessions.lock() {
+                        sessions.finish_command(
+                            &task_session_id,
+                            &format!("$ {command}\n{output}"),
+                            exit_code,
+                        );
+                    }
+                    let result = CommandResult {
+                        id: Uuid::new_v4().to_string(),
+                        session_id: task_session_id,
+                        connection_id: connection.id.clone(),
+                        connection_alias: connection.alias.clone(),
+                        environment: connection.environment,
+                        command: command.clone(),
+                        exit_code,
+                        output,
+                        truncated,
+                        risk: decision.risk,
+                        policy_action: decision.action,
+                        decision_reasons: decision.reasons.clone(),
+                        duration_ms,
+                        simulated: false,
+                    };
+                    let detail = if approval.is_some() {
+                        "审批通过后执行完成（SSH exec）"
+                    } else {
+                        "命令执行完成（SSH exec）"
+                    };
+                    let _ = audit.log(make_audit(
+                        source,
+                        Some(&connection),
+                        Some(command),
+                        Some(decision.risk),
+                        PolicyAction::Allow,
+                        approval,
+                        exit_code,
+                        Some(duration_ms),
+                        detail,
+                    ));
+                    Ok(CommandOutcome::Completed { result })
+                }
+                Err(error) => {
+                    let detail = format!("命令执行失败：{error}");
+                    if let Ok(mut sessions) = sessions.lock() {
+                        sessions.finish_command(
+                            &task_session_id,
+                            &format!("$ {command}\n{detail}"),
+                            None,
+                        );
+                    }
+                    let _ = audit.log(make_audit(
+                        source,
+                        Some(&connection),
+                        Some(command),
+                        Some(decision.risk),
+                        PolicyAction::Block,
+                        approval,
+                        None,
+                        Some(duration_ms),
+                        detail.clone(),
+                    ));
+                    Err(detail)
+                }
+            };
+            let _ = completion_tx.send(outcome);
+        });
+
+        Ok(StartedExecution {
             session_id,
-            connection_id: connection.id.clone(),
-            connection_alias: connection.alias.clone(),
-            environment: connection.environment,
-            command: command.to_string(),
-            exit_code,
-            output,
-            truncated,
-            risk: decision.risk,
-            policy_action: decision.action,
-            decision_reasons: decision.reasons.clone(),
-            duration_ms,
-            simulated: false,
-        };
-
-        let detail = if approval.is_some() {
-            "审批通过后执行完成（SSH exec）"
-        } else {
-            "命令执行完成（SSH exec）"
-        };
-        self.audit.log(make_audit(
-            source,
-            Some(connection),
-            Some(command.to_string()),
-            Some(decision.risk),
-            PolicyAction::Allow,
-            approval,
-            exit_code,
-            Some(duration_ms),
-            detail,
-        ))?;
-
-        Ok(CommandOutcome::Completed { result })
+            completion,
+        })
     }
 }
 
@@ -634,6 +799,20 @@ fn expand_home(path: &str) -> PathBuf {
     } else {
         PathBuf::from(home).join(rest)
     }
+}
+
+/// Truncate oversized output and mask secrets before it leaves the core.
+fn finalize_output(mut output: String, redactor: &Redactor) -> (String, bool) {
+    let truncated = output.len() > MAX_COMMAND_OUTPUT_BYTES;
+    if truncated {
+        let mut cutoff = MAX_COMMAND_OUTPUT_BYTES;
+        while cutoff > 0 && !output.is_char_boundary(cutoff) {
+            cutoff -= 1;
+        }
+        output.truncate(cutoff);
+        output.push_str("\n[输出已截断]");
+    }
+    (redactor.redact(&output), truncated)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -237,6 +237,7 @@ mod tests {
     use crate::models::ConnectionInput;
     use crate::ssh::{connect_authenticated, Credential};
     use crate::ssh_test_server::{start_test_server, trusted_params, TestAuthMode};
+    use std::time::Duration;
 
     struct TestState {
         dir: PathBuf,
@@ -518,6 +519,137 @@ mod tests {
                 "params": {
                     "name": "close_session",
                     "arguments": { "session_id": page["sessionId"] }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("close_session response");
+        assert_eq!(closed["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn background_command_can_be_polled_and_signaled() {
+        let server = start_test_server(TestAuthMode::Password("secret".into())).await;
+        let fixture = test_state();
+        let connection = save_connection(
+            &fixture.state,
+            "127.0.0.1",
+            server.port,
+            "dev",
+            "standard_controlled",
+        );
+        fixture
+            .state
+            .cache_password_for_test(&connection, "secret");
+        let trust = trusted_params(
+            &server,
+            &fixture.state.known_hosts_path(),
+            Credential::Password("secret".into()),
+        )
+        .await;
+        drop(connect_authenticated(&trust).await.expect("trust host key"));
+
+        // Start without waiting: the call returns as soon as the remote
+        // command is running.
+        let started = handle_line(
+            &fixture.state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 11,
+                "method": "tools/call",
+                "params": {
+                    "name": "exec_command",
+                    "arguments": {
+                        "connection_id": connection,
+                        "command": "sleep",
+                        "timeout_secs": 30,
+                        "wait": false
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("start response");
+        assert_eq!(started["result"]["isError"], false, "{}", tool_text(&started));
+        let started: Value = serde_json::from_str(tool_text(&started)).expect("parse start");
+        let session_id = started["sessionId"].as_str().expect("session id").to_string();
+        assert_eq!(started["running"], true);
+
+        let page = handle_line(
+            &fixture.state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {
+                    "name": "read_output",
+                    "arguments": { "session_id": session_id }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("read running session");
+        let page: Value = serde_json::from_str(tool_text(&page)).expect("parse page");
+        assert_eq!(page["running"], true);
+        assert_eq!(page["exitCode"], Value::Null);
+
+        let signal = handle_line(
+            &fixture.state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "tools/call",
+                "params": {
+                    "name": "send_signal",
+                    "arguments": { "session_id": session_id, "signal": "INT" }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("send_signal response");
+        assert_eq!(signal["result"]["isError"], false, "{}", tool_text(&signal));
+
+        let mut finished = None;
+        for _ in 0..50 {
+            let response = handle_line(
+                &fixture.state,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 14,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "read_output",
+                        "arguments": { "session_id": session_id }
+                    }
+                })
+                .to_string(),
+            )
+            .await
+            .expect("poll session");
+            let page: Value =
+                serde_json::from_str(tool_text(&response)).expect("parse page");
+            if page["running"] == false {
+                finished = Some(page);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let finished = finished.expect("signalled command should finish");
+        assert_eq!(finished["exitCode"], 130);
+
+        let closed = handle_line(
+            &fixture.state,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 15,
+                "method": "tools/call",
+                "params": {
+                    "name": "close_session",
+                    "arguments": { "session_id": session_id }
                 }
             })
             .to_string(),

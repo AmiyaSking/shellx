@@ -186,8 +186,8 @@ cargo test
 
 - **前端**：Vitest + jsdom，覆盖设置持久化/默认值迁移与工作区序列化；`npm test`
 - **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法等单元测试；`cargo test`
-- **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发、`exec` 输出/退出码/超时，以及 SFTP 目录列举、创建/重命名/删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
-- **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`read_output` 分页与 `close_session`
+- **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发、`exec` 输出/退出码/超时/运行中信号，以及 SFTP 目录列举、创建/重命名/删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
+- **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`wait=false` 后台执行、`read_output` 分页与状态轮询、`send_signal` 与 `close_session`
 - **CI**：`.github/workflows/ci.yml` 在 Windows 上执行前端测试/构建 + `cargo test` / `cargo check`
 - 系统凭据存储的读写测试标记为 `#[ignore]`，需要手动运行：
   `cargo test keyring_roundtrip -- --ignored`
@@ -211,10 +211,10 @@ Tauri 应用数据目录（标识符 `com.shellx.app`）下：
 | 工具 | 风险 | 状态 |
 | --- | --- | --- |
 | `list_servers` | 低 | 已实现：仅返回已授权连接的安全元信息 |
-| `exec_command` | 中 | 已实现：真实 SSH `exec`，受策略/审批/审计约束，支持超时与输出截断 |
-| `read_output` | 低 | 已实现：按行分页读取会话输出缓冲 |
-| `send_signal` | 中 | 🚧 待接入：需要可中断的长驻会话 |
-| `close_session` | 中 | 已实现：关闭指定命令会话 |
+| `exec_command` | 中 | 已实现：真实 SSH `exec`，受策略/审批/审计约束，支持超时、输出截断与 `wait=false` 后台执行 |
+| `read_output` | 低 | 已实现：按行分页读取会话输出，附带 `running` / `exitCode` 状态 |
+| `send_signal` | 中 | 已实现：向运行中的命令发送 `INT` / `TERM` / `KILL` 等信号 |
+| `close_session` | 中 | 已实现：关闭指定命令会话（运行中的命令会先收到 `KILL`） |
 
 以 stdio 方式启动（MCP 客户端会自行拉起该进程）：
 
@@ -240,6 +240,8 @@ shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
 - 传输为换行分隔的 JSON-RPC 2.0，stdout 只输出协议消息；日志写入 stderr。
 - 支持 `initialize`、`tools/list`、`tools/call`、`ping` 与 `notifications/initialized`。
 - `exec_command` 每次使用独立 SSH 连接，默认超时 30 秒（最大 600 秒），返回退出码、输出与是否截断；输出超过 256 KiB 会截断。
+- `exec_command` 传 `wait: false` 时立即返回 `sessionId`，命令在后台继续执行；随后可用 `read_output` 轮询 `running` / `exitCode`，用 `send_signal` 发送信号，用 `close_session` 终止。默认 `wait: true` 会等命令结束再返回完整结果。
+- 同一连接同一时间只运行一条命令；需要并行执行时请先在桌面端确认主机密钥并建立多个连接。
 - 主机密钥必须先在桌面端终端连接中确认；stdio 进程与桌面版共用 `known_hosts`、`connections.json` 与审计目录。
 - stdio 模式没有人工审批窗口：需要审批的命令会被**自动拒绝**并写入审计日志，请先在桌面端批准执行或改用低风险命令。
 

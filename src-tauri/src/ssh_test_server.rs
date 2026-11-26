@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::server::{self, Auth, Msg, Response, Server as _, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet};
+use russh::{Channel, ChannelId, MethodKind, MethodSet, Sig};
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
     Version,
@@ -208,6 +208,26 @@ impl server::Handler for TestServer {
             (format!("ran: {command}\n"), 0)
         };
         let _ = session.data(channel, output.into_bytes());
+        let _ = session.exit_status_request(channel, status);
+        let _ = session.eof(channel);
+        let _ = session.close(channel);
+        Ok(())
+    }
+
+    async fn signal(
+        &mut self,
+        channel: ChannelId,
+        signal: Sig,
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        // Turn the signal into an exit status so clients can observe that it
+        // reached the remote command. This mirrors a shell reporting 130/143.
+        let status = match signal {
+            Sig::INT => 130,
+            Sig::TERM => 143,
+            Sig::KILL => 137,
+            _ => 1,
+        };
         let _ = session.exit_status_request(channel, status);
         let _ = session.eof(channel);
         let _ = session.close(channel);

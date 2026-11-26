@@ -17,6 +17,18 @@ pub struct Session {
     status: SessionStatus,
     output: VecDeque<String>,
     output_bytes: usize,
+    running: bool,
+    exit_code: Option<i32>,
+}
+
+/// One page of buffered session output plus the command's current state.
+#[derive(Debug, Clone)]
+pub struct SessionOutputPage {
+    pub text: String,
+    pub next_offset: usize,
+    pub eof: bool,
+    pub running: bool,
+    pub exit_code: Option<i32>,
 }
 
 /// In-memory session registry with a bounded output ring buffer. Real SSH
@@ -52,6 +64,8 @@ impl SessionManager {
                         status: SessionStatus::Active,
                         output: VecDeque::new(),
                         output_bytes: 0,
+                        running: false,
+                        exit_code: None,
                     },
                 );
                 id
@@ -77,14 +91,31 @@ impl SessionManager {
         }
     }
 
-    /// Read up to `limit` buffered lines starting at `offset`. Returns the
-    /// joined text, the next offset and whether the buffer is exhausted.
+    /// Mark a session as having a command in flight.
+    pub fn mark_running(&mut self, id: &str) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.running = true;
+            session.exit_code = None;
+            session.last_active_at = Utc::now().to_rfc3339();
+        }
+    }
+
+    /// Record a finished command: append its output and store the exit code.
+    pub fn finish_command(&mut self, id: &str, text: &str, exit_code: Option<i32>) {
+        if let Some(session) = self.sessions.get_mut(id) {
+            session.running = false;
+            session.exit_code = exit_code;
+        }
+        self.append_output(id, text);
+    }
+
+    /// Read up to `limit` buffered lines starting at `offset`.
     pub fn read_output(
         &self,
         id: &str,
         offset: usize,
         limit: usize,
-    ) -> Result<(String, usize, bool), String> {
+    ) -> Result<SessionOutputPage, String> {
         let session = self
             .sessions
             .get(id)
@@ -98,8 +129,15 @@ impl SessionManager {
             .map(String::as_str)
             .collect();
         let next_offset = offset + lines.len();
-        let eof = next_offset >= session.output.len();
-        Ok((lines.join("\n"), next_offset, eof))
+        Ok(SessionOutputPage {
+            text: lines.join("\n"),
+            next_offset,
+            // While a command is running more output may still arrive, so the
+            // page is never final.
+            eof: !session.running && next_offset >= session.output.len(),
+            running: session.running,
+            exit_code: session.exit_code,
+        })
     }
 
     pub fn list(&self) -> Vec<SessionInfo> {
@@ -115,6 +153,8 @@ impl SessionManager {
                 status: session.status,
                 output_lines: session.output.len(),
                 output_bytes: session.output_bytes,
+                running: session.running,
+                exit_code: session.exit_code,
             })
             .collect();
         sessions.sort_by(|left, right| right.created_at.cmp(&left.created_at));

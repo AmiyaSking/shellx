@@ -326,6 +326,9 @@ pub struct SessionInfo {
     pub status: SessionStatus,
     pub output_lines: usize,
     pub output_bytes: usize,
+    /// A command is currently executing in this session.
+    pub running: bool,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
