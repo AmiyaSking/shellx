@@ -13,6 +13,7 @@ interface Props {
   mcpInfo: McpServerInfo | null;
   onOpen: (connection: Connection) => void;
   onNew: () => void;
+  onImport: () => void;
   onEdit: (connection: Connection) => void;
 }
 
@@ -23,6 +24,7 @@ export default function Sidebar({
   mcpInfo,
   onOpen,
   onNew,
+  onImport,
   onEdit,
 }: Props) {
   const [query, setQuery] = useState("");
@@ -53,9 +55,18 @@ export default function Sidebar({
           <div className="section-title">连接</div>
           <div className="section-sub">{connections.length} 台服务器</div>
         </div>
-        <button className="btn btn-primary btn-sm" onClick={onNew}>
-          + 新建
-        </button>
+        <div className="sidebar-head-actions">
+          <button
+            className="btn btn-ghost btn-sm"
+            title="从 ~/.ssh/config 导入"
+            onClick={onImport}
+          >
+            导入
+          </button>
+          <button className="btn btn-primary btn-sm" onClick={onNew}>
+            + 新建
+          </button>
+        </div>
       </div>
 
       <input

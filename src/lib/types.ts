@@ -163,6 +163,22 @@ export interface PtyOpened {
   hostKey: HostKey;
 }
 
+export interface SshConfigHost {
+  alias: string;
+  host: string;
+  port: number;
+  username: string;
+  identityFile?: string | null;
+  proxyJump?: string | null;
+}
+
+export interface SshConfigPreview {
+  path: string;
+  hosts: SshConfigHost[];
+  warnings: string[];
+  defaultUser: string;
+}
+
 /** A fingerprint the user confirmed in the first-connect dialog. */
 export interface HostKeyTrust {
   host: string;

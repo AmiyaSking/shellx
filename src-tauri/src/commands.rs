@@ -7,6 +7,7 @@ use crate::models::{
 };
 use crate::pty::{PtyManager, PtyOpenError, PtyOpened, SessionMeta};
 use crate::ssh;
+use crate::ssh_config::{self, SshConfigPreview};
 use crate::state::AppState;
 
 #[tauri::command]
@@ -235,4 +236,9 @@ pub fn pty_active_sessions(pty: State<'_, PtyManager>) -> usize {
 #[tauri::command]
 pub fn set_session_logging(pty: State<'_, PtyManager>, enabled: bool) {
     pty.set_session_logging(enabled);
+}
+
+#[tauri::command]
+pub fn preview_ssh_config() -> Result<SshConfigPreview, String> {
+    ssh_config::preview_default()
 }

@@ -13,6 +13,7 @@ import type {
   PolicyDecision,
   PtyOpened,
   RiskLevel,
+  SshConfigPreview,
 } from "./types";
 
 export const isTauri = (): boolean =>
@@ -114,6 +115,11 @@ export const api = {
     isTauri()
       ? invoke<void>("set_session_logging", { enabled })
       : Promise.resolve(),
+
+  previewSshConfig: (): Promise<SshConfigPreview> =>
+    isTauri()
+      ? invoke<SshConfigPreview>("preview_ssh_config")
+      : mock.previewSshConfig(),
 };
 
 /* ------------------------------------------------------------------ */
@@ -467,6 +473,32 @@ const mock = {
 
   async listAuditEntries(limit: number) {
     return mockState.audit.slice(0, limit);
+  },
+
+  async previewSshConfig(): Promise<SshConfigPreview> {
+    return {
+      path: "~/.ssh/config",
+      defaultUser: "amiya",
+      warnings: ["Include 指令未展开，如需导入请手动处理被包含的文件"],
+      hosts: [
+        {
+          alias: "prod-db",
+          host: "10.30.0.20",
+          port: 22,
+          username: "dba",
+          identityFile: "~/.ssh/id_ed25519",
+          proxyJump: "bastion",
+        },
+        {
+          alias: "staging-cache",
+          host: "10.20.0.30",
+          port: 2222,
+          username: "deploy",
+          identityFile: null,
+          proxyJump: null,
+        },
+      ],
+    };
   },
 
   async mcpServerInfo(): Promise<McpServerInfo> {

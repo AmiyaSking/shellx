@@ -10,6 +10,7 @@ mod redaction;
 mod sessions;
 mod shell;
 mod ssh;
+mod ssh_config;
 mod state;
 mod vault;
 
@@ -50,6 +51,7 @@ pub fn run() {
             commands::pty_active_sessions,
             commands::set_session_logging,
             commands::forget_host_key,
+            commands::preview_ssh_config,
         ])
         .build(tauri::generate_context!())
         .expect("error while building ShellX");

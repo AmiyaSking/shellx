@@ -19,6 +19,7 @@ import AuditDrawer from "./components/AuditDrawer";
 import ConnectionModal from "./components/ConnectionModal";
 import SettingsDrawer from "./components/SettingsDrawer";
 import Sidebar from "./components/Sidebar";
+import SshConfigImportDialog from "./components/SshConfigImportDialog";
 import TabBar, {
   type TerminalPaneState,
   type TerminalTab,
@@ -82,6 +83,7 @@ export default function App() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [auditOpen, setAuditOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [mcpInfo, setMcpInfo] = useState<McpServerInfo | null>(null);
   const [modal, setModal] = useState<
     { mode: "create" } | { mode: "edit"; connection: Connection } | null
@@ -430,6 +432,16 @@ export default function App() {
     });
   }, []);
 
+  const handleImported = useCallback(
+    async (count: number) => {
+      setImportOpen(false);
+      await refreshConnections();
+      await refreshMcpInfo();
+      if (count > 0) setError(null);
+    },
+    [refreshConnections, refreshMcpInfo],
+  );
+
   const handleSaved = useCallback(
     async (input: ConnectionInput) => {
       try {
@@ -645,6 +657,10 @@ export default function App() {
           mcpInfo={mcpInfo}
           onOpen={openConnection}
           onNew={() => setModal({ mode: "create" })}
+          onImport={() => {
+            setImportOpen(true);
+            setModal(null);
+          }}
           onEdit={(connection) => setModal({ mode: "edit", connection })}
         />
 
@@ -734,6 +750,14 @@ export default function App() {
 
       {auditOpen && <AuditDrawer onClose={() => setAuditOpen(false)} />}
       {settingsOpen && <SettingsDrawer onClose={() => setSettingsOpen(false)} />}
+
+      {importOpen && (
+        <SshConfigImportDialog
+          existingConnections={connections}
+          onImported={handleImported}
+          onClose={() => setImportOpen(false)}
+        />
+      )}
 
       {modal && (
         <ConnectionModal
