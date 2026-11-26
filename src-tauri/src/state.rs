@@ -11,10 +11,11 @@ use crate::audit::AuditLogger;
 use crate::connections::ConnectionStore;
 use crate::forwards::{ForwardRule, ForwardRuleInput, ForwardStore};
 use crate::mcp;
+use crate::mcp_access::{AccessLevel, Capability, McpPolicy};
 use crate::models::{
     ApprovalDecision, ApprovalRequest, AuditEntry, AuditSource, AuthKind, CommandOutcome,
-    CommandRequest, CommandResult, Connection, ConnectionInput, Environment, HostKeyTrust,
-    McpAccessMode, McpServerInfo, PolicyAction, PolicyDecision, RiskLevel, SessionInfo,
+    CommandRequest, CommandResult, Connection, ConnectionInput, HostKeyTrust,
+    McpServerInfo, PolicyAction, PolicyDecision, RiskLevel, SessionInfo,
 };
 use crate::policy::PolicyEngine;
 use crate::redaction::Redactor;
@@ -81,6 +82,8 @@ pub struct AppState {
     approvals: Mutex<HashMap<String, PendingApproval>>,
     running: Arc<Mutex<HashMap<String, RunningCommand>>>,
     starting: Arc<Mutex<HashSet<String>>>,
+    /// Versioned MCP access policy shared by the GUI and the stdio process.
+    mcp_policy: Mutex<McpPolicy>,
     vault: SecretVault,
     audit: Arc<AuditLogger>,
     policy: PolicyEngine,
@@ -94,14 +97,27 @@ fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, String> {
 impl AppState {
     pub fn load(data_dir: PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&data_dir)?;
+        let connections = ConnectionStore::load(&data_dir);
+        let policy_path = data_dir.join("mcp_policy.json");
+        let policy = match McpPolicy::load(&policy_path)
+            .map_err(std::io::Error::other)?
+        {
+            Some(policy) => policy,
+            None => {
+                let policy = McpPolicy::from_connections(&connections.list());
+                let _ = policy.persist(&policy_path);
+                policy
+            }
+        };
         let state = Self {
             data_dir: data_dir.clone(),
-            connections: Mutex::new(ConnectionStore::load(&data_dir)),
+            connections: Mutex::new(connections),
             forwards: Mutex::new(ForwardStore::load(&data_dir)),
             sessions: Arc::new(Mutex::new(SessionManager::default())),
             approvals: Mutex::new(HashMap::new()),
             running: Arc::new(Mutex::new(HashMap::new())),
             starting: Arc::new(Mutex::new(HashSet::new())),
+            mcp_policy: Mutex::new(policy),
             vault: SecretVault::new(),
             audit: Arc::new(AuditLogger::new(&data_dir)),
             policy: PolicyEngine,
@@ -125,22 +141,82 @@ impl AppState {
         Ok(lock(&self.connections)?.list())
     }
 
-    /// Re-read persisted connection and forwarding settings. The MCP stdio
-    /// process is long-lived and runs alongside the GUI, so permission and
-    /// PTY toggles must take effect without restarting the MCP server.
+    /// Re-read persisted connection, forwarding and MCP policy files. The MCP
+    /// stdio process is long-lived and runs alongside the GUI, so permission
+    /// and PTY changes must take effect without restarting the MCP server.
     pub fn refresh_from_disk(&self) -> Result<(), String> {
-        *lock(&self.connections)? = ConnectionStore::load(&self.data_dir);
+        let connections = ConnectionStore::load(&self.data_dir);
+        let policy = match McpPolicy::load(&self.mcp_policy_path())? {
+            Some(policy) => policy,
+            None => McpPolicy::from_connections(&connections.list()),
+        };
+        *lock(&self.connections)? = connections;
         *lock(&self.forwards)? = ForwardStore::load(&self.data_dir);
+        *lock(&self.mcp_policy)? = policy;
         Ok(())
+    }
+
+    fn mcp_policy_path(&self) -> PathBuf {
+        self.data_dir.join("mcp_policy.json")
+    }
+
+    pub fn mcp_policy(&self) -> Result<McpPolicy, String> {
+        Ok(lock(&self.mcp_policy)?.clone())
+    }
+
+    pub fn save_mcp_policy(&self, policy: McpPolicy) -> Result<(), String> {
+        let policy = policy.normalized();
+        policy.persist(&self.mcp_policy_path())?;
+        *lock(&self.mcp_policy)? = policy;
+        Ok(())
+    }
+
+    /// Build the policy page payload: the stored policy, the effective values
+    /// for every connection, and the tool catalog with enabled flags.
+    pub fn mcp_policy_snapshot(&self) -> Result<serde_json::Value, String> {
+        mcp::policy_snapshot(self)
+    }
+
+    pub fn mcp_visible_connections(&self) -> Result<Vec<Connection>, String> {
+        let policy = self.mcp_policy()?;
+        Ok(self
+            .list_connections()?
+            .into_iter()
+            .filter(|connection| policy.effective(connection).visible)
+            .collect())
+    }
+
+    fn sync_connection_policy(&self, connection: &Connection) {
+        let Ok(mut policy) = lock(&self.mcp_policy) else {
+            return;
+        };
+        policy.apply_legacy_connection(connection);
+        let snapshot = policy.clone();
+        drop(policy);
+        if let Err(error) = snapshot.persist(&self.mcp_policy_path()) {
+            eprintln!("[shellx] 保存 MCP 权限策略失败：{error}");
+        }
     }
 
     pub fn save_connection(&self, input: ConnectionInput) -> Result<Connection, String> {
         let password = input.password.clone();
         let passphrase = input.passphrase.clone();
+        let previous = input.id.as_deref().and_then(|id| {
+            lock(&self.connections)
+                .ok()
+                .and_then(|store| store.get(id))
+        });
         let connection = {
             let mut store = lock(&self.connections)?;
             store.upsert(input)?
         };
+        let policy_changed = previous.as_ref().map_or(true, |previous| {
+            previous.mcp_access != connection.mcp_access
+                || previous.environment != connection.environment
+        });
+        if policy_changed {
+            self.sync_connection_policy(&connection);
+        }
         if let Some(secret) = password {
             if !secret.is_empty() {
                 if let Err(error) = self.vault.set(&vault_key(&connection.id), &secret) {
@@ -163,6 +239,14 @@ impl AppState {
         self.vault.remove(&vault_key(id));
         self.vault.remove(&passphrase_key(id));
         lock(&self.sessions)?.close_for_connection(id);
+        if let Ok(mut policy) = lock(&self.mcp_policy) {
+            policy.remove_connection(id);
+            let snapshot = policy.clone();
+            drop(policy);
+            if let Err(error) = snapshot.persist(&self.mcp_policy_path()) {
+                eprintln!("[shellx] 保存 MCP 权限策略失败：{error}");
+            }
+        }
         Ok(())
     }
 
@@ -199,44 +283,48 @@ impl AppState {
         ));
     }
 
-    /// SFTP permission derived from the connection's MCP access and
-    /// environment. Reads are low risk; writes/deletes follow the command
-    /// matrix (staging/prod would need a human approval, which stdio cannot
-    /// provide).
-    pub fn authorize_sftp(
+    /// Gate an MCP-originated capability call through the configurable policy.
+    pub fn authorize_mcp_capability(
         &self,
         connection_id: &str,
-        write: bool,
-        action: &str,
-    ) -> Result<Connection, String> {
-        self.authorize_mcp_action(connection_id, write, action)
-    }
-
-    /// Gate an MCP-originated action by connection authorization and, for
-    /// writes, the environment matrix. Returns the connection for auditing.
-    pub fn authorize_mcp_action(
-        &self,
-        connection_id: &str,
-        write: bool,
+        capability: Capability,
+        required: AccessLevel,
         action: &str,
     ) -> Result<Connection, String> {
         let connection = self.get_connection(connection_id)?;
-        let denial = match connection.mcp_access {
-            McpAccessMode::Disabled => Some("该连接未授权给 MCP".to_string()),
-            McpAccessMode::ReadOnly if write => {
-                Some("该连接对 MCP 为只读模式，不允许写入或删除".to_string())
-            }
-            McpAccessMode::StandardControlled
-                if write && connection.environment != Environment::Dev =>
-            {
-                Some(format!(
-                    "{} 环境的写操作需要人工审批，stdio 模式无法审批，已自动拒绝",
-                    connection.environment.label()
-                ))
-            }
-            _ => None,
-        };
-        self.finish_authorization(connection, action, denial)
+        let policy = self.mcp_policy()?;
+        let verdict = policy.check(&connection, capability, required);
+        if !verdict.visible || verdict.effective == AccessLevel::None {
+            return self.deny_agent(
+                &connection,
+                action,
+                "该连接未授权给 MCP（对 MCP 不可见或不可访问）".into(),
+            );
+        }
+        if !verdict.allowed {
+            return self.deny_agent(
+                &connection,
+                action,
+                format!(
+                    "MCP 权限不足：需要{}，当前{}（来源：{}）",
+                    required.label(),
+                    verdict.effective.label(),
+                    verdict.source.label()
+                ),
+            );
+        }
+        if verdict.needs_confirmation {
+            return self.deny_agent(
+                &connection,
+                action,
+                format!(
+                    "该操作需要人工审批（确认阈值：{}，来源：{}），stdio 模式无法审批，已自动拒绝",
+                    verdict.confirm.label(),
+                    verdict.confirm_source.label()
+                ),
+            );
+        }
+        Ok(connection)
     }
 
     /// Interactive PTY is a separate, explicit opt-in: an interactive shell
@@ -244,42 +332,55 @@ impl AppState {
     /// `mcpPtyEnabled`.
     pub fn authorize_mcp_pty(&self, connection_id: &str) -> Result<Connection, String> {
         let connection = self.get_connection(connection_id)?;
-        let denial = match connection.mcp_access {
-            McpAccessMode::Disabled => Some("该连接未授权给 MCP".to_string()),
-            McpAccessMode::ReadOnly => Some(
-                "MCP 交互式终端要求连接的 MCP 授权为「受控」，只读连接不能开启"
-                    .to_string(),
-            ),
-            McpAccessMode::StandardControlled if !connection.mcp_pty_enabled => Some(
+        let policy = self.mcp_policy()?;
+        let verdict = policy.check(&connection, Capability::Pty, AccessLevel::Full);
+        if !verdict.visible || verdict.effective == AccessLevel::None {
+            return self.deny_agent(
+                &connection,
+                "打开 MCP 交互式终端",
+                "该连接未授权给 MCP".into(),
+            );
+        }
+        if !verdict.allowed {
+            return self.deny_agent(
+                &connection,
+                "打开 MCP 交互式终端",
+                format!(
+                    "MCP 交互式终端需要完全访问，当前为{}（来源：{}）",
+                    verdict.effective.label(),
+                    verdict.source.label()
+                ),
+            );
+        }
+        if !connection.mcp_pty_enabled {
+            return self.deny_agent(
+                &connection,
+                "打开 MCP 交互式终端",
                 "该连接未开启 MCP 交互式终端；请在桌面端编辑连接并显式开启（危险）"
-                    .to_string(),
-            ),
-            McpAccessMode::StandardControlled => None,
-        };
-        self.finish_authorization(connection, "打开 MCP 交互式终端", denial)
-    }
-
-    fn finish_authorization(
-        &self,
-        connection: Connection,
-        action: &str,
-        denial: Option<String>,
-    ) -> Result<Connection, String> {
-        if let Some(reason) = denial {
-            let _ = self.audit.log(make_audit(
-                AuditSource::Agent,
-                Some(&connection),
-                None,
-                None,
-                PolicyAction::Block,
-                None,
-                None,
-                None,
-                format!("{action} 被拒绝：{reason}"),
-            ));
-            return Err(reason);
+                    .into(),
+            );
         }
         Ok(connection)
+    }
+
+    fn deny_agent(
+        &self,
+        connection: &Connection,
+        action: &str,
+        reason: String,
+    ) -> Result<Connection, String> {
+        let _ = self.audit.log(make_audit(
+            AuditSource::Agent,
+            Some(connection),
+            None,
+            None,
+            PolicyAction::Block,
+            None,
+            None,
+            None,
+            format!("{action} 被拒绝：{reason}"),
+        ));
+        Err(reason)
     }
 
     pub fn preview_command(
@@ -289,12 +390,26 @@ impl AppState {
         source: AuditSource,
     ) -> Result<PolicyDecision, String> {
         let connection = self.get_connection(connection_id)?;
-        Ok(self.policy.evaluate(
-            connection.environment,
-            connection.mcp_access,
-            source,
-            command,
-        ))
+        self.evaluate_command(&connection, source, command)
+    }
+
+    fn evaluate_command(
+        &self,
+        connection: &Connection,
+        source: AuditSource,
+        command: &str,
+    ) -> Result<PolicyDecision, String> {
+        if source == AuditSource::Agent {
+            let policy = self.mcp_policy()?;
+            Ok(self.policy.evaluate_agent(&policy, connection, command))
+        } else {
+            Ok(self.policy.evaluate(
+                connection.environment,
+                connection.mcp_access,
+                source,
+                command,
+            ))
+        }
     }
 
     /// Evaluate policy and, if allowed, start the command. Returning a session
@@ -305,12 +420,8 @@ impl AppState {
         request: CommandRequest,
     ) -> Result<CommandStart, String> {
         let connection = self.get_connection(&request.connection_id)?;
-        let decision = self.policy.evaluate(
-            connection.environment,
-            connection.mcp_access,
-            request.source,
-            &request.command,
-        );
+        let decision =
+            self.evaluate_command(&connection, request.source, &request.command)?;
 
         match decision.action {
             PolicyAction::Allow => {
@@ -476,12 +587,8 @@ impl AppState {
             });
         }
 
-        let mut decision = self.policy.evaluate(
-            connection.environment,
-            connection.mcp_access,
-            pending.source,
-            &command,
-        );
+        let mut decision =
+            self.evaluate_command(&connection, pending.source, &command)?;
         if decision.action == PolicyAction::Block {
             let message = decision.reasons.join("；");
             let entry = self.audit.log(make_audit(
@@ -594,13 +701,24 @@ impl AppState {
     }
 
     pub fn mcp_info(&self) -> Result<McpServerInfo, String> {
-        let authorized_connections = lock(&self.connections)?.authorized_count();
+        let policy = self.mcp_policy()?;
+        let tools = mcp::tool_catalog();
+        let enabled_tools = tools
+            .iter()
+            .filter(|tool| policy.tool_enabled(&tool.name))
+            .count();
+        let authorized_connections = self
+            .list_connections()?
+            .iter()
+            .filter(|connection| policy.effective(connection).visible)
+            .count();
         let active_sessions = lock(&self.sessions)?.active_count();
         Ok(McpServerInfo {
             transport: "stdio".into(),
             command: "shellx --mcp-stdio".into(),
             status: "ready".into(),
-            tools: mcp::tool_catalog(),
+            tools,
+            enabled_tools,
             authorized_connections,
             active_sessions,
         })

@@ -86,6 +86,20 @@ pub fn mcp_server_info(state: State<'_, AppState>) -> Result<McpServerInfo, Stri
     state.mcp_info()
 }
 
+#[tauri::command]
+pub fn get_mcp_policy(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    state.mcp_policy_snapshot()
+}
+
+#[tauri::command]
+pub fn save_mcp_policy(
+    state: State<'_, AppState>,
+    policy: crate::mcp_access::McpPolicy,
+) -> Result<serde_json::Value, String> {
+    state.save_mcp_policy(policy)?;
+    state.mcp_policy_snapshot()
+}
+
 // ---------------------------------------------------------------------------
 // Interactive terminal (real SSH PTY, as opposed to the command/RPC path above)
 // ---------------------------------------------------------------------------

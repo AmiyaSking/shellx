@@ -15,6 +15,7 @@ interface Props {
   onNew: () => void;
   onImport: () => void;
   onEdit: (connection: Connection) => void;
+  onOpenMcpPolicy: () => void;
 }
 
 export default function Sidebar({
@@ -26,6 +27,7 @@ export default function Sidebar({
   onNew,
   onImport,
   onEdit,
+  onOpenMcpPolicy,
 }: Props) {
   const [query, setQuery] = useState("");
 
@@ -169,7 +171,9 @@ export default function Sidebar({
             </div>
             <div className="mcp-line">
               <span>工具</span>
-              <span>{mcpInfo.tools.length} 个</span>
+              <span>
+                {mcpInfo.enabledTools} / {mcpInfo.tools.length}
+              </span>
             </div>
             <div className="mcp-line">
               <span>已授权连接</span>
@@ -182,6 +186,12 @@ export default function Sidebar({
                   ? "MCP 服务运行中。"
                   : "stdio 传输已就绪，由 MCP 客户端按需启动 `shellx --mcp-stdio`。"}
             </p>
+            <button
+              className="btn btn-ghost btn-sm mcp-policy-open"
+              onClick={onOpenMcpPolicy}
+            >
+              MCP 权限设置
+            </button>
           </>
         ) : (
           <p className="muted">MCP 状态读取中…</p>

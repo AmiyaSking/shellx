@@ -119,7 +119,13 @@ pub async fn handle_request(
     match method {
         "initialize" => Some(ok_response(id, initialize_result(&request))),
         "ping" => Some(ok_response(id, json!({}))),
-        "tools/list" => Some(ok_response(id, json!({ "tools": mcp::tool_definitions() }))),
+        "tools/list" => match state.mcp_policy() {
+            Ok(policy) => Some(ok_response(
+                id,
+                json!({ "tools": mcp::tool_definitions(&policy) }),
+            )),
+            Err(error) => Some(error_response(id, -32603, error)),
+        },
         "tools/call" => {
             Some(call_tool(state, services, id, request.get("params")).await)
         }
@@ -289,6 +295,10 @@ fn platform_data_dir() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::forwards::{ForwardKind, ForwardRuleInput};
+    use crate::mcp_access::{
+        AccessLevel, ConfirmLevel, McpCapabilityOverrides, McpPolicy, McpPolicyRule,
+        McpRuleTarget,
+    };
     use crate::models::ConnectionInput;
     use crate::ssh::{connect_authenticated, Credential};
     use crate::ssh_test_server::{
@@ -546,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn tool_calls_reload_connection_settings_from_disk() {
         let fixture = test_state();
-        save_connection(
+        let connection = save_connection(
             &fixture.state,
             "127.0.0.1",
             22,
@@ -563,11 +573,27 @@ mod tests {
         let body: Value = serde_json::from_str(tool_text(&listed)).expect("parse servers");
         assert_eq!(body["servers"].as_array().unwrap().len(), 1);
 
-        // Simulate the GUI revoking MCP access while the stdio process runs.
-        let path = fixture.dir.join("connections.json");
-        let text = std::fs::read_to_string(&path).expect("read connections.json");
-        std::fs::write(&path, text.replace("standard_controlled", "disabled"))
-            .expect("rewrite connections.json");
+        // Simulate the GUI revoking MCP access while the stdio process runs:
+        // the GUI writes both connections.json and mcp_policy.json.
+        let policy_path = fixture.dir.join("mcp_policy.json");
+        let mut policy: McpPolicy =
+            serde_json::from_str(&std::fs::read_to_string(&policy_path).expect("read policy"))
+                .expect("parse policy");
+        for rule in &mut policy.rules {
+            if rule.target
+                == (McpRuleTarget::Connection {
+                    id: connection.clone(),
+                })
+            {
+                rule.visible = Some(false);
+                rule.access = Some(AccessLevel::None);
+            }
+        }
+        std::fs::write(
+            &policy_path,
+            serde_json::to_string_pretty(&policy).expect("serialize policy"),
+        )
+        .expect("rewrite policy");
 
         let listed = handle_line(
             &fixture.state, &fixture.services,
@@ -580,6 +606,147 @@ mod tests {
             body["servers"].as_array().unwrap().is_empty(),
             "MCP must pick up permission changes from disk"
         );
+    }
+
+    #[tokio::test]
+    async fn custom_policy_can_grant_access_and_disable_tools() {
+        let fixture = test_state();
+        // The legacy quick preset disables this connection...
+        let connection = save_connection(&fixture.state, "127.0.0.1", 22, "dev", "disabled");
+
+        let listed = handle_line(
+            &fixture.state, &fixture.services,
+            r#"{"jsonrpc":"2.0","id":75,"method":"tools/call","params":{"name":"list_servers","arguments":{}}}"#,
+        )
+        .await
+        .expect("list servers");
+        let body: Value = serde_json::from_str(tool_text(&listed)).expect("parse servers");
+        assert!(body["servers"].as_array().unwrap().is_empty());
+
+        // ...but the configurable policy can grant it freely.
+        let mut policy = fixture.state.mcp_policy().expect("load policy");
+        policy.rules.push(McpPolicyRule {
+            target: McpRuleTarget::Connection {
+                id: connection.clone(),
+            },
+            visible: Some(true),
+            access: Some(AccessLevel::Full),
+            confirm: Some(ConfirmLevel::High),
+        });
+        policy.tools.insert("sftp_remove".to_string(), false);
+        fixture
+            .state
+            .save_mcp_policy(policy)
+            .expect("save custom policy");
+
+        let listed = handle_line(
+            &fixture.state, &fixture.services,
+            r#"{"jsonrpc":"2.0","id":76,"method":"tools/call","params":{"name":"list_servers","arguments":{}}}"#,
+        )
+        .await
+        .expect("list servers after grant");
+        let body: Value = serde_json::from_str(tool_text(&listed)).expect("parse servers");
+        let servers = body["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["id"], connection);
+
+        let tools = handle_line(
+            &fixture.state, &fixture.services,
+            r#"{"jsonrpc":"2.0","id":77,"method":"tools/list"}"#,
+        )
+        .await
+        .expect("tools/list");
+        let tools = tools["result"]["tools"].as_array().unwrap();
+        assert!(
+            !tools.iter().any(|tool| tool["name"] == "sftp_remove"),
+            "disabled tool must disappear from tools/list"
+        );
+
+        let denied = handle_line(
+            &fixture.state, &fixture.services,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 78,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_remove",
+                    "arguments": { "session_id": "missing", "path": "/tmp/x" }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("disabled tool response");
+        assert_eq!(denied["result"]["isError"], true);
+        assert!(
+            tool_text(&denied).contains("禁用"),
+            "got {}",
+            tool_text(&denied)
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_policy_can_grant_exec_on_a_legacy_disabled_connection() {
+        let server = start_test_server(TestAuthMode::Password("secret".into())).await;
+        let fixture = test_state();
+        let connection = save_connection(
+            &fixture.state,
+            "127.0.0.1",
+            server.port,
+            "dev",
+            "disabled",
+        );
+        fixture.state.cache_password_for_test(&connection, "secret");
+
+        let mut policy = fixture.state.mcp_policy().expect("load policy");
+        policy.rules.push(McpPolicyRule {
+            target: McpRuleTarget::Connection {
+                id: connection.clone(),
+            },
+            visible: Some(true),
+            access: Some(AccessLevel::Full),
+            confirm: Some(ConfirmLevel::High),
+        });
+        fixture
+            .state
+            .save_mcp_policy(policy)
+            .expect("grant exec via policy");
+
+        let trust = trusted_params(
+            &server,
+            &fixture.state.known_hosts_path(),
+            Credential::Password("secret".into()),
+        )
+        .await;
+        drop(connect_authenticated(&trust).await.expect("trust host key"));
+
+        let response = handle_line(
+            &fixture.state, &fixture.services,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 79,
+                "method": "tools/call",
+                "params": {
+                    "name": "exec_command",
+                    "arguments": {
+                        "connection_id": connection,
+                        "command": "echo policy-granted"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("exec response");
+        assert_eq!(response["result"]["isError"], false, "{}", tool_text(&response));
+        let result: Value =
+            serde_json::from_str(tool_text(&response)).expect("parse result");
+        assert!(result["output"]
+            .as_str()
+            .unwrap()
+            .contains("policy-granted"));
+
+        drop(server);
     }
 
     #[tokio::test]
@@ -1253,6 +1420,73 @@ mod tests {
             .expect("sftp_close response");
         }
 
+        // A capability ceiling tightens SFTP to read-only even on a Full
+        // connection.
+        let capped = save_connection(
+            &fixture.state,
+            "127.0.0.1",
+            server.port,
+            "dev",
+            "standard_controlled",
+        );
+        fixture.state.cache_password_for_test(&capped, "secret");
+        let opened = handle_line(
+            &fixture.state, &fixture.services,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 71,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_open",
+                    "arguments": { "connection_id": capped }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("capped open response");
+        let opened: Value = serde_json::from_str(tool_text(&opened)).expect("parse open");
+        let capped_session = opened["sessionId"].as_str().expect("session id").to_string();
+
+        let mut policy = fixture.state.mcp_policy().expect("load policy");
+        policy.capabilities.insert(
+            capped.clone(),
+            McpCapabilityOverrides {
+                sftp: Some(AccessLevel::Read),
+                forwarding: None,
+            },
+        );
+        fixture
+            .state
+            .save_mcp_policy(policy)
+            .expect("save capability ceiling");
+
+        let denied = handle_line(
+            &fixture.state, &fixture.services,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 72,
+                "method": "tools/call",
+                "params": {
+                    "name": "sftp_write_file",
+                    "arguments": {
+                        "session_id": capped_session,
+                        "path": "/capped.txt",
+                        "content": "nope"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .expect("capped write response");
+        assert_eq!(denied["result"]["isError"], true);
+        assert!(
+            tool_text(&denied).contains("只读"),
+            "got {}",
+            tool_text(&denied)
+        );
+
         let disabled = save_connection(
             &fixture.state,
             "127.0.0.1",
@@ -1608,7 +1842,7 @@ mod tests {
         .expect("read-only terminal response");
         assert_eq!(denied["result"]["isError"], true);
         assert!(
-            tool_text(&denied).contains("受控"),
+            tool_text(&denied).contains("完全访问"),
             "got {}",
             tool_text(&denied)
         );

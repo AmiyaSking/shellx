@@ -47,6 +47,7 @@ ShellX 面向两类使用者：
 | SSH Agent 转发 | ✅ 已实现 | 每连接可选，OpenSSH Agent / `SSH_AUTH_SOCK` |
 | X11 转发 | 🚧 暂未实现 | Windows 场景价值较低 |
 | 本地 MCP stdio 传输 | ✅ 已实现 | `shellx --mcp-stdio`；JSON-RPC 2.0，命令、SFTP、端口转发工具调用走策略/审计 |
+| MCP 权限配置 | ✅ 已实现 | 可见范围、访问级别、确认阈值、能力上限与工具开关；旧配置自动迁移 |
 | MCP 交互式终端 | ✅ 已实现 | 默认关闭；需在连接设置中显式开启并确认危险提示，绕过命令级策略 |
 | MCP 端口转发 | ✅ 已实现 | 仅能启动桌面端预定义、绑定回环地址的规则 |
 
@@ -92,7 +93,8 @@ Tauri Frontend (React + TS + xterm.js)
 Tauri Backend / Local Core (Rust)
   ├─ commands.rs       Tauri Commands
   ├─ state.rs          应用状态与命令编排
-  ├─ policy.rs         连接白名单 / 环境分级 / 风险规则
+  ├─ policy.rs         风险规则 / 手动终端环境矩阵 / Agent 命令判定
+  ├─ mcp_access.rs     可配置 MCP 权限模型（继承 / 可见性 / 确认 / 工具）
   ├─ redaction.rs      输出敏感信息脱敏
   ├─ audit.rs          JSONL 审计 + 内存环形缓冲
   ├─ connections.rs    连接配置持久化（不含凭据）
@@ -143,9 +145,10 @@ shellx/
 
 安全控制**不依赖 Prompt 自律**，全部在 Rust 侧统一执行：
 
-- **默认最小权限**：新连接默认 `mcpAccess = disabled`。
-- **连接级授权**：`read_only` 仅允许低风险命令；`standard_controlled` 走环境策略矩阵；手动 GUI 会话不受 MCP 授权限制。
-- **环境分级**：
+- **默认最小权限**：新连接默认 `mcpAccess = disabled`。侧边栏「本地 MCP → MCP 权限设置」可以按全局/分组/连接自由调整。
+- **MCP 权限策略**：全局默认 → 分组 → 连接 → 能力上限。每个节点可配置可见性、访问级别（只读 / 读写 / 完全访问）、确认阈值（关闭 / 中风险起 / 高风险起）；SFTP 与端口转发还可以单独收紧。工具可以逐个禁用，禁用后不会出现在 `tools/list`，调用也会被拒绝。
+- **手动终端**：仍按环境风险矩阵执行，不受 MCP 权限页影响。
+- **环境风险矩阵（手动终端与旧配置迁移默认值）**：
 
   | 环境 | 低风险 | 中风险 | 高风险 | 极高危 |
   | --- | --- | --- | --- | --- |
@@ -154,7 +157,7 @@ shellx/
   | prod | 放行 | 审批 | 审批 | 拦截 |
 
 - **硬拦截**：`rm -rf /`、磁盘格式化/裸写、fork 炸弹等即使人工批准也不会执行。
-- **审批流**：挂起命令、展示目标/环境/完整命令/风险原因，支持修改后执行；修改后的命令会重新过策略。
+- **审批流**：挂起命令、展示目标/环境/完整命令/风险原因，支持修改后执行；修改后的命令会重新过策略。stdio 模式没有审批窗口，需要确认的 MCP 调用会直接拒绝并写审计。
 - **输出脱敏**：返回给 Agent 或写入审计前，对密码、Token、API Key、私钥块、Bearer 凭据做掩码。
 - **审计**：记录来源（用户/Agent）、服务器、命令、风险、判定、审批结果、耗时与退出码。
 
@@ -187,9 +190,9 @@ cargo test
 ### 测试与 CI
 
 - **前端**：Vitest + jsdom，覆盖设置持久化/默认值迁移与工作区序列化；`npm test`
-- **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法、SFTP 传输取消等单元测试；`cargo test`
+- **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法、SFTP 传输取消、MCP 权限继承/迁移/锁定等单元测试；`cargo test`
 - **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发、`exec` 输出/退出码/超时/运行中信号，以及 SFTP 目录列举、创建/重命名/递归删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
-- **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`wait=false` 后台执行、`read_output` 分页与状态轮询、`send_signal`、`close_session`、SFTP 读写/建目录/重命名/递归删除、只读与 staging 写拦截、端口转发启动/停止与非回环拦截、PTY 显式开启/回显/关闭、`resources/*` 资源读取
+- **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`wait=false` 后台执行、`read_output` 分页与状态轮询、`send_signal`、`close_session`、SFTP 读写/建目录/重命名/递归删除、只读与 staging 写拦截、端口转发启动/停止与非回环拦截、PTY 显式开启/回显/关闭、自定义策略授权/能力上限/工具开关/策略热刷新、`resources/*` 资源读取
 - **CI**：`.github/workflows/ci.yml` 在 Windows 上执行前端测试/构建 + `cargo test` / `cargo check`
 - 系统凭据存储的读写测试标记为 `#[ignore]`，需要手动运行：
   `cargo test keyring_roundtrip -- --ignored`
@@ -200,6 +203,7 @@ cargo test
 Tauri 应用数据目录（标识符 `com.shellx.app`）下：
 
 - `connections.json`：连接元数据（不含密码/私钥内容）
+- `mcp_policy.json`：MCP 权限策略（可见范围、访问级别、确认阈值、能力上限、工具开关）
 - `known_hosts`：ShellX 自己的主机密钥信任库（不修改 OpenSSH 的 `~/.ssh/known_hosts`）
 - `audit/audit-YYYY-MM-DD.jsonl`：结构化审计日志
 - `sessions/YYYY-MM-DD/<session-id>.log`：开启「记录终端输出」后的原始 PTY 输出
@@ -258,12 +262,39 @@ shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
 - 同一连接同一时间只运行一条命令；需要并行执行时请先在桌面端确认主机密钥并建立多个连接。
 - 主机密钥必须先在桌面端终端连接中确认；stdio 进程与桌面版共用 `known_hosts`、`connections.json` 与审计目录。
 - stdio 模式没有人工审批窗口：需要审批的命令会被**自动拒绝**并写入审计日志，请先在桌面端批准执行或改用低风险命令。
-- SFTP 工具沿用连接的 `mcpAccess`：`read_only` 只能读取；`standard_controlled` 在 dev 环境允许写入/删除，staging/prod 的写操作按命令矩阵需要审批，stdio 模式会自动拒绝并写审计。
+- SFTP 工具遵循 MCP 权限策略：读取需要 `read`，写入/建目录/重命名需要 `write`，删除也按 `write` 处理。默认迁移后 dev 可写，staging/prod 的写操作会因确认阈值被 stdio 自动拒绝；可在权限页调整，或在连接上单独收紧 SFTP。
 - SFTP 单次读取默认 64 KiB、最大 512 KiB；单次写入最大 1 MiB；删除目录必须显式传 `recursive=true`。
 - SFTP 工具只操作远端路径，不接受本地文件路径；主机密钥同样必须先在桌面端确认，2FA 在 stdio 模式下不可用。
-- 端口转发：MCP 只能启动桌面端已保存的规则，且规则必须绑定回环地址（`127.0.0.1` / `::1` / `localhost`）；`read_only` 连接不允许启动，staging/prod 受控连接按写操作矩阵自动拒绝。MCP 不能创建新规则。
-- 交互式终端：默认关闭，必须在连接设置中勾选「允许 MCP 交互式终端」并确认危险提示；只有 MCP 授权为「受控」的连接可以开启，只读连接始终拒绝。开启后 Agent 获得完整 shell，**绕过命令级策略、环境分级与审批**；每个 stdio 进程最多 8 个终端会话。
+- 端口转发：MCP 只能启动桌面端已保存的规则，且规则必须绑定回环地址（`127.0.0.1` / `::1` / `localhost`）；启动需要 `write` 级别。默认迁移后 dev 允许，staging/prod 会因确认阈值自动拒绝。MCP 不能创建新规则。
+- 交互式终端：默认关闭，必须在连接设置中勾选「允许 MCP 交互式终端」并确认危险提示；同时要求连接的访问级别为「完全访问」，只读/读写级别始终拒绝。开启后 Agent 获得完整 shell，**绕过命令级策略、环境分级与审批**；每个 stdio 进程最多 8 个终端会话。
 - 终端输出按连接编码解码并保留 ANSI 转义，每个会话只保留最近 256 KiB 原始输出；终端输入内容不写审计，只记录打开/关闭。MCP 终端与桌面端终端标签互不共享，也不会请求 SSH Agent 转发。
+
+### MCP 权限设置
+
+侧边栏「本地 MCP → MCP 权限设置」打开配置抽屉，所有 MCP/Agent 调用共用一份策略：
+
+- **全局默认 → 分组 → 连接** 逐级继承；每个节点可以覆盖访问级别和确认阈值。
+- **可见范围**：全部连接，或只暴露资源树中勾选的分组/连接。
+- **访问级别**：
+  - `只读`：低风险命令、SFTP 读取、列表/状态查询。
+  - `读写`：中风险命令、SFTP 写入/建目录/重命名/删除、启动端口转发。
+  - `完全访问`：高风险命令；交互式终端还需要连接级显式开关。
+  - 极高危命令、非回环转发、未确认主机密钥始终拒绝，不受策略放宽。
+- **确认阈值**：关闭 / 中风险起 / 高风险起，独立于访问级别；stdio 模式下需要确认的调用会自动拒绝并写审计。
+- **能力上限**：连接可以单独把 SFTP 或端口转发收紧到更低级别。
+- **工具开关**：关闭的工具不会出现在 `tools/list`，调用也会被拒绝。
+- 该页面只影响 MCP/Agent，手动终端仍按环境风险矩阵执行。
+
+策略保存在应用数据目录的 `mcp_policy.json`。首次启动会按现有 `mcpAccess + environment` 自动迁移，保持原有行为：
+
+| 旧配置 | 迁移后 |
+| --- | --- |
+| `disabled` | 不可见 / 不可访问 |
+| `read_only` | 可见 / 只读 / 高风险起确认 |
+| `standard_controlled` + dev | 可见 / 完全访问 / 高风险起确认 |
+| `standard_controlled` + staging/prod | 可见 / 完全访问 / 中风险起确认 |
+
+在连接编辑器中修改 `mcpAccess` 或环境时，会同步更新该连接在策略中的规则；在权限页单独调整连接后，只要不改这两个字段，自定义规则会保留。策略文件损坏或版本高于当前支持版本时会进入“全部锁定”状态，避免错误解析放宽权限。
 
 ### MCP 资源（只读）
 

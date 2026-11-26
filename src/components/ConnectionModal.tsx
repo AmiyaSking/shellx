@@ -257,6 +257,8 @@ export default function ConnectionModal({
             <p className="muted small span-2">
               「只读」允许 MCP 读取命令与 SFTP 文件；「受控」在 dev 环境还允许
               SFTP 写入/删除，staging/prod 的写操作需要人工审批（stdio 模式会自动拒绝）。
+              这里是快捷预设；更细的可见范围、访问级别、确认阈值与工具开关请在侧边栏
+              「MCP 权限设置」中配置。
             </p>
 
             <label className="span-2 checkbox-field">

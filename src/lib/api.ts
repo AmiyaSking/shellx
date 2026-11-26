@@ -11,6 +11,13 @@ import type {
   ForwardRuleInput,
   ForwardStatus,
   HostKeyTrust,
+  McpAccessLevel,
+  McpAccessSource,
+  McpConfirmLevel,
+  McpConnectionAccess,
+  McpPolicy,
+  McpPolicySnapshot,
+  McpRuleTarget,
   McpServerInfo,
   PolicyAction,
   PolicyDecision,
@@ -64,6 +71,14 @@ export const api = {
 
   mcpServerInfo: (): Promise<McpServerInfo> =>
     isTauri() ? invoke<McpServerInfo>("mcp_server_info") : mock.mcpServerInfo(),
+
+  getMcpPolicy: (): Promise<McpPolicySnapshot> =>
+    isTauri() ? invoke<McpPolicySnapshot>("get_mcp_policy") : mock.getMcpPolicy(),
+
+  saveMcpPolicy: (policy: McpPolicy): Promise<McpPolicySnapshot> =>
+    isTauri()
+      ? invoke<McpPolicySnapshot>("save_mcp_policy", { policy })
+      : mock.saveMcpPolicy(policy),
 
   /* ---- interactive PTY (real SSH shell, desktop build only) ---- */
 
@@ -358,6 +373,186 @@ const mockState = {
   forwardStatuses: new Map<string, ForwardStatus>(),
 };
 
+const MOCK_MCP_TOOLS = [
+  { name: "list_servers", description: "列出已授权给 MCP 的服务器元信息", risk: "low" },
+  { name: "exec_command", description: "在已授权服务器上执行命令（受策略引擎约束）", risk: "medium" },
+  { name: "read_output", description: "分页读取会话输出", risk: "low" },
+  { name: "send_signal", description: "向会话发送中断信号", risk: "medium" },
+  { name: "close_session", description: "关闭指定会话", risk: "medium" },
+  { name: "sftp_open", description: "打开 SFTP 文件会话", risk: "low" },
+  { name: "sftp_close", description: "关闭 SFTP 文件会话", risk: "low" },
+  { name: "sftp_list", description: "列出远端目录", risk: "low" },
+  { name: "sftp_stat", description: "读取远端路径元信息", risk: "low" },
+  { name: "sftp_read_file", description: "读取远端文件内容", risk: "low" },
+  { name: "sftp_write_file", description: "创建或覆盖远端文件", risk: "medium" },
+  { name: "sftp_mkdir", description: "创建远端目录", risk: "medium" },
+  { name: "sftp_remove", description: "删除远端文件或目录", risk: "medium" },
+  { name: "sftp_rename", description: "重命名远端路径", risk: "medium" },
+  { name: "list_forward_rules", description: "列出端口转发规则与状态", risk: "low" },
+  { name: "start_forward", description: "启动预定义转发规则", risk: "medium" },
+  { name: "stop_forward", description: "停止转发规则", risk: "medium" },
+  { name: "terminal_open", description: "打开交互式 PTY（危险，需显式开启）", risk: "high" },
+  { name: "terminal_write", description: "向交互式终端发送输入", risk: "high" },
+  { name: "terminal_read", description: "读取交互式终端输出", risk: "medium" },
+  { name: "terminal_resize", description: "调整终端窗口大小", risk: "low" },
+  { name: "terminal_signal", description: "向终端前台进程发送信号", risk: "medium" },
+  { name: "terminal_close", description: "关闭交互式终端", risk: "low" },
+] as const satisfies ReadonlyArray<{ name: string; description: string; risk: RiskLevel }>;
+
+const ACCESS_RANK: Record<McpAccessLevel, number> = {
+  none: 0,
+  read: 1,
+  write: 2,
+  full: 3,
+};
+
+const ACCESS_LABELS: Record<McpAccessLevel, string> = {
+  none: "不可访问",
+  read: "只读",
+  write: "读写",
+  full: "完全访问",
+};
+
+function minAccess(left: McpAccessLevel, right: McpAccessLevel): McpAccessLevel {
+  return ACCESS_RANK[left] <= ACCESS_RANK[right] ? left : right;
+}
+
+function legacyAccessRule(connection: Connection): {
+  visible: boolean;
+  access: McpAccessLevel;
+  confirm: McpConfirmLevel;
+} {
+  if (connection.mcpAccess === "disabled") {
+    return { visible: false, access: "none", confirm: "high" };
+  }
+  if (connection.mcpAccess === "read_only") {
+    return { visible: true, access: "read", confirm: "high" };
+  }
+  return connection.environment === "dev"
+    ? { visible: true, access: "full", confirm: "high" }
+    : { visible: true, access: "full", confirm: "medium" };
+}
+
+function findMockRule(policy: McpPolicy, target: McpRuleTarget) {
+  return policy.rules.find((rule) =>
+    target.kind === "group"
+      ? rule.target.kind === "group" && rule.target.name === target.name
+      : rule.target.kind === "connection" && rule.target.id === target.id,
+  );
+}
+
+function applyLegacyAccessRule(policy: McpPolicy, connection: Connection): void {
+  const legacy = legacyAccessRule(connection);
+  const existing = findMockRule(policy, {
+    kind: "connection",
+    id: connection.id,
+  });
+  if (existing) {
+    existing.visible = legacy.visible;
+    existing.access = legacy.access;
+    existing.confirm = legacy.confirm;
+  } else {
+    policy.rules.push({
+      target: { kind: "connection", id: connection.id },
+      ...legacy,
+    });
+  }
+}
+
+function mockEffective(
+  policy: McpPolicy,
+  connection: Connection,
+): McpConnectionAccess {
+  let access = policy.defaults.access;
+  let confirm = policy.defaults.confirm;
+  let source: McpAccessSource = "global";
+  let confirmSource: McpAccessSource = "global";
+  let groupName: string | null = null;
+  let visibleOverride: boolean | null = null;
+
+  const groupRule = findMockRule(policy, {
+    kind: "group",
+    name: connection.group.trim(),
+  });
+  if (groupRule) {
+    if (groupRule.access) {
+      access = groupRule.access;
+      source = "group";
+      groupName = connection.group;
+    }
+    if (groupRule.confirm) {
+      confirm = groupRule.confirm;
+      confirmSource = "group";
+    }
+    if (groupRule.visible != null) visibleOverride = groupRule.visible;
+  }
+
+  const connectionRule = findMockRule(policy, {
+    kind: "connection",
+    id: connection.id,
+  });
+  if (connectionRule) {
+    if (connectionRule.access) {
+      access = connectionRule.access;
+      source = "connection";
+      groupName = null;
+    }
+    if (connectionRule.confirm) {
+      confirm = connectionRule.confirm;
+      confirmSource = "connection";
+    }
+    if (connectionRule.visible != null) visibleOverride = connectionRule.visible;
+  }
+
+  const visible =
+    (policy.visibility === "all"
+      ? (visibleOverride ?? true)
+      : (visibleOverride ?? false)) && access !== "none";
+  const caps = policy.capabilities[connection.id] ?? {};
+  return {
+    connectionId: connection.id,
+    alias: connection.alias,
+    group: connection.group,
+    environment: connection.environment,
+    visible,
+    access,
+    confirm,
+    source,
+    confirmSource,
+    groupName,
+    sftpAccess: minAccess(access, caps.sftp ?? "full"),
+    forwardingAccess: minAccess(access, caps.forwarding ?? "full"),
+    ptyEnabled: connection.mcpPtyEnabled,
+    ptyAllowed:
+      visible && ACCESS_RANK[access] >= ACCESS_RANK.full && connection.mcpPtyEnabled,
+  };
+}
+
+let mockMcpPolicy: McpPolicy = {
+  version: 2,
+  defaults: { access: "read", confirm: "high" },
+  visibility: "all",
+  rules: [],
+  capabilities: {},
+  tools: {},
+};
+for (const connection of demoConnections) {
+  applyLegacyAccessRule(mockMcpPolicy, connection);
+}
+
+function mockPolicySnapshot(policy: McpPolicy): McpPolicySnapshot {
+  return {
+    policy,
+    connections: mockState.connections.map((connection) =>
+      mockEffective(policy, connection),
+    ),
+    tools: MOCK_MCP_TOOLS.map((tool) => ({
+      ...tool,
+      enabled: policy.tools[tool.name] ?? true,
+    })),
+  };
+}
+
 const HIGH_RISK = [
   ["rm ", "包含删除操作"],
   ["systemctl restart", "重启系统服务"],
@@ -408,11 +603,33 @@ function decide(
   if (base.risk === "critical") {
     return { action: "block", risk: base.risk, reasons: base.reasons, ruleId: "critical-destructive" };
   }
-  if (source === "agent" && connection.mcpAccess === "disabled") {
-    return { action: "block", risk: base.risk, reasons: ["该连接未授权给 MCP"], ruleId: "mcp-not-authorized" };
-  }
-  if (source === "agent" && connection.mcpAccess === "read_only" && base.risk !== "low") {
-    return { action: "block", risk: base.risk, reasons: ["该连接对 MCP 为只读模式，仅允许低风险命令"], ruleId: "mcp-read-only" };
+  if (source === "agent") {
+    const effective = mockEffective(mockMcpPolicy, connection);
+    const required: McpAccessLevel =
+      base.risk === "low" ? "read" : base.risk === "medium" ? "write" : "full";
+    if (!effective.visible || effective.access === "none") {
+      return { action: "block", risk: base.risk, reasons: [...base.reasons, "该连接对 MCP 不可见或不可访问"], ruleId: "mcp-policy-hidden" };
+    }
+    if (ACCESS_RANK[required] > ACCESS_RANK[effective.access]) {
+      return {
+        action: "block",
+        risk: base.risk,
+        reasons: [...base.reasons, `MCP 权限不足：需要${ACCESS_LABELS[required]}，当前${ACCESS_LABELS[effective.access]}`],
+        ruleId: "mcp-policy-level",
+      };
+    }
+    const needsConfirm =
+      effective.confirm === "high"
+        ? required === "full"
+        : effective.confirm === "medium"
+          ? ACCESS_RANK[required] >= ACCESS_RANK.write
+          : false;
+    return {
+      action: needsConfirm ? "require_approval" : "allow",
+      risk: base.risk,
+      reasons: [...base.reasons, `MCP 策略允许（${ACCESS_LABELS[effective.access]}）`],
+      ruleId: "mcp-policy",
+    };
   }
   const matrix: Record<Connection["environment"], Record<RiskLevel, PolicyAction>> = {
     dev: { low: "allow", medium: "allow", high: "require_approval", critical: "block" },
@@ -642,11 +859,31 @@ const mock = {
     mockState.connections = existing
       ? mockState.connections.map((c) => (c.id === connection.id ? connection : c))
       : [...mockState.connections, connection];
+    if (
+      !existing ||
+      existing.mcpAccess !== connection.mcpAccess ||
+      existing.environment !== connection.environment
+    ) {
+      applyLegacyAccessRule(mockMcpPolicy, connection);
+    }
     return connection;
   },
 
   async deleteConnection(id: string) {
     mockState.connections = mockState.connections.filter((c) => c.id !== id);
+    mockMcpPolicy.rules = mockMcpPolicy.rules.filter(
+      (rule) => !(rule.target.kind === "connection" && rule.target.id === id),
+    );
+    delete mockMcpPolicy.capabilities[id];
+  },
+
+  async getMcpPolicy(): Promise<McpPolicySnapshot> {
+    return mockPolicySnapshot(mockMcpPolicy);
+  },
+
+  async saveMcpPolicy(policy: McpPolicy): Promise<McpPolicySnapshot> {
+    mockMcpPolicy = { ...policy, version: 2 };
+    return mockPolicySnapshot(mockMcpPolicy);
   },
 
   async runCommand(request: CommandRequest): Promise<CommandOutcome> {
@@ -961,32 +1198,13 @@ const mock = {
       transport: "stdio",
       command: "shellx --mcp-stdio",
       status: "ready",
-      tools: [
-        { name: "list_servers", description: "列出已授权给 MCP 的服务器元信息", risk: "low" },
-        { name: "exec_command", description: "在已授权服务器上执行命令（受策略引擎约束）", risk: "medium" },
-        { name: "read_output", description: "分页读取会话输出", risk: "low" },
-        { name: "send_signal", description: "向会话发送中断信号", risk: "medium" },
-        { name: "close_session", description: "关闭指定会话", risk: "medium" },
-        { name: "sftp_open", description: "打开 SFTP 文件会话", risk: "low" },
-        { name: "sftp_close", description: "关闭 SFTP 文件会话", risk: "low" },
-        { name: "sftp_list", description: "列出远端目录", risk: "low" },
-        { name: "sftp_stat", description: "读取远端路径元信息", risk: "low" },
-        { name: "sftp_read_file", description: "读取远端文件内容", risk: "low" },
-        { name: "sftp_write_file", description: "创建或覆盖远端文件", risk: "medium" },
-        { name: "sftp_mkdir", description: "创建远端目录", risk: "medium" },
-        { name: "sftp_remove", description: "删除远端文件或目录", risk: "medium" },
-        { name: "sftp_rename", description: "重命名远端路径", risk: "medium" },
-        { name: "list_forward_rules", description: "列出端口转发规则与状态", risk: "low" },
-        { name: "start_forward", description: "启动预定义转发规则", risk: "medium" },
-        { name: "stop_forward", description: "停止转发规则", risk: "medium" },
-        { name: "terminal_open", description: "打开交互式 PTY（危险，需显式开启）", risk: "high" },
-        { name: "terminal_write", description: "向交互式终端发送输入", risk: "high" },
-        { name: "terminal_read", description: "读取交互式终端输出", risk: "medium" },
-        { name: "terminal_resize", description: "调整终端窗口大小", risk: "low" },
-        { name: "terminal_signal", description: "向终端前台进程发送信号", risk: "medium" },
-        { name: "terminal_close", description: "关闭交互式终端", risk: "low" },
-      ],
-      authorizedConnections: mockState.connections.filter((c) => c.mcpAccess !== "disabled").length,
+      tools: MOCK_MCP_TOOLS.map((tool) => ({ ...tool })),
+      enabledTools: MOCK_MCP_TOOLS.filter(
+        (tool) => mockMcpPolicy.tools[tool.name] ?? true,
+      ).length,
+      authorizedConnections: mockState.connections.filter(
+        (connection) => mockEffective(mockMcpPolicy, connection).visible,
+      ).length,
       activeSessions: 0,
     };
   },

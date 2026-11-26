@@ -41,12 +41,6 @@ impl Default for McpAccessMode {
     }
 }
 
-impl McpAccessMode {
-    pub fn is_authorized(self) -> bool {
-        !matches!(self, McpAccessMode::Disabled)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthKind {
@@ -352,6 +346,7 @@ pub struct McpServerInfo {
     pub command: String,
     pub status: String,
     pub tools: Vec<McpToolInfo>,
+    pub enabled_tools: usize,
     pub authorized_connections: usize,
     pub active_sessions: usize,
 }

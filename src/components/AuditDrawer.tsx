@@ -9,13 +9,14 @@ import {
 
 interface Props {
   onClose: () => void;
+  initialFilter?: string;
 }
 
-export default function AuditDrawer({ onClose }: Props) {
+export default function AuditDrawer({ onClose, initialFilter = "" }: Props) {
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [filter, setFilter] = useState("");
+  const [filter, setFilter] = useState(initialFilter);
 
   const load = useCallback(async () => {
     setLoading(true);

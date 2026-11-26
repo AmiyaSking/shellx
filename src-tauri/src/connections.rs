@@ -40,13 +40,6 @@ impl ConnectionStore {
             .cloned()
     }
 
-    pub fn authorized_count(&self) -> usize {
-        self.connections
-            .iter()
-            .filter(|connection| connection.mcp_access.is_authorized())
-            .count()
-    }
-
     pub fn upsert(&mut self, input: ConnectionInput) -> Result<Connection, String> {
         if input.alias.trim().is_empty() {
             return Err("连接别名不能为空".into());

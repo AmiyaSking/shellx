@@ -1,5 +1,9 @@
+use crate::mcp_access::{
+    required_level_for_risk, AccessLevel, Capability, McpPolicy,
+};
 use crate::models::{
-    AuditSource, Environment, McpAccessMode, PolicyAction, PolicyDecision, RiskLevel,
+    AuditSource, Connection, Environment, McpAccessMode, PolicyAction, PolicyDecision,
+    RiskLevel,
 };
 use crate::shell::{self, Segment};
 
@@ -25,7 +29,7 @@ impl PolicyEngine {
 
         // Catastrophic commands are blocked for everyone, including manual use.
         if risk == RiskLevel::Critical {
-            return policy(PolicyAction::Block, risk, reasons, "critical-destructive");
+            return policy_decision(PolicyAction::Block, risk, reasons, "critical-destructive");
         }
 
         // MCP authorization gates only agent-originated calls.
@@ -33,11 +37,11 @@ impl PolicyEngine {
             match mcp_access {
                 McpAccessMode::Disabled => {
                     reasons.push("该连接未授权给 MCP".into());
-                    return policy(PolicyAction::Block, risk, reasons, "mcp-not-authorized");
+                    return policy_decision(PolicyAction::Block, risk, reasons, "mcp-not-authorized");
                 }
                 McpAccessMode::ReadOnly if risk != RiskLevel::Low => {
                     reasons.push("该连接对 MCP 为只读模式，仅允许低风险命令".into());
-                    return policy(PolicyAction::Block, risk, reasons, "mcp-read-only");
+                    return policy_decision(PolicyAction::Block, risk, reasons, "mcp-read-only");
                 }
                 _ => {}
             }
@@ -67,9 +71,104 @@ impl PolicyEngine {
             rule_id: Some(format!("env-{}", environment.label())),
         }
     }
+
+    /// Evaluate an agent command against the configurable MCP policy.
+    ///
+    /// The legacy environment matrix remains in [`Self::evaluate`] for manual
+    /// GUI commands. Critical commands are still hard-blocked here.
+    pub fn evaluate_agent(
+        &self,
+        policy: &McpPolicy,
+        connection: &Connection,
+        command: &str,
+    ) -> PolicyDecision {
+        let (risk, mut reasons) = classify(command);
+        if risk == RiskLevel::Critical {
+            return policy_decision(
+                PolicyAction::Block,
+                risk,
+                reasons,
+                "critical-destructive",
+            );
+        }
+        let Some(required) = required_level_for_risk(risk) else {
+            return policy_decision(
+                PolicyAction::Block,
+                risk,
+                reasons,
+                "critical-destructive",
+            );
+        };
+
+        let verdict = policy.check(connection, Capability::Exec, required);
+        if !verdict.visible || verdict.effective == AccessLevel::None {
+            push_unique(&mut reasons, "该连接对 MCP 不可见或不可访问".into());
+            return policy_decision(
+                PolicyAction::Block,
+                risk,
+                reasons,
+                "mcp-policy-hidden",
+            );
+        }
+        if !verdict.allowed {
+            push_unique(
+                &mut reasons,
+                format!(
+                    "MCP 权限不足：需要{}，当前{}（来源：{}）",
+                    required.label(),
+                    verdict.effective.label(),
+                    verdict.source.label()
+                ),
+            );
+            return policy_decision(
+                PolicyAction::Block,
+                risk,
+                reasons,
+                "mcp-policy-level",
+            );
+        }
+
+        let action = if verdict.needs_confirmation {
+            push_unique(
+                &mut reasons,
+                format!(
+                    "MCP 策略要求{}级命令人工确认（确认阈值：{}）",
+                    risk_label(risk),
+                    verdict.confirm.label()
+                ),
+            );
+            PolicyAction::RequireApproval
+        } else {
+            push_unique(
+                &mut reasons,
+                format!(
+                    "MCP 策略允许（{}，来源：{}）",
+                    verdict.effective.label(),
+                    verdict.source.label()
+                ),
+            );
+            PolicyAction::Allow
+        };
+
+        PolicyDecision {
+            action,
+            risk,
+            reasons,
+            rule_id: Some("mcp-policy".into()),
+        }
+    }
 }
 
-fn policy(
+fn risk_label(risk: RiskLevel) -> &'static str {
+    match risk {
+        RiskLevel::Low => "低风险",
+        RiskLevel::Medium => "中风险",
+        RiskLevel::High => "高风险",
+        RiskLevel::Critical => "极高危",
+    }
+}
+
+fn policy_decision(
     action: PolicyAction,
     risk: RiskLevel,
     reasons: Vec<String>,

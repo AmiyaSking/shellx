@@ -5,6 +5,7 @@ mod connections;
 mod encoding;
 mod forwards;
 mod mcp;
+mod mcp_access;
 mod mcp_pty;
 mod mcp_stdio;
 mod models;
@@ -60,6 +61,8 @@ pub fn run() {
             commands::list_sessions,
             commands::close_session,
             commands::mcp_server_info,
+            commands::get_mcp_policy,
+            commands::save_mcp_policy,
             commands::pty_open,
             commands::pty_cancel,
             commands::auth_respond,

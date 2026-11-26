@@ -156,8 +156,78 @@ export interface McpServerInfo {
   command: string;
   status: "scaffold" | "ready" | "running" | "stopped";
   tools: McpToolInfo[];
+  enabledTools: number;
   authorizedConnections: number;
   activeSessions: number;
+}
+
+/* ------------------------------------------------------------------ */
+/* Configurable MCP access policy                                      */
+/* ------------------------------------------------------------------ */
+
+export type McpAccessLevel = "none" | "read" | "write" | "full";
+export type McpConfirmLevel = "off" | "medium" | "high";
+export type McpVisibilityMode = "all" | "selected";
+export type McpAccessSource = "global" | "group" | "connection";
+
+export interface McpPolicyDefaults {
+  access: McpAccessLevel;
+  confirm: McpConfirmLevel;
+}
+
+export type McpRuleTarget =
+  | { kind: "group"; name: string }
+  | { kind: "connection"; id: string };
+
+export interface McpPolicyRule {
+  target: McpRuleTarget;
+  visible?: boolean | null;
+  access?: McpAccessLevel | null;
+  confirm?: McpConfirmLevel | null;
+}
+
+export interface McpCapabilityOverrides {
+  sftp?: McpAccessLevel | null;
+  forwarding?: McpAccessLevel | null;
+}
+
+export interface McpPolicy {
+  version: number;
+  defaults: McpPolicyDefaults;
+  visibility: McpVisibilityMode;
+  rules: McpPolicyRule[];
+  capabilities: Record<string, McpCapabilityOverrides>;
+  tools: Record<string, boolean>;
+}
+
+export interface McpConnectionAccess {
+  connectionId: string;
+  alias: string;
+  group: string;
+  environment: Environment;
+  visible: boolean;
+  access: McpAccessLevel;
+  confirm: McpConfirmLevel;
+  source: McpAccessSource;
+  confirmSource: McpAccessSource;
+  groupName?: string | null;
+  sftpAccess: McpAccessLevel;
+  forwardingAccess: McpAccessLevel;
+  ptyEnabled: boolean;
+  ptyAllowed: boolean;
+}
+
+export interface McpToolState {
+  name: string;
+  description: string;
+  risk: RiskLevel;
+  enabled: boolean;
+}
+
+export interface McpPolicySnapshot {
+  policy: McpPolicy;
+  connections: McpConnectionAccess[];
+  tools: McpToolState[];
 }
 
 /* ------------------------------------------------------------------ */

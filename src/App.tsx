@@ -26,6 +26,7 @@ import AuditDrawer from "./components/AuditDrawer";
 import AuthPromptDialog from "./components/AuthPromptDialog";
 import ConnectionModal from "./components/ConnectionModal";
 import ForwardDrawer from "./components/ForwardDrawer";
+import McpPolicyDrawer from "./components/McpPolicyDrawer";
 import SettingsDrawer from "./components/SettingsDrawer";
 import SftpDrawer from "./components/SftpDrawer";
 import Sidebar from "./components/Sidebar";
@@ -92,6 +93,8 @@ export default function App() {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [auditOpen, setAuditOpen] = useState(false);
+  const [auditFilter, setAuditFilter] = useState("");
+  const [mcpPolicyOpen, setMcpPolicyOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [forwardOpen, setForwardOpen] = useState(false);
@@ -695,6 +698,7 @@ export default function App() {
               setSftpOpen(false);
               setAuditOpen(false);
               setSettingsOpen(false);
+              setMcpPolicyOpen(false);
             }}
           >
             转发
@@ -706,6 +710,7 @@ export default function App() {
               setAuditOpen(false);
               setForwardOpen(false);
               setSftpOpen(false);
+              setMcpPolicyOpen(false);
             }}
           >
             设置
@@ -713,10 +718,12 @@ export default function App() {
           <button
             className="btn btn-ghost"
             onClick={() => {
+              setAuditFilter("");
               setAuditOpen(true);
               setSettingsOpen(false);
               setForwardOpen(false);
               setSftpOpen(false);
+              setMcpPolicyOpen(false);
             }}
           >
             审计日志
@@ -746,6 +753,13 @@ export default function App() {
             setModal(null);
           }}
           onEdit={(connection) => setModal({ mode: "edit", connection })}
+          onOpenMcpPolicy={() => {
+            setMcpPolicyOpen(true);
+            setAuditOpen(false);
+            setSettingsOpen(false);
+            setForwardOpen(false);
+            setSftpOpen(false);
+          }}
         />
 
         <main className="workspace">
@@ -832,7 +846,23 @@ export default function App() {
         </main>
       </div>
 
-      {auditOpen && <AuditDrawer onClose={() => setAuditOpen(false)} />}
+      {auditOpen && (
+        <AuditDrawer
+          initialFilter={auditFilter}
+          onClose={() => setAuditOpen(false)}
+        />
+      )}
+      {mcpPolicyOpen && (
+        <McpPolicyDrawer
+          onClose={() => setMcpPolicyOpen(false)}
+          onSaved={() => void refreshMcpInfo()}
+          onOpenAudit={(filter) => {
+            setMcpPolicyOpen(false);
+            setAuditFilter(filter);
+            setAuditOpen(true);
+          }}
+        />
+      )}
       {settingsOpen && <SettingsDrawer onClose={() => setSettingsOpen(false)} />}
       {forwardOpen && (
         <ForwardDrawer

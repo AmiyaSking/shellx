@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::encoding::base64_decode;
 use crate::forwards::ForwardManager;
+use crate::mcp_access::{AccessLevel, Capability, McpPolicy};
 use crate::mcp_pty::McpPtyManager;
 use crate::models::{
     AuditSource, CommandOutcome, CommandRequest, McpToolInfo, RiskLevel,
@@ -171,10 +172,39 @@ pub fn tool_catalog() -> Vec<McpToolInfo> {
         .collect()
 }
 
-/// JSON definitions returned by `tools/list`.
-pub fn tool_definitions() -> Vec<Value> {
+/// Payload for the MCP permission page: stored policy, effective values and
+/// the tool catalog with enabled flags.
+pub fn policy_snapshot(state: &AppState) -> Result<Value, String> {
+    let policy = state.mcp_policy()?;
+    let connections: Vec<_> = state
+        .list_connections()?
+        .iter()
+        .map(|connection| policy.describe(connection))
+        .collect();
+    let tools: Vec<Value> = TOOL_CATALOG
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "risk": tool.risk,
+                "enabled": policy.tool_enabled(tool.name)
+            })
+        })
+        .collect();
+    serde_json::to_value(json!({
+        "policy": policy,
+        "connections": connections,
+        "tools": tools
+    }))
+    .map_err(|error| error.to_string())
+}
+
+/// JSON definitions returned by `tools/list`, with disabled tools removed.
+pub fn tool_definitions(policy: &McpPolicy) -> Vec<Value> {
     TOOL_CATALOG
         .iter()
+        .filter(|tool| policy.tool_enabled(tool.name))
         .map(|tool| {
             let schema = match tool.name {
                 "exec_command" => json!({
@@ -514,12 +544,15 @@ pub async fn dispatch_tool(
     name: &str,
     arguments: Value,
 ) -> Result<Value, String> {
+    let policy = state.mcp_policy()?;
+    if !policy.tool_enabled(name) {
+        return Err(format!("MCP 工具 {name} 已被权限策略禁用"));
+    }
     match name {
         "list_servers" => {
             let servers: Vec<Value> = state
-                .list_connections()?
+                .mcp_visible_connections()?
                 .into_iter()
-                .filter(|connection| connection.mcp_access.is_authorized())
                 .map(|connection| {
                     json!({
                         "id": connection.id,
@@ -527,6 +560,7 @@ pub async fn dispatch_tool(
                         "group": connection.group,
                         "environment": connection.environment,
                         "mcpAccess": connection.mcp_access,
+                        "access": policy.effective(&connection).access,
                         "tags": connection.tags
                     })
                 })
@@ -614,7 +648,12 @@ pub async fn dispatch_tool(
         "sftp_open" => {
             let connection_id = string_arg(&arguments, "connection_id", "connectionId")?;
             let connection =
-                state.authorize_sftp(connection_id, false, "打开 SFTP 会话")?;
+                state.authorize_mcp_capability(
+                    connection_id,
+                    Capability::Sftp,
+                    AccessLevel::Read,
+                    "打开 SFTP 会话",
+                )?;
             let params = state.sftp_params(connection_id)?;
             let session_id = Uuid::new_v4().to_string();
             let opened = services
@@ -648,7 +687,12 @@ pub async fn dispatch_tool(
         "sftp_list" => {
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
             let connection_id = sftp_connection(&services.sftp, session_id)?;
-            state.authorize_sftp(&connection_id, false, "列出 SFTP 目录")?;
+            state.authorize_mcp_capability(
+                &connection_id,
+                Capability::Sftp,
+                AccessLevel::Read,
+                "列出 SFTP 目录",
+            )?;
             let path = arguments
                 .get("path")
                 .and_then(Value::as_str)
@@ -660,7 +704,12 @@ pub async fn dispatch_tool(
         "sftp_stat" => {
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
             let connection_id = sftp_connection(&services.sftp, session_id)?;
-            state.authorize_sftp(&connection_id, false, "读取 SFTP 元信息")?;
+            state.authorize_mcp_capability(
+                &connection_id,
+                Capability::Sftp,
+                AccessLevel::Read,
+                "读取 SFTP 元信息",
+            )?;
             let path = string_arg(&arguments, "path", "path")?.to_string();
             let entry = services.sftp.stat(session_id, path).await?;
             serde_json::to_value(entry).map_err(|error| error.to_string())
@@ -668,7 +717,12 @@ pub async fn dispatch_tool(
         "sftp_read_file" => {
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
             let connection_id = sftp_connection(&services.sftp, session_id)?;
-            state.authorize_sftp(&connection_id, false, "读取 SFTP 文件")?;
+            state.authorize_mcp_capability(
+                &connection_id,
+                Capability::Sftp,
+                AccessLevel::Read,
+                "读取 SFTP 文件",
+            )?;
             let path = string_arg(&arguments, "path", "path")?.to_string();
             let max_bytes = arguments
                 .get("max_bytes")
@@ -691,9 +745,10 @@ pub async fn dispatch_tool(
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
             let path = string_arg(&arguments, "path", "path")?.to_string();
             let connection_id = sftp_connection(&services.sftp, session_id)?;
-            state.authorize_sftp(
+            state.authorize_mcp_capability(
                 &connection_id,
-                true,
+                Capability::Sftp,
+                AccessLevel::Write,
                 &format!("写入 SFTP 文件 {path}"),
             )?;
             let content = string_arg(&arguments, "content", "content")?;
@@ -729,9 +784,10 @@ pub async fn dispatch_tool(
             let session_id = string_arg(&arguments, "session_id", "sessionId")?;
             let path = string_arg(&arguments, "path", "path")?.to_string();
             let connection_id = sftp_connection(&services.sftp, session_id)?;
-            state.authorize_sftp(
+            state.authorize_mcp_capability(
                 &connection_id,
-                true,
+                Capability::Sftp,
+                AccessLevel::Write,
                 &format!("创建 SFTP 目录 {path}"),
             )?;
             services.sftp.create_dir(session_id, path.clone()).await?;
@@ -756,9 +812,12 @@ pub async fn dispatch_tool(
                 return Err("删除目录需要显式传入 recursive=true".into());
             }
             let connection_id = sftp_connection(&services.sftp, session_id)?;
-            state.authorize_sftp(
+            // Delete stays at Write so the legacy dev/staging matrix keeps its
+            // old behaviour; operators can cap SFTP separately if needed.
+            state.authorize_mcp_capability(
                 &connection_id,
-                true,
+                Capability::Sftp,
+                AccessLevel::Write,
                 &format!("删除 SFTP 路径 {path}"),
             )?;
             services.sftp.remove(session_id, path.clone(), is_dir).await?;
@@ -776,9 +835,10 @@ pub async fn dispatch_tool(
             let old_path = string_arg(&arguments, "old_path", "oldPath")?.to_string();
             let new_path = string_arg(&arguments, "new_path", "newPath")?.to_string();
             let connection_id = sftp_connection(&services.sftp, session_id)?;
-            state.authorize_sftp(
+            state.authorize_mcp_capability(
                 &connection_id,
-                true,
+                Capability::Sftp,
+                AccessLevel::Write,
                 &format!("重命名 SFTP 路径 {old_path} -> {new_path}"),
             )?;
             services.sftp.rename(session_id, old_path.clone(), new_path.clone())
@@ -817,9 +877,10 @@ pub async fn dispatch_tool(
         "start_forward" => {
             let rule_id = string_arg(&arguments, "rule_id", "ruleId")?;
             let rule = state.get_forward_rule(rule_id)?;
-            let connection = state.authorize_mcp_action(
+            let connection = state.authorize_mcp_capability(
                 &rule.connection_id,
-                true,
+                Capability::Forwarding,
+                AccessLevel::Write,
                 &format!("启动端口转发规则 {}", rule.id),
             )?;
             if !is_loopback_bind(&rule.bind_host) {
