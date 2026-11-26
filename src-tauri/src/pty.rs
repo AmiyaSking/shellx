@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,6 +36,151 @@ pub const EVENT_CLOSED: &str = "pty:closed";
 /// Keyboard-interactive/2FA waits for the user, so this is generous; the UI
 /// can cancel at any time.
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Coalesce output for about half a 60 Hz frame. A busy command produces
+/// thousands of tiny SSH packets per second; sending one IPC event per packet
+/// swamps the webview and makes xterm.js re-render needlessly.
+const OUTPUT_BATCH_WINDOW: Duration = Duration::from_millis(8);
+/// Upper bound for one output event, so a single IPC message stays small.
+const OUTPUT_BATCH_MAX_BYTES: usize = 64 * 1024;
+/// Unacknowledged bytes allowed in flight to the webview. When the terminal
+/// falls behind, the pump stops reading; russh's bounded channel fills and TCP
+/// backpressure eventually throttles the remote process instead of growing an
+/// unbounded queue in the UI.
+const OUTPUT_IN_FLIGHT_LIMIT: usize = 1024 * 1024;
+
+/// Byte-budget flow control between the SSH reader and xterm.
+///
+/// The pump reserves bytes before emitting an event; the frontend returns them
+/// with `pty_ack` once xterm has parsed that batch. A slow renderer therefore
+/// applies real backpressure all the way to the remote PTY.
+struct OutputFlow {
+    in_flight: AtomicUsize,
+    wake: Notify,
+    closed: AtomicBool,
+}
+
+impl OutputFlow {
+    fn new() -> Self {
+        Self {
+            in_flight: AtomicUsize::new(0),
+            wake: Notify::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    /// Wait until `bytes` fit in the budget, then reserve them.
+    async fn reserve(&self, bytes: usize) {
+        let bytes = bytes.min(OUTPUT_IN_FLIGHT_LIMIT);
+        if bytes == 0 {
+            return;
+        }
+        loop {
+            // Register before re-checking the budget: `notify_one` stores a
+            // permit, so an ACK racing with this wait is not lost.
+            let notified = self.wake.notified();
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let current = self.in_flight.load(Ordering::Acquire);
+            if current + bytes <= OUTPUT_IN_FLIGHT_LIMIT
+                && self
+                    .in_flight
+                    .compare_exchange_weak(
+                        current,
+                        current + bytes,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Return `bytes` to the budget after the terminal consumed them.
+    fn ack(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let bytes = bytes.min(OUTPUT_IN_FLIGHT_LIMIT);
+        let mut current = self.in_flight.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.in_flight.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+        self.wake.notify_one();
+    }
+
+    /// Release a pump blocked on the budget when its session goes away.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+}
+
+/// Output accumulated for the next IPC event.
+struct OutputBatch {
+    data: Vec<u8>,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl OutputBatch {
+    fn new() -> Self {
+        Self {
+            data: Vec::with_capacity(OUTPUT_BATCH_MAX_BYTES),
+            deadline: None,
+        }
+    }
+
+    /// Append decoded bytes. Returns true when the batch should be flushed now.
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        self.data.extend_from_slice(bytes);
+        if self.deadline.is_none() {
+            self.deadline = Some(tokio::time::Instant::now() + OUTPUT_BATCH_WINDOW);
+        }
+        self.data.len() >= OUTPUT_BATCH_MAX_BYTES
+    }
+
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
+    }
+
+    /// Reserve flow-control budget, base64-encode and emit one batch.
+    /// Returns false when the window is gone and the pump should stop.
+    async fn flush(
+        &mut self,
+        app: &AppHandle,
+        session_id: &str,
+        flow: &OutputFlow,
+    ) -> bool {
+        if self.data.is_empty() {
+            self.deadline = None;
+            return true;
+        }
+        flow.reserve(self.data.len()).await;
+        let payload = PtyOutputPayload {
+            session_id: session_id.to_string(),
+            data: base64_encode(&self.data),
+        };
+        self.data.clear();
+        self.deadline = None;
+        app.emit(EVENT_OUTPUT, payload).is_ok()
+    }
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -142,6 +287,7 @@ struct PtyEntry {
     task: JoinHandle<()>,
     meta: SessionMeta,
     encoding: &'static Encoding,
+    flow: Arc<OutputFlow>,
 }
 
 /// Holds every live PTY session and the in-flight connection attempts that can
@@ -260,9 +406,11 @@ impl PtyManager {
 
         let conn = Arc::new(conn);
         let host_key = conn.host_key().clone();
+        let flow = Arc::new(OutputFlow::new());
 
         let pump_id = session_id.clone();
         let pump_app = app.clone();
+        let pump_flow = flow.clone();
         let runtime = runtime().map_err(SshError::Connect)?;
         let task = runtime.spawn(async move {
             let mut log: Option<BufWriter<File>> = None;
@@ -272,9 +420,25 @@ impl PtyManager {
             } else {
                 Some(encoding.new_decoder())
             };
+            let mut batch = OutputBatch::new();
 
             loop {
-                match reader.next_event().await {
+                let event = match batch.deadline() {
+                    Some(deadline) => {
+                        tokio::select! {
+                            event = reader.next_event() => event,
+                            _ = tokio::time::sleep_until(deadline) => {
+                                if !batch.flush(&pump_app, &pump_id, &pump_flow).await {
+                                    break;
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    None => reader.next_event().await,
+                };
+
+                match event {
                     PtyEvent::Data(bytes) => {
                         if logging.load(Ordering::Relaxed) && !log_attempted {
                             log_attempted = true;
@@ -309,19 +473,17 @@ impl PtyManager {
                         } else {
                             bytes
                         };
-                        if !output.is_empty() {
-                            let payload = PtyOutputPayload {
-                                session_id: pump_id.clone(),
-                                data: base64_encode(&output),
-                            };
-                            // A failed emit means the window is gone: stop reading.
-                            if pump_app.emit(EVENT_OUTPUT, payload).is_err() {
-                                break;
-                            }
+                        if batch.push(&output)
+                            && !batch.flush(&pump_app, &pump_id, &pump_flow).await
+                        {
+                            break;
                         }
                     }
                     PtyEvent::Exit(exit_code) => {
-                        emit_decoder_tail(&pump_app, &pump_id, decoder.as_mut());
+                        append_decoder_tail(&mut batch, decoder.as_mut());
+                        if !batch.flush(&pump_app, &pump_id, &pump_flow).await {
+                            break;
+                        }
                         let _ = pump_app.emit(
                             EVENT_EXIT,
                             PtyExitPayload {
@@ -332,7 +494,10 @@ impl PtyManager {
                         close_session_log(&mut log);
                     }
                     PtyEvent::Closed => {
-                        emit_decoder_tail(&pump_app, &pump_id, decoder.as_mut());
+                        append_decoder_tail(&mut batch, decoder.as_mut());
+                        // A failed emit means the window is gone; there is
+                        // still nothing left to deliver on close.
+                        let _ = batch.flush(&pump_app, &pump_id, &pump_flow).await;
                         let _ = pump_app.emit(
                             EVENT_CLOSED,
                             PtyClosedPayload {
@@ -345,6 +510,7 @@ impl PtyManager {
                 }
             }
 
+            pump_flow.close();
             close_session_log(&mut log);
         });
 
@@ -356,8 +522,10 @@ impl PtyManager {
                 task,
                 meta,
                 encoding,
+                flow,
             },
         ) {
+            previous.flow.close();
             previous.task.abort();
         }
         Ok(host_key)
@@ -373,6 +541,23 @@ impl PtyManager {
         };
         let data = encode_input(encoding, data);
         run(async move { conn.write(&data).await }).await
+    }
+
+    /// Return consumed output bytes to the session's flow-control budget.
+    /// Unknown sessions are ignored because an ACK can race with `pty_close`.
+    pub fn ack_output(&self, session_id: &str, bytes: usize) -> bool {
+        let flow = self
+            .entries
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(session_id).map(|entry| entry.flow.clone()));
+        match flow {
+            Some(flow) => {
+                flow.ack(bytes);
+                true
+            }
+            None => false,
+        }
     }
 
     pub async fn resize(&self, session_id: &str, cols: u32, rows: u32) -> Result<(), String> {
@@ -397,6 +582,7 @@ impl PtyManager {
             Ok::<(), SshError>(())
         })
         .await;
+        entry.flow.close();
         entry.task.abort();
         Ok(Some(entry.meta))
     }
@@ -411,6 +597,7 @@ impl PtyManager {
             .unwrap_or_default();
         let count = drained.len();
         for (_, entry) in drained {
+            entry.flow.close();
             entry.task.abort();
             drop(entry.conn);
         }
@@ -511,25 +698,16 @@ fn flush_decoder(decoder: &mut Decoder) -> Vec<u8> {
     text.into_bytes()
 }
 
-fn emit_decoder_tail(
-    app: &AppHandle,
-    session_id: &str,
-    decoder: Option<&mut Decoder>,
-) {
+fn append_decoder_tail(batch: &mut OutputBatch, decoder: Option<&mut Decoder>) {
     let Some(decoder) = decoder else {
         return;
     };
     let tail = flush_decoder(decoder);
-    if tail.is_empty() {
-        return;
+    if !tail.is_empty() {
+        // The batch is flushed immediately afterwards. If this happens to
+        // exceed the soft cap, one event simply carries a few extra bytes.
+        let _ = batch.push(&tail);
     }
-    let _ = app.emit(
-        EVENT_OUTPUT,
-        PtyOutputPayload {
-            session_id: session_id.to_string(),
-            data: base64_encode(&tail),
-        },
-    );
 }
 
 #[cfg(test)]
@@ -604,6 +782,86 @@ mod tests {
         assert!(manager.session_logging_enabled());
         manager.set_session_logging(false);
         assert!(!manager.session_logging_enabled());
+    }
+
+    #[test]
+    fn output_batches_coalesce_until_the_frame_deadline() {
+        let mut batch = OutputBatch::new();
+        assert!(!batch.push(b"a"));
+        assert!(batch.deadline().is_some());
+        assert!(!batch.push(b"bc"));
+        assert_eq!(batch.data, b"abc");
+
+        // Reaching the soft cap asks the pump to flush immediately.
+        assert!(batch.push(&vec![0u8; OUTPUT_BATCH_MAX_BYTES]));
+        assert_eq!(batch.data.len(), OUTPUT_BATCH_MAX_BYTES + 3);
+    }
+
+    #[test]
+    fn empty_output_does_not_start_a_batch() {
+        let mut batch = OutputBatch::new();
+        assert!(!batch.push(b""));
+        assert!(batch.deadline().is_none());
+        assert!(batch.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flow_control_blocks_until_the_terminal_acks() {
+        let flow = Arc::new(OutputFlow::new());
+        flow.reserve(OUTPUT_IN_FLIGHT_LIMIT).await;
+
+        let waiter = {
+            let flow = flow.clone();
+            tokio::spawn(async move { flow.reserve(1024).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "budget is exhausted");
+
+        flow.ack(1024);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("reservation should unblock after an ACK")
+            .expect("reserve task should not panic");
+    }
+
+    #[tokio::test]
+    async fn duplicate_acks_do_not_underflow_the_budget() {
+        let flow = OutputFlow::new();
+        flow.reserve(2048).await;
+        flow.ack(4096);
+        assert_eq!(flow.in_flight.load(Ordering::Acquire), 0);
+
+        // The full budget is available again.
+        flow.reserve(OUTPUT_IN_FLIGHT_LIMIT).await;
+        assert_eq!(
+            flow.in_flight.load(Ordering::Acquire),
+            OUTPUT_IN_FLIGHT_LIMIT
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_the_flow_releases_a_blocked_pump() {
+        let flow = Arc::new(OutputFlow::new());
+        flow.reserve(OUTPUT_IN_FLIGHT_LIMIT).await;
+
+        let waiter = {
+            let flow = flow.clone();
+            tokio::spawn(async move { flow.reserve(1).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        flow.close();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("close should wake a blocked reservation")
+            .expect("reserve task should not panic");
+    }
+
+    #[test]
+    fn ack_for_an_unknown_session_is_ignored() {
+        let manager = PtyManager::new();
+        assert!(!manager.ack_output("missing", 1024));
     }
 
     #[test]

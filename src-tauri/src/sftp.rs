@@ -442,3 +442,193 @@ where
         Err(_) => Err("SFTP 后台任务已退出".to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ssh::{connect_authenticated, Credential};
+    use crate::ssh_test_server::{
+        start_sftp_test_server, temp_known_hosts, trusted_params, TestAuthMode,
+        TestSshServer,
+    };
+    use std::path::PathBuf;
+
+    fn seed_root() -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "shellx-sftp-it-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("create SFTP root");
+        std::fs::write(root.join("hello.txt"), b"hello").expect("seed hello.txt");
+        std::fs::write(root.join("sub").join("nested.txt"), b"nested")
+            .expect("seed nested.txt");
+        (dir, root)
+    }
+
+    async fn open_session(
+        manager: &SftpManager,
+        server: &TestSshServer,
+        known_hosts: &std::path::Path,
+        session_id: &str,
+    ) -> SftpOpened {
+        let params = trusted_params(
+            server,
+            known_hosts,
+            Credential::Password("secret".into()),
+        )
+        .await;
+        manager
+            .open(session_id.into(), "conn-1".into(), params)
+            .await
+            .expect("open SFTP session")
+    }
+
+    fn entry<'a>(listing: &'a SftpListing, name: &str) -> &'a SftpEntryInfo {
+        listing
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing entry {name}, got {:?}",
+                    listing
+                        .entries
+                        .iter()
+                        .map(|entry| entry.name.as_str())
+                        .collect::<Vec<_>>()
+                )
+            })
+    }
+
+    #[tokio::test]
+    async fn real_sftp_lists_and_mutates_remote_files() {
+        let (dir, root) = seed_root();
+        let server =
+            start_sftp_test_server(TestAuthMode::Password("secret".into()), root.clone())
+                .await;
+        let (known_dir, known_hosts) = temp_known_hosts();
+        let manager = SftpManager::new();
+
+        let opened = open_session(&manager, &server, &known_hosts, "sftp-it-1").await;
+        assert_eq!(opened.listing.path, "/");
+        let hello = entry(&opened.listing, "hello.txt");
+        assert!(!hello.is_dir);
+        assert_eq!(hello.size, 5);
+        assert_eq!(hello.path, "/hello.txt");
+        let sub = entry(&opened.listing, "sub");
+        assert!(sub.is_dir);
+        assert_eq!(sub.path, "/sub");
+
+        let nested = manager
+            .list("sftp-it-1", "/sub".into())
+            .await
+            .expect("list sub directory");
+        assert_eq!(nested.path, "/sub");
+        assert_eq!(entry(&nested, "nested.txt").size, 6);
+
+        manager
+            .create_dir("sftp-it-1", "/created".into())
+            .await
+            .expect("create directory");
+        assert!(root.join("created").is_dir());
+
+        manager
+            .rename("sftp-it-1", "/created".into(), "/renamed".into())
+            .await
+            .expect("rename directory");
+        assert!(root.join("renamed").is_dir());
+
+        manager
+            .remove("sftp-it-1", "/renamed".into(), true)
+            .await
+            .expect("remove directory");
+        assert!(!root.join("renamed").exists());
+
+        manager
+            .remove("sftp-it-1", "/hello.txt".into(), false)
+            .await
+            .expect("remove file");
+        assert!(!root.join("hello.txt").exists());
+
+        assert!(manager.close("sftp-it-1").await);
+        assert!(
+            manager.list("sftp-it-1", "/".into()).await.is_err(),
+            "closed session must no longer be usable"
+        );
+
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&known_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn real_sftp_round_trips_file_contents() {
+        let (dir, root) = seed_root();
+        let server =
+            start_sftp_test_server(TestAuthMode::Password("secret".into()), root.clone())
+                .await;
+        let (known_dir, known_hosts) = temp_known_hosts();
+        let params = trusted_params(
+            &server,
+            &known_hosts,
+            Credential::Password("secret".into()),
+        )
+        .await;
+
+        // Drive the same client session type the manager uses, so the
+        // streaming upload/download data path is exercised over real SSH.
+        let ssh = connect_authenticated(&params)
+            .await
+            .expect("connect SFTP transport");
+        let channel = ssh
+            .handle
+            .channel_open_session()
+            .await
+            .expect("open session channel");
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .expect("request sftp subsystem");
+        let sftp = SftpSession::new(channel.into_stream())
+            .await
+            .expect("start SFTP session");
+
+        // A payload that spans several 32 KiB SFTP packets.
+        let payload: Vec<u8> = (0..256 * 1024).map(|index| (index % 251) as u8).collect();
+
+        let mut remote = sftp.create("/payload.bin").await.expect("create file");
+        remote.write_all(&payload).await.expect("write file");
+        remote.close().await.expect("close file");
+        assert_eq!(
+            std::fs::read(root.join("payload.bin")).expect("read uploaded file"),
+            payload
+        );
+
+        let mut remote = sftp.open("/payload.bin").await.expect("open file");
+        let mut read_back = Vec::new();
+        remote
+            .read_to_end(&mut read_back)
+            .await
+            .expect("read file back");
+        assert_eq!(read_back, payload);
+        remote.close().await.expect("close file");
+
+        let listing: Vec<_> = sftp
+            .read_dir("/")
+            .await
+            .expect("list root")
+            .collect();
+        let uploaded = listing
+            .iter()
+            .find(|entry| entry.file_name() == "payload.bin")
+            .expect("uploaded file is listed");
+        assert_eq!(uploaded.metadata().len() as usize, payload.len());
+
+        sftp.close().await.expect("close SFTP session");
+        drop(ssh);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&known_dir).ok();
+    }
+}

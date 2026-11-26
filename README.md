@@ -37,6 +37,7 @@ ShellX 面向两类使用者：
 | 分屏（多窗格） | ✅ 已实现 | 最多 4 个窗格，可拖动分隔条、双击均分 |
 | 会话恢复（工作区） | ✅ 已实现 | 设置中开启后，启动时恢复标签/分屏并自动重连 |
 | 终端输出日志 | ✅ 已实现 | 写入 `sessions/日期/会话ID.log`，默认关闭 |
+| 终端输出批处理与背压 | ✅ 已实现 | 约 8ms / 64KiB 合并事件；1MiB 未确认窗口，UI 落后时反向节流远端 |
 | OpenSSH config 导入 | ✅ 已实现 | `~/.ssh/config` 预览选择导入，支持单级 ProxyJump 映射 |
 | 端口转发（-L / -R / -D） | ✅ 已实现 | 规则持久化，手动启动/停止，每规则独立 SSH 连接 |
 | SFTP 文件浏览 / 上传 / 下载 | ✅ 已实现 | 独立会话、目录操作、流式传输与进度显示 |
@@ -98,7 +99,7 @@ Tauri Backend / Local Core (Rust)
   ├─ ssh_config.rs     OpenSSH config 只读解析（导入预览）
   ├─ forwards.rs       本地/远程/SOCKS5 端口转发与规则持久化
   ├─ sftp.rs           SFTP 文件浏览、目录操作、流式传输与进度
-  ├─ pty.rs            PTY 会话表 / 事件桥 / 超时与取消
+  ├─ pty.rs            PTY 会话表 / 事件桥 / 输出批处理与背压 / 超时与取消
   ├─ shell.rs          命令链解析（策略引擎输入）
   ├─ encoding.rs       PTY 字节 base64 传输
   ├─ sessions.rs       命令型会话注册表与输出缓冲
@@ -120,7 +121,7 @@ shellx/
 ├─ src-tauri/                Rust 核心（Tauri 2）
 │  ├─ src/models.rs          领域模型（camelCase 序列化）
 │  ├─ src/ssh.rs             SSH/PTY 传输与主机密钥策略
-│  ├─ src/pty.rs             会话管理、事件桥、超时/取消
+│  ├─ src/pty.rs             会话管理、事件桥、输出批处理与背压、超时/取消
 │  ├─ src/shell.rs           命令链解析
 │  ├─ src/policy.rs          安全策略引擎（含单元测试）
 │  ├─ src/redaction.rs       输出脱敏（含单元测试）
@@ -183,10 +184,11 @@ cargo test
 
 - **前端**：Vitest + jsdom，覆盖设置持久化/默认值迁移与工作区序列化；`npm test`
 - **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法等单元测试；`cargo test`
+- **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发，以及 SFTP 目录列举、创建/重命名/删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
 - **CI**：`.github/workflows/ci.yml` 在 Windows 上执行前端测试/构建 + `cargo test` / `cargo check`
 - 系统凭据存储的读写测试标记为 `#[ignore]`，需要手动运行：
   `cargo test keyring_roundtrip -- --ignored`
-- 尚未包含真实 SSH 服务器的集成测试和前端 E2E；后续可用容器化 sshd 补齐
+- 尚未包含前端 E2E 与 MCP stdio 集成测试；后续可补齐
 
 ### 数据位置
 
@@ -218,7 +220,7 @@ stdio JSON-RPC 循环将以 `shellx --mcp-stdio` 形式接入；`src-tauri/src/m
 1. **第一阶段（连接可靠性）**：✅ 真实 SSH/PTY、SSH Agent、单级跳板机、系统钥匙串、主机密钥确认、连接超时/取消、PTY 会话审计。
 2. **第二阶段（终端体验）**：✅ 搜索、可点击链接、Unicode 宽度、GPU 渲染、快捷键、同主机多开、动态标题、响铃提示、设置页、右键菜单、多行粘贴确认、标签重命名/拖拽、多窗格分屏、可拖动分隔条、工作区恢复、终端输出日志；🚧 嵌套分屏。
 3. **第三阶段（专业能力）**：✅ OpenSSH config 导入、端口转发（-L / -R / -D）、SFTP 文件浏览/上传/下载、每连接 TERM/编码/启动命令、keyboard-interactive/2FA、旧算法兼容、SSH Agent 转发；🚧 X11 转发。
-4. **第四阶段（工程化）**：✅ Windows CI（前端测试/构建 + Rust 测试）；🚧 SSH 集成测试、前端 E2E、MCP stdio 传输、输出批处理与背压、规则配置界面。
+4. **第四阶段（工程化）**：✅ Windows CI（前端测试/构建 + Rust 测试）；✅ 进程内 SSH / SFTP 集成测试；✅ PTY 输出批处理与背压；🚧 前端 E2E、MCP stdio 传输、规则配置界面。
 
 ## 说明
 
@@ -236,3 +238,4 @@ stdio JSON-RPC 循环将以 `shellx --mcp-stdio` 形式接入；`src-tauri/src/m
 - SSH config 导入为一次性预览：`Include` 不会展开，`Match` 与通配符 Host 会跳过；`ProxyJump` 仅在目标同时被导入或已存在时映射，多级跳转按直连导入并提示。
 - 「启动时恢复工作区」默认关闭；开启后会在应用启动时使用已保存连接自动重连。
 - 「记录终端输出」默认关闭；日志可能包含敏感输出，请自行控制访问权限。
+- PTY 输出会按约 8ms / 64KiB 合并后发送到前端，减少高频小包造成的 IPC 与重绘开销；每个会话有 1MiB 未确认窗口，xterm 解析完一批后回执。UI 处理不过来时后端会暂停读取，russh 内部队列填满后由 TCP 反向节流远端进程。

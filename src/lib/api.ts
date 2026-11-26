@@ -112,6 +112,12 @@ export const api = {
       ? invoke<void>("pty_write", { sessionId, data })
       : Promise.reject(new Error("浏览器 Mock 模式不提供真实 SSH 会话")),
 
+  /** Return consumed output bytes to the backend's flow-control window. */
+  ptyAck: (sessionId: string, bytes: number): Promise<boolean> =>
+    isTauri()
+      ? invoke<boolean>("pty_ack", { sessionId, bytes })
+      : Promise.resolve(false),
+
   ptyResize: (sessionId: string, cols: number, rows: number): Promise<void> =>
     isTauri()
       ? invoke<void>("pty_resize", { sessionId, cols, rows })

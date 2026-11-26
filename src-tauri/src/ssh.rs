@@ -1200,6 +1200,12 @@ fn parse_signal(name: &str) -> Result<Sig, SshError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh_test_server::{
+        start_test_server, temp_known_hosts, trusted_params, TestAuthMode,
+    };
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     #[test]
     fn password_never_appears_in_debug_output() {
@@ -1332,6 +1338,189 @@ mod tests {
         assert!(content.contains("CCCC"));
         assert!(!forget_known_host(&path, "example.com", 22).unwrap());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn real_ssh_requires_host_key_confirmation() {
+        let server =
+            start_test_server(TestAuthMode::Password("secret".into())).await;
+        let (dir, known_hosts) = temp_known_hosts();
+        let mut params = ConnectParams::new("127.0.0.1", server.port, "tester");
+        params.credential = Credential::Password("secret".into());
+        params.known_hosts_path = known_hosts.clone();
+
+        let error = connect_authenticated(&params)
+            .await
+            .err()
+            .expect("unknown host key must be rejected");
+        let fingerprint = match error {
+            SshError::HostKeyUnknown { fingerprint, .. } => fingerprint,
+            other => panic!("expected HostKeyUnknown, got {other:?}"),
+        };
+        assert!(fingerprint.starts_with("SHA256:"));
+        assert!(!known_hosts.exists());
+
+        params.trusted_host_keys = vec![HostKeyTrust {
+            host: "127.0.0.1".into(),
+            port: server.port,
+            fingerprint,
+        }];
+        let session = connect_authenticated(&params)
+            .await
+            .expect("trusted host key should connect");
+        assert!(known_hosts.exists(), "trusted key should be recorded");
+        drop(session);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn real_ssh_password_authentication() {
+        let server =
+            start_test_server(TestAuthMode::Password("secret".into())).await;
+        let (dir, known_hosts) = temp_known_hosts();
+        let params = trusted_params(
+            &server,
+            &known_hosts,
+            Credential::Password("secret".into()),
+        )
+        .await;
+
+        connect_authenticated(&params)
+            .await
+            .expect("correct password should authenticate");
+
+        let mut wrong = params.clone();
+        wrong.credential = Credential::Password("wrong".into());
+        let error = connect_authenticated(&wrong)
+            .await
+            .err()
+            .expect("wrong password must fail");
+        assert!(
+            matches!(error, SshError::Auth { .. }),
+            "unexpected error: {error:?}"
+        );
+
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn real_ssh_keyboard_interactive_authentication() {
+        let server = start_test_server(TestAuthMode::KeyboardInteractive(
+            "654321".into(),
+        ))
+        .await;
+        let (dir, known_hosts) = temp_known_hosts();
+        let mut params = trusted_params(
+            &server,
+            &known_hosts,
+            Credential::Password("ignored".into()),
+        )
+        .await;
+
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_by_prompt = seen.clone();
+        params.auth_prompter = Some(AuthPrompter::new(move |_host, _name, _instructions, prompts| {
+            let seen = seen_by_prompt.clone();
+            Box::pin(async move {
+                seen.lock()
+                    .unwrap()
+                    .extend(prompts.iter().map(|prompt| prompt.prompt.clone()));
+                Ok::<Vec<String>, SshError>(vec!["654321".to_string()])
+            })
+        }));
+
+        connect_authenticated(&params)
+            .await
+            .expect("keyboard-interactive should authenticate");
+        let prompts = seen.lock().unwrap().clone();
+        assert!(
+            prompts.iter().any(|prompt| prompt.contains("OTP")),
+            "expected OTP prompt, got {prompts:?}"
+        );
+
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn real_ssh_pty_echoes_input() {
+        let server =
+            start_test_server(TestAuthMode::Password("secret".into())).await;
+        let (dir, known_hosts) = temp_known_hosts();
+        let params = trusted_params(
+            &server,
+            &known_hosts,
+            Credential::Password("secret".into()),
+        )
+        .await;
+
+        let (conn, mut reader) = PtyConn::open(params).await.expect("open PTY");
+        conn.write(b"hello\r").await.expect("write PTY input");
+
+        let mut output = Vec::new();
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_secs(2), reader.next_event()).await {
+                Ok(PtyEvent::Data(bytes)) => {
+                    output.extend_from_slice(&bytes);
+                    if String::from_utf8_lossy(&output).contains("hello") {
+                        break;
+                    }
+                }
+                Ok(PtyEvent::Exit(_)) | Ok(PtyEvent::Closed) | Err(_) => break,
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&output).contains("hello"),
+            "expected echoed PTY data, got {:?}",
+            String::from_utf8_lossy(&output)
+        );
+
+        drop(conn);
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn real_ssh_direct_tcpip_channel_is_relayed() {
+        let server =
+            start_test_server(TestAuthMode::Password("secret".into())).await;
+        let (dir, known_hosts) = temp_known_hosts();
+        let params = trusted_params(
+            &server,
+            &known_hosts,
+            Credential::Password("secret".into()),
+        )
+        .await;
+
+        let session = connect_authenticated(&params)
+            .await
+            .expect("connect for forwarding");
+        let mut channel = session
+            .handle
+            .channel_open_direct_tcpip("example.internal", 8080, "127.0.0.1", 0)
+            .await
+            .expect("open direct-tcpip channel");
+
+        let mut payload = Vec::new();
+        for _ in 0..8 {
+            match tokio::time::timeout(Duration::from_secs(2), channel.wait()).await {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    payload.extend_from_slice(&data);
+                    if payload == b"forwarded" {
+                        break;
+                    }
+                }
+                Ok(Some(ChannelMsg::Eof)) | Ok(None) | Err(_) => break,
+                Ok(Some(_)) => {}
+            }
+        }
+        assert_eq!(payload, b"forwarded");
+        drop(channel);
+        drop(session);
+        drop(server);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

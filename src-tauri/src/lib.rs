@@ -11,6 +11,8 @@ mod pty;
 mod redaction;
 mod sessions;
 mod sftp;
+#[cfg(test)]
+mod ssh_test_server;
 mod shell;
 mod ssh;
 mod ssh_config;
@@ -53,6 +55,7 @@ pub fn run() {
             commands::auth_respond,
             commands::auth_cancel,
             commands::pty_write,
+            commands::pty_ack,
             commands::pty_resize,
             commands::pty_signal,
             commands::pty_close,

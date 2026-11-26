@@ -202,6 +202,14 @@ pub async fn pty_write(
     pty.write(&session_id, data.into_bytes()).await
 }
 
+/// The terminal calls this after xterm.js has parsed an output batch. The
+/// number is bytes of decoded PTY output, which returns flow-control budget to
+/// the session; unknown sessions are ignored.
+#[tauri::command]
+pub fn pty_ack(pty: State<'_, PtyManager>, session_id: String, bytes: u32) -> bool {
+    pty.ack_output(&session_id, bytes as usize)
+}
+
 #[tauri::command]
 pub async fn pty_resize(
     pty: State<'_, PtyManager>,

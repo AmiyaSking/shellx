@@ -460,7 +460,15 @@ export default function TerminalPane({
     const early = new Map<string, string[]>();
     let shellExited = false;
 
-    const writeChunk = (payload: string) => term.write(base64ToBytes(payload));
+    const writeChunk = (chunkSessionId: string, payload: string) => {
+      const bytes = base64ToBytes(payload);
+      // The ACK tells the backend this batch has been parsed, releasing its
+      // flow-control budget. Without it a fast remote would be throttled.
+      term.write(bytes, () => {
+        if (disposed) return;
+        void api.ptyAck(chunkSessionId, bytes.length).catch(() => {});
+      });
+    };
 
     /* ------------------------- real SSH PTY session ------------------------- */
     let listenersReady = false;
@@ -477,7 +485,7 @@ export default function TerminalPane({
             return;
           }
           if (payload.sessionId !== sessionId) return;
-          writeChunk(payload.data);
+          writeChunk(payload.sessionId, payload.data);
         }),
       );
       unlisteners.push(
@@ -535,7 +543,7 @@ export default function TerminalPane({
         setStatus("live");
         const queued = early.get(sessionId);
         early.clear();
-        if (queued) queued.forEach(writeChunk);
+        if (queued) queued.forEach((data) => writeChunk(opened.sessionId, data));
         safeFit();
         term.focus();
       } catch (err) {
