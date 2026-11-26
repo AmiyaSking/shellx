@@ -44,21 +44,23 @@ pub fn preview_command(
 }
 
 #[tauri::command]
-pub fn run_command(
+pub async fn run_command(
     state: State<'_, AppState>,
     request: CommandRequest,
 ) -> Result<CommandOutcome, String> {
-    state.run_command(request)
+    state.run_command(request).await
 }
 
 #[tauri::command]
-pub fn resolve_approval(
+pub async fn resolve_approval(
     state: State<'_, AppState>,
     approval_id: String,
     approve: bool,
     command_override: Option<String>,
 ) -> Result<CommandOutcome, String> {
-    state.resolve_approval(&approval_id, approve, command_override)
+    state
+        .resolve_approval(&approval_id, approve, command_override)
+        .await
 }
 
 #[tauri::command]

@@ -5,6 +5,7 @@ mod connections;
 mod encoding;
 mod forwards;
 mod mcp;
+mod mcp_stdio;
 mod models;
 mod policy;
 mod pty;
@@ -22,6 +23,14 @@ mod vault;
 use tauri::Manager;
 
 use state::AppState;
+
+/// Headless MCP server over stdin/stdout (`shellx --mcp-stdio`).
+///
+/// It deliberately does not start Tauri or open a window: MCP clients spawn
+/// this process and speak JSON-RPC over its standard streams.
+pub fn run_mcp_stdio() -> Result<(), String> {
+    mcp_stdio::run()
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

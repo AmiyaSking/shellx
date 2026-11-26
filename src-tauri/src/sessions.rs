@@ -5,6 +5,8 @@ use chrono::Utc;
 use crate::models::{SessionInfo, SessionStatus};
 
 const MAX_OUTPUT_LINES: usize = 2000;
+/// Upper bound for one `read_output` page.
+const MAX_READ_LINES: usize = 500;
 
 pub struct Session {
     pub id: String,
@@ -73,6 +75,31 @@ impl SessionManager {
             }
             session.last_active_at = Utc::now().to_rfc3339();
         }
+    }
+
+    /// Read up to `limit` buffered lines starting at `offset`. Returns the
+    /// joined text, the next offset and whether the buffer is exhausted.
+    pub fn read_output(
+        &self,
+        id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(String, usize, bool), String> {
+        let session = self
+            .sessions
+            .get(id)
+            .ok_or_else(|| format!("会话 {id} 不存在"))?;
+        let limit = limit.clamp(1, MAX_READ_LINES);
+        let lines: Vec<&str> = session
+            .output
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(String::as_str)
+            .collect();
+        let next_offset = offset + lines.len();
+        let eof = next_offset >= session.output.len();
+        Ok((lines.join("\n"), next_offset, eof))
     }
 
     pub fn list(&self) -> Vec<SessionInfo> {

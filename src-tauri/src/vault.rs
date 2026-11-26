@@ -48,6 +48,15 @@ impl SecretVault {
         Some(secret)
     }
 
+    /// Seed the in-memory cache without touching the OS credential store.
+    /// Integration tests use this so they never create real keyring entries.
+    #[cfg(test)]
+    pub(crate) fn cache_only(&self, key: &str, secret: &str) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(key.to_string(), secret.to_string());
+        }
+    }
+
     pub fn remove(&self, key: &str) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.remove(key);

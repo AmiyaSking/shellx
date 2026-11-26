@@ -46,7 +46,7 @@ ShellX 面向两类使用者：
 | 旧算法兼容 | ✅ 已实现 | 每连接可选 ssh-rsa / SHA-1 KEX/MAC / CBC / 3DES |
 | SSH Agent 转发 | ✅ 已实现 | 每连接可选，OpenSSH Agent / `SSH_AUTH_SOCK` |
 | X11 转发 | 🚧 暂未实现 | Windows 场景价值较低 |
-| 本地 MCP stdio 传输 | 🚧 待接入 | 工具目录、JSON Schema、分发器已就绪 |
+| 本地 MCP stdio 传输 | ✅ 已实现 | `shellx --mcp-stdio`；JSON-RPC 2.0，工具调用走策略/审批/审计 |
 
 > 桌面版连接真实服务器；浏览器 `npm run dev` 会使用内置 Mock 后端，界面显示「浏览器 Mock 模式」。
 
@@ -103,7 +103,8 @@ Tauri Backend / Local Core (Rust)
   ├─ shell.rs          命令链解析（策略引擎输入）
   ├─ encoding.rs       PTY 字节 base64 传输
   ├─ sessions.rs       命令型会话注册表与输出缓冲
-  └─ mcp.rs            MCP 工具目录 / manifest / 分发器骨架
+  ├─ mcp.rs            MCP 工具目录 / JSON Schema / 分发器
+  └─ mcp_stdio.rs      stdio JSON-RPC 2.0 传输（无界面模式）
                                        │
                                        v
                           SSH（russh + PTY + ProxyJump）
@@ -127,7 +128,8 @@ shellx/
 │  ├─ src/redaction.rs       输出脱敏（含单元测试）
 │  ├─ src/audit.rs           审计日志
 │  ├─ src/state.rs           核心服务编排
-│  ├─ src/mcp.rs             MCP 工具目录与分发器骨架
+│  ├─ src/mcp.rs             MCP 工具目录与分发器
+│  ├─ src/mcp_stdio.rs       stdio JSON-RPC 传输（无界面模式）
 │  ├─ capabilities/          Tauri 权限能力
 │  └─ tauri.conf.json
 ├─ assets/app-icon.png       图标源文件
@@ -184,11 +186,12 @@ cargo test
 
 - **前端**：Vitest + jsdom，覆盖设置持久化/默认值迁移与工作区序列化；`npm test`
 - **Rust**：策略引擎、命令解析、脱敏、SSH config、编码、旧算法等单元测试；`cargo test`
-- **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发，以及 SFTP 目录列举、创建/重命名/删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
+- **SSH / SFTP 集成测试**：进程内 `russh` 服务端 + 真实 loopback SSH 连接，覆盖主机密钥首次确认、密码认证、keyboard-interactive/2FA、PTY 回显、`direct-tcpip` 转发、`exec` 输出/退出码/超时，以及 SFTP 目录列举、创建/重命名/删除与 256KiB 文件读写往返；无需 Docker 或外部 sshd
+- **MCP stdio 集成测试**：直接驱动 JSON-RPC 循环，覆盖 `initialize`、`tools/list`、授权过滤、策略拦截、审批自动拒绝与审计、真实 SSH `exec_command`、`read_output` 分页与 `close_session`
 - **CI**：`.github/workflows/ci.yml` 在 Windows 上执行前端测试/构建 + `cargo test` / `cargo check`
 - 系统凭据存储的读写测试标记为 `#[ignore]`，需要手动运行：
   `cargo test keyring_roundtrip -- --ignored`
-- 尚未包含前端 E2E 与 MCP stdio 集成测试；后续可补齐
+- 尚未包含前端 E2E；后续可补齐
 
 ### 数据位置
 
@@ -203,28 +206,54 @@ Tauri 应用数据目录（标识符 `com.shellx.app`）下：
 密码与私钥口令存放在操作系统凭据存储中，不落盘到 JSON。Windows 通常位于
 `%APPDATA%\com.shellx.app`。
 
-## MCP 工具（骨架已定义）
+## MCP 工具（stdio 已接入）
 
 | 工具 | 风险 | 状态 |
 | --- | --- | --- |
-| `list_servers` | 低 | 过滤为仅返回已授权连接的安全元信息 |
-| `exec_command` | 中 | 走 `AppState::run_command`，策略/审批/审计全生效 |
-| `read_output` | 低 | 协议已定义，待接入 |
-| `send_signal` | 中 | 协议已定义，待接入 |
-| `close_session` | 中 | 协议已定义，待接入 |
+| `list_servers` | 低 | 已实现：仅返回已授权连接的安全元信息 |
+| `exec_command` | 中 | 已实现：真实 SSH `exec`，受策略/审批/审计约束，支持超时与输出截断 |
+| `read_output` | 低 | 已实现：按行分页读取会话输出缓冲 |
+| `send_signal` | 中 | 🚧 待接入：需要可中断的长驻会话 |
+| `close_session` | 中 | 已实现：关闭指定命令会话 |
 
-stdio JSON-RPC 循环将以 `shellx --mcp-stdio` 形式接入；`src-tauri/src/mcp.rs` 已提供 `tools/list` manifest 与 `tools/call` 分发器。
+以 stdio 方式启动（MCP 客户端会自行拉起该进程）：
+
+```bash
+shellx --mcp-stdio
+# 可选：指定与桌面版一致的数据目录
+shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
+```
+
+客户端配置示例：
+
+```json
+{
+  "mcpServers": {
+    "shellx": {
+      "command": "C:/path/to/shellx.exe",
+      "args": ["--mcp-stdio"]
+    }
+  }
+}
+```
+
+- 传输为换行分隔的 JSON-RPC 2.0，stdout 只输出协议消息；日志写入 stderr。
+- 支持 `initialize`、`tools/list`、`tools/call`、`ping` 与 `notifications/initialized`。
+- `exec_command` 每次使用独立 SSH 连接，默认超时 30 秒（最大 600 秒），返回退出码、输出与是否截断；输出超过 256 KiB 会截断。
+- 主机密钥必须先在桌面端终端连接中确认；stdio 进程与桌面版共用 `known_hosts`、`connections.json` 与审计目录。
+- stdio 模式没有人工审批窗口：需要审批的命令会被**自动拒绝**并写入审计日志，请先在桌面端批准执行或改用低风险命令。
 
 ## 实施路线
 
 1. **第一阶段（连接可靠性）**：✅ 真实 SSH/PTY、SSH Agent、单级跳板机、系统钥匙串、主机密钥确认、连接超时/取消、PTY 会话审计。
 2. **第二阶段（终端体验）**：✅ 搜索、可点击链接、Unicode 宽度、GPU 渲染、快捷键、同主机多开、动态标题、响铃提示、设置页、右键菜单、多行粘贴确认、标签重命名/拖拽、多窗格分屏、可拖动分隔条、工作区恢复、终端输出日志；🚧 嵌套分屏。
 3. **第三阶段（专业能力）**：✅ OpenSSH config 导入、端口转发（-L / -R / -D）、SFTP 文件浏览/上传/下载、每连接 TERM/编码/启动命令、keyboard-interactive/2FA、旧算法兼容、SSH Agent 转发；🚧 X11 转发。
-4. **第四阶段（工程化）**：✅ Windows CI（前端测试/构建 + Rust 测试）；✅ 进程内 SSH / SFTP 集成测试；✅ PTY 输出批处理与背压；🚧 前端 E2E、MCP stdio 传输、规则配置界面。
+4. **第四阶段（工程化）**：✅ Windows CI（前端测试/构建 + Rust 测试）；✅ 进程内 SSH / SFTP 集成测试；✅ PTY 输出批处理与背压；✅ MCP stdio 传输与工具调用；🚧 前端 E2E、规则配置界面。
 
 ## 说明
 
-- 凭据保存在系统凭据存储；Linux 当前使用内核 keyring，重启后可能需要重新输入，后续可切换到 Secret Service。
+- 凭据保存在系统凭据存储；Linux 当前使用内核 keyring，重启后可能需要重新输入，后续可切换到 Secret Service。`shellx --mcp-stdio` 以独立进程读取同一个凭据存储，Linux 内核 keyring 在跨进程/重启场景下可能读不到口令。
+- `shellx --mcp-stdio` 使用与桌面版相同的应用数据目录（可用 `--data-dir` 或 `SHELLX_DATA_DIR` 覆盖）；主机密钥必须先在桌面端终端连接中确认。stdio 模式没有审批弹窗，需要人工审批的命令会被自动拒绝并记入审计。
 - 浏览器 Mock 模式不会建立任何网络连接；桌面版才会连接真实服务器。
 - 当前暂不支持多级跳板机、嵌套混合分屏、X11 转发。
 - SSH Agent 转发只对交互式终端会话请求；端口转发/SFTP 不会请求 Agent 通道。Windows 转发依赖 OpenSSH Authentication Agent 服务，Pageant 仅用于认证、不支持转发。

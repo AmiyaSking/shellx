@@ -265,6 +265,7 @@ pub enum SshError {
         detail: String,
     },
     Channel(String),
+    Timeout(String),
     Unsupported(String),
 }
 
@@ -299,6 +300,7 @@ impl fmt::Display for SshError {
                 detail,
             } => write!(f, "{username}@{host} 认证失败：{detail}"),
             SshError::Channel(detail) => write!(f, "打开终端通道失败：{detail}"),
+            SshError::Timeout(detail) => write!(f, "命令执行超时：{detail}"),
             SshError::Unsupported(detail) => write!(f, "暂不支持：{detail}"),
         }
     }
@@ -601,6 +603,72 @@ pub struct AuthenticatedSession {
     pub handle: client::Handle<HostKeyHandler>,
     pub host_key: HostKey,
     pub jump_handle: Option<client::Handle<HostKeyHandler>>,
+}
+
+/// Collected output of a non-interactive `exec` request.
+#[derive(Debug, Clone)]
+pub struct ExecOutput {
+    /// Combined stdout and stderr, decoded with the connection's encoding.
+    pub output: String,
+    pub exit_status: Option<u32>,
+}
+
+/// Run one command through an SSH `exec` request and wait for it to finish.
+///
+/// The connection is opened per command, so an agent call cannot leave a
+/// half-used shell behind. Output is collected until EOF or `timeout`.
+pub async fn exec_command(
+    params: &ConnectParams,
+    command: &str,
+    timeout: Duration,
+) -> Result<ExecOutput, SshError> {
+    let session = connect_authenticated(params).await?;
+    let mut channel = session
+        .handle
+        .channel_open_session()
+        .await
+        .map_err(|error| SshError::Channel(error.to_string()))?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|error| SshError::Channel(format!("无法执行命令：{error}")))?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut bytes = Vec::new();
+    let mut exit_status = None;
+    loop {
+        match tokio::time::timeout_at(deadline, channel.wait()).await {
+            Err(_) => {
+                let _ = channel.close().await;
+                return Err(SshError::Timeout(format!(
+                    "命令在 {} 秒内未结束：{command}",
+                    timeout.as_secs()
+                )));
+            }
+            Ok(Some(ChannelMsg::Data { data })) => bytes.extend_from_slice(&data),
+            Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                bytes.extend_from_slice(&data)
+            }
+            Ok(Some(ChannelMsg::ExitStatus { exit_status: status })) => {
+                exit_status = Some(status)
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+        }
+    }
+
+    Ok(ExecOutput {
+        output: decode_output(&bytes, &params.encoding),
+        exit_status,
+    })
+}
+
+/// Decode raw command output using the label configured on the connection.
+fn decode_output(bytes: &[u8], label: &str) -> String {
+    let encoding = encoding_rs::Encoding::for_label(label.trim().as_bytes())
+        .unwrap_or(encoding_rs::UTF_8);
+    let (text, _, _) = encoding.decode(bytes);
+    text.into_owned()
 }
 
 /// Connect, verify the host key and authenticate, without opening a shell.
@@ -1400,6 +1468,46 @@ mod tests {
         assert!(
             matches!(error, SshError::Auth { .. }),
             "unexpected error: {error:?}"
+        );
+
+        drop(server);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn real_ssh_exec_collects_output_and_exit_status() {
+        let server =
+            start_test_server(TestAuthMode::Password("secret".into())).await;
+        let (dir, known_hosts) = temp_known_hosts();
+        let params = trusted_params(
+            &server,
+            &known_hosts,
+            Credential::Password("secret".into()),
+        )
+        .await;
+
+        let output = exec_command(&params, "echo shellx-exec", Duration::from_secs(5))
+            .await
+            .expect("exec echo");
+        assert_eq!(output.exit_status, Some(0));
+        assert!(
+            output.output.contains("shellx-exec"),
+            "got {:?}",
+            output.output
+        );
+
+        let failing = exec_command(&params, "exit 7", Duration::from_secs(5))
+            .await
+            .expect("exec failing command");
+        assert_eq!(failing.exit_status, Some(7));
+        assert!(failing.output.is_empty());
+
+        let timeout = exec_command(&params, "sleep", Duration::from_millis(300))
+            .await
+            .expect_err("sleeping command must time out");
+        assert!(
+            matches!(timeout, SshError::Timeout(_)),
+            "unexpected error: {timeout:?}"
         );
 
         drop(server);

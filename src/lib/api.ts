@@ -951,7 +951,7 @@ const mock = {
     return {
       transport: "stdio",
       command: "shellx --mcp-stdio",
-      status: "scaffold",
+      status: "ready",
       tools: [
         { name: "list_servers", description: "列出已授权给 MCP 的服务器元信息", risk: "low" },
         { name: "exec_command", description: "在已授权服务器上执行命令（受策略引擎约束）", risk: "medium" },

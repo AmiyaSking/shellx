@@ -472,7 +472,8 @@ pre {
   background: var(--warning);
   box-shadow: 0 0 8px rgba(251, 191, 36, 0.5);
 }
-.status-running {
+.status-running,
+.status-ready {
   background: var(--accent);
   box-shadow: 0 0 8px rgba(94, 234, 212, 0.5);
 }

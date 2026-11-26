@@ -186,6 +186,34 @@ impl server::Handler for TestServer {
         Ok(())
     }
 
+    async fn exec_request(
+        &mut self,
+        channel: russh::ChannelId,
+        data: &[u8],
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        let command = String::from_utf8_lossy(data).trim().to_string();
+        let _ = session.channel_success(channel);
+
+        // `sleep` never answers so the client-side timeout can be exercised.
+        if command == "sleep" {
+            return Ok(());
+        }
+
+        let (output, status) = if let Some(rest) = command.strip_prefix("echo ") {
+            (format!("{rest}\n"), 0)
+        } else if command == "exit 7" {
+            (String::new(), 7)
+        } else {
+            (format!("ran: {command}\n"), 0)
+        };
+        let _ = session.data(channel, output.into_bytes());
+        let _ = session.exit_status_request(channel, status);
+        let _ = session.eof(channel);
+        let _ = session.close(channel);
+        Ok(())
+    }
+
     async fn data(
         &mut self,
         channel: russh::ChannelId,

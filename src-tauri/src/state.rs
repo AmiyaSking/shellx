@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use uuid::Uuid;
@@ -24,7 +25,14 @@ struct PendingApproval {
     request: ApprovalRequest,
     command: String,
     source: AuditSource,
+    timeout_secs: Option<u64>,
 }
+
+/// Default and maximum wall-clock budget for one agent command.
+const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 30;
+const MAX_COMMAND_TIMEOUT_SECS: u64 = 600;
+/// Upper bound on the output returned to an agent or kept in the session ring.
+const MAX_COMMAND_OUTPUT_BYTES: usize = 256 * 1024;
 
 /// Core services shared by the Tauri commands and the (future) MCP transport.
 pub struct AppState {
@@ -66,7 +74,7 @@ impl AppState {
             None,
             None,
             None,
-            "ShellX 核心启动（脚手架模式）",
+            "ShellX 核心启动",
         ));
         Ok(state)
     }
@@ -139,8 +147,7 @@ impl AppState {
         ))
     }
 
-    pub fn run_command(&self, request: CommandRequest) -> Result<CommandOutcome, String> {
-        let _timeout_secs = request.timeout_secs; // wired with the real SSH channel in phase 1
+    pub async fn run_command(&self, request: CommandRequest) -> Result<CommandOutcome, String> {
         let connection = self.get_connection(&request.connection_id)?;
         let decision = self.policy.evaluate(
             connection.environment,
@@ -150,13 +157,17 @@ impl AppState {
         );
 
         match decision.action {
-            PolicyAction::Allow => self.execute_command(
-                &connection,
-                &request.command,
-                request.source,
-                decision,
-                None,
-            ),
+            PolicyAction::Allow => {
+                self.execute_command(
+                    &connection,
+                    &request.command,
+                    request.source,
+                    decision,
+                    None,
+                    request.timeout_secs,
+                )
+                .await
+            }
             PolicyAction::RequireApproval => {
                 let approval = ApprovalRequest {
                     id: Uuid::new_v4().to_string(),
@@ -186,6 +197,7 @@ impl AppState {
                         request: approval.clone(),
                         command: request.command.clone(),
                         source: request.source,
+                        timeout_secs: request.timeout_secs,
                     },
                 );
                 Ok(CommandOutcome::PendingApproval { approval })
@@ -212,11 +224,33 @@ impl AppState {
         }
     }
 
-    pub fn resolve_approval(
+    pub async fn resolve_approval(
         &self,
         approval_id: &str,
         approve: bool,
         command_override: Option<String>,
+    ) -> Result<CommandOutcome, String> {
+        self.resolve_approval_inner(approval_id, approve, command_override, "用户拒绝了该命令")
+            .await
+    }
+
+    /// Reject a pending approval without a human in the loop. Used by the
+    /// headless stdio transport, which has no approval dialog.
+    pub async fn deny_approval(
+        &self,
+        approval_id: &str,
+        reason: &str,
+    ) -> Result<CommandOutcome, String> {
+        self.resolve_approval_inner(approval_id, false, None, reason)
+            .await
+    }
+
+    async fn resolve_approval_inner(
+        &self,
+        approval_id: &str,
+        approve: bool,
+        command_override: Option<String>,
+        rejection_reason: &str,
     ) -> Result<CommandOutcome, String> {
         let pending = lock(&self.approvals)?
             .remove(approval_id)
@@ -228,7 +262,7 @@ impl AppState {
             .unwrap_or_else(|| pending.command.clone());
 
         if !approve {
-            let reason = "用户拒绝了该命令".to_string();
+            let reason = rejection_reason.to_string();
             let entry = self.audit.log(make_audit(
                 pending.source,
                 Some(&connection),
@@ -287,7 +321,9 @@ impl AppState {
             pending.source,
             decision,
             Some(ApprovalDecision::Approved),
+            pending.timeout_secs,
         )
+        .await
     }
 
     pub fn list_forward_rules(&self) -> Result<Vec<ForwardRule>, String> {
@@ -333,13 +369,24 @@ impl AppState {
         Ok(lock(&self.sessions)?.close(id))
     }
 
+    /// Paginated access to a command session's output ring. Returns the text,
+    /// the offset to pass next time, and whether the buffer is exhausted.
+    pub fn read_session_output(
+        &self,
+        session_id: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(String, usize, bool), String> {
+        lock(&self.sessions)?.read_output(session_id, offset, limit)
+    }
+
     pub fn mcp_info(&self) -> Result<McpServerInfo, String> {
         let authorized_connections = lock(&self.connections)?.authorized_count();
         let active_sessions = lock(&self.sessions)?.active_count();
         Ok(McpServerInfo {
             transport: "stdio".into(),
             command: "shellx --mcp-stdio".into(),
-            status: "scaffold".into(),
+            status: "ready".into(),
             tools: mcp::tool_catalog(),
             authorized_connections,
             active_sessions,
@@ -439,23 +486,73 @@ impl AppState {
         }
     }
 
+    /// Seed a password in the in-memory vault for integration tests, without
+    /// creating a real OS credential entry.
+    #[cfg(test)]
+    pub(crate) fn cache_password_for_test(&self, connection_id: &str, password: &str) {
+        self.vault.cache_only(&vault_key(connection_id), password);
+    }
+
     fn get_connection(&self, id: &str) -> Result<Connection, String> {
         lock(&self.connections)?
             .get(id)
             .ok_or_else(|| "连接不存在".to_string())
     }
 
-    fn execute_command(
+    /// Execute one command over a dedicated SSH `exec` channel.
+    ///
+    /// The host key must already be trusted (confirmed in the terminal), so an
+    /// agent can never silently accept a new key. Policy, approval and audit
+    /// have already run by the time this is called.
+    async fn execute_command(
         &self,
         connection: &Connection,
         command: &str,
         source: AuditSource,
         decision: PolicyDecision,
         approval: Option<ApprovalDecision>,
+        timeout_secs: Option<u64>,
     ) -> Result<CommandOutcome, String> {
-        let started = std::time::Instant::now();
-        let (raw_output, exit_code) = simulate_command(connection, command);
-        let output = self.redactor.redact(&raw_output);
+        let started = Instant::now();
+        let (_, mut params) = self.pty_params(&connection.id, 80, 24, Vec::new())?;
+        params.agent_forwarding = false;
+        let timeout = Duration::from_secs(
+            timeout_secs
+                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS)
+                .clamp(1, MAX_COMMAND_TIMEOUT_SECS),
+        );
+
+        let exec = match ssh::exec_command(&params, command, timeout).await {
+            Ok(exec) => exec,
+            Err(error) => {
+                let detail = format!("命令执行失败：{error}");
+                let _ = self.audit.log(make_audit(
+                    source,
+                    Some(connection),
+                    Some(command.to_string()),
+                    Some(decision.risk),
+                    PolicyAction::Block,
+                    approval,
+                    None,
+                    Some(started.elapsed().as_millis() as u64),
+                    detail.clone(),
+                ));
+                return Err(detail);
+            }
+        };
+
+        let mut output = exec.output;
+        let truncated = output.len() > MAX_COMMAND_OUTPUT_BYTES;
+        if truncated {
+            let mut cutoff = MAX_COMMAND_OUTPUT_BYTES;
+            while cutoff > 0 && !output.is_char_boundary(cutoff) {
+                cutoff -= 1;
+            }
+            output.truncate(cutoff);
+            output.push_str("\n[输出已截断]");
+        }
+        let output = self.redactor.redact(&output);
+        let exit_code = exec.exit_status.map(|status| status as i32);
         let duration_ms = started.elapsed().as_millis() as u64;
 
         let session_id = {
@@ -475,20 +572,20 @@ impl AppState {
             connection_alias: connection.alias.clone(),
             environment: connection.environment,
             command: command.to_string(),
-            exit_code: Some(exit_code),
+            exit_code,
             output,
-            truncated: false,
+            truncated,
             risk: decision.risk,
             policy_action: decision.action,
             decision_reasons: decision.reasons.clone(),
             duration_ms,
-            simulated: true,
+            simulated: false,
         };
 
         let detail = if approval.is_some() {
-            "审批通过后执行完成（模拟执行器）"
+            "审批通过后执行完成（SSH exec）"
         } else {
-            "命令执行完成（模拟执行器）"
+            "命令执行完成（SSH exec）"
         };
         self.audit.log(make_audit(
             source,
@@ -497,7 +594,7 @@ impl AppState {
             Some(decision.risk),
             PolicyAction::Allow,
             approval,
-            Some(exit_code),
+            exit_code,
             Some(duration_ms),
             detail,
         ))?;
@@ -566,44 +663,4 @@ fn make_audit(
         duration_ms,
         detail: detail.into(),
     }
-}
-
-/// Scaffold executor. Keeps policy, approval and audit flows fully functional
-/// while the real SSH transport is being implemented.
-fn simulate_command(connection: &Connection, command: &str) -> (String, i32) {
-    let trimmed = command.trim();
-    let lower = trimmed.to_lowercase();
-
-    let output = if lower.starts_with("echo ") {
-        trimmed.get(5..).unwrap_or_default().to_string()
-    } else if lower == "whoami" {
-        connection.username.clone()
-    } else if lower == "hostname" {
-        connection.alias.clone()
-    } else if lower == "pwd" {
-        format!("/home/{}", connection.username)
-    } else if lower == "date" {
-        Utc::now().to_rfc2822()
-    } else if lower == "uptime" {
-        " 14:32:01 up 42 days,  3:17,  2 users,  load average: 0.08, 0.12, 0.09".to_string()
-    } else if lower == "ls" || lower.starts_with("ls ") || lower == "ll" {
-        "app  config  logs  scripts  README.md".to_string()
-    } else if lower.starts_with("df") {
-        "Filesystem      Size  Used Avail Use% Mounted on\n/dev/vda1        80G   31G   45G  41% /"
-            .to_string()
-    } else if lower.starts_with("systemctl status") {
-        format!(
-            "● {}.service - simulated\n     Loaded: loaded\n     Active: active (running)",
-            lower.split_whitespace().nth(2).unwrap_or("unknown")
-        )
-    } else {
-        format!(
-            "[shellx] 脚手架模拟执行：命令已通过策略引擎，但尚未接入真实 SSH 通道。\n\
-             [shellx] target={}@{}:{}\n\
-             [shellx] TODO(phase-1): 使用 russh 建立连接并回传真实输出。",
-            connection.username, connection.host, connection.port
-        )
-    };
-
-    (output, 0)
 }

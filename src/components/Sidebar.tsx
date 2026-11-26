@@ -170,7 +170,9 @@ export default function Sidebar({
             <p className="mcp-note">
               {mcpInfo.status === "scaffold"
                 ? "协议与工具目录已就绪；stdio 传输与真实执行将在第一阶段接入。"
-                : "MCP 服务运行中。"}
+                : mcpInfo.status === "running"
+                  ? "MCP 服务运行中。"
+                  : "stdio 传输已就绪，由 MCP 客户端按需启动 `shellx --mcp-stdio`。"}
             </p>
           </>
         ) : (

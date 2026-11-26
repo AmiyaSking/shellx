@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 
-use crate::models::{AuditSource, CommandRequest, McpToolInfo, RiskLevel};
+use crate::models::{
+    AuditSource, CommandOutcome, CommandRequest, McpToolInfo, RiskLevel,
+};
 use crate::state::AppState;
 
 pub struct ToolDef {
@@ -50,11 +52,9 @@ pub fn tool_catalog() -> Vec<McpToolInfo> {
         .collect()
 }
 
-/// JSON manifest for `tools/list`. Consumed once the stdio JSON-RPC loop is
-/// wired in phase 1; kept here so the catalog has a single source of truth.
-#[allow(dead_code)]
-pub fn tool_manifest() -> Value {
-    let tools: Vec<Value> = TOOL_CATALOG
+/// JSON definitions returned by `tools/list`.
+pub fn tool_definitions() -> Vec<Value> {
+    TOOL_CATALOG
         .iter()
         .map(|tool| {
             let schema = match tool.name {
@@ -63,7 +63,12 @@ pub fn tool_manifest() -> Value {
                     "properties": {
                         "connection_id": { "type": "string", "description": "已授权连接 ID" },
                         "command": { "type": "string", "description": "要执行的命令" },
-                        "timeout_secs": { "type": "integer", "minimum": 1 }
+                        "timeout_secs": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 600,
+                            "description": "执行超时（秒），默认 30"
+                        }
                     },
                     "required": ["connection_id", "command"],
                     "additionalProperties": false
@@ -72,7 +77,13 @@ pub fn tool_manifest() -> Value {
                     "type": "object",
                     "properties": {
                         "session_id": { "type": "string" },
-                        "offset": { "type": "integer", "minimum": 0 }
+                        "offset": { "type": "integer", "minimum": 0 },
+                        "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 500,
+                            "description": "本页最大行数，默认 200"
+                        }
                     },
                     "required": ["session_id"],
                     "additionalProperties": false
@@ -104,19 +115,15 @@ pub fn tool_manifest() -> Value {
                 "inputSchema": schema
             })
         })
-        .collect();
-
-    json!({
-        "protocolVersion": "2025-06-18",
-        "tools": tools
-    })
+        .collect()
 }
 
-/// Skeleton dispatcher for MCP `tools/call`. The stdio transport will call this
-/// once `--mcp-stdio` is implemented; policy and audit already apply because
-/// every execution goes through `AppState::run_command`.
-#[allow(dead_code)]
-pub fn dispatch_tool(
+/// Dispatch one MCP `tools/call`. Policy, approval and audit always apply
+/// because execution goes through `AppState::run_command`.
+///
+/// The stdio transport has no dialog, so commands that need human approval are
+/// rejected (and audited) instead of hanging forever.
+pub async fn dispatch_tool(
     state: &AppState,
     name: &str,
     arguments: Value,
@@ -141,31 +148,85 @@ pub fn dispatch_tool(
             Ok(json!({ "servers": servers }))
         }
         "exec_command" => {
-            let connection_id = arguments
-                .get("connection_id")
-                .or_else(|| arguments.get("connectionId"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| "缺少 connection_id 参数".to_string())?;
-            let command = arguments
-                .get("command")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "缺少 command 参数".to_string())?;
+            let connection_id = string_arg(&arguments, "connection_id", "connectionId")?;
+            let command = string_arg(&arguments, "command", "command")?;
             let timeout_secs = arguments
                 .get("timeout_secs")
                 .or_else(|| arguments.get("timeoutSecs"))
                 .and_then(Value::as_u64);
 
-            let outcome = state.run_command(CommandRequest {
-                connection_id: connection_id.to_string(),
-                command: command.to_string(),
-                source: AuditSource::Agent,
-                timeout_secs,
-            })?;
-            serde_json::to_value(outcome).map_err(|error| error.to_string())
+            let outcome = state
+                .run_command(CommandRequest {
+                    connection_id: connection_id.to_string(),
+                    command: command.to_string(),
+                    source: AuditSource::Agent,
+                    timeout_secs,
+                })
+                .await?;
+            match outcome {
+                CommandOutcome::Completed { result } => {
+                    serde_json::to_value(result).map_err(|error| error.to_string())
+                }
+                CommandOutcome::Blocked {
+                    message, audit_id, ..
+                } => Err(format!(
+                    "命令被策略引擎拦截：{message}（审计 ID：{audit_id}）"
+                )),
+                CommandOutcome::PendingApproval { approval } => {
+                    let reason = "MCP stdio 模式没有人工审批界面，已自动拒绝";
+                    let _ = state.deny_approval(&approval.id, reason).await?;
+                    Err(format!(
+                        "命令需要人工审批（{}），但 stdio 传输无法弹出审批窗口，已自动拒绝。\
+                         请在桌面端确认后执行，或改用低风险命令。",
+                        approval.reasons.join("；")
+                    ))
+                }
+            }
         }
-        "read_output" | "send_signal" | "close_session" => {
-            Err(format!("MCP 工具 {name} 将在第一阶段接入"))
+        "read_output" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            let offset = arguments
+                .get("offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            let limit = arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(200) as usize;
+            let (output, next_offset, eof) =
+                state.read_session_output(session_id, offset, limit)?;
+            Ok(json!({
+                "sessionId": session_id,
+                "offset": offset,
+                "nextOffset": next_offset,
+                "eof": eof,
+                "output": output
+            }))
+        }
+        "send_signal" => Err(
+            "send_signal 需要可中断的长驻会话；当前 exec_command 为同步执行（受 timeout_secs 限制），暂不支持发送信号"
+                .to_string(),
+        ),
+        "close_session" => {
+            let session_id = string_arg(&arguments, "session_id", "sessionId")?;
+            if state.close_session(session_id)? {
+                Ok(json!({ "sessionId": session_id, "closed": true }))
+            } else {
+                Err(format!("会话 {session_id} 不存在"))
+            }
         }
         other => Err(format!("未知 MCP 工具: {other}")),
     }
+}
+
+fn string_arg<'a>(
+    arguments: &'a Value,
+    name: &str,
+    alias: &str,
+) -> Result<&'a str, String> {
+    arguments
+        .get(name)
+        .or_else(|| arguments.get(alias))
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("缺少 {name} 参数"))
 }

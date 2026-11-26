@@ -148,7 +148,7 @@ export interface McpToolInfo {
 export interface McpServerInfo {
   transport: string;
   command: string;
-  status: "scaffold" | "running" | "stopped";
+  status: "scaffold" | "ready" | "running" | "stopped";
   tools: McpToolInfo[];
   authorizedConnections: number;
   activeSessions: number;
