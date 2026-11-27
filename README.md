@@ -20,6 +20,9 @@ ShellX 面向两类使用者：
 | 模块 | 状态 | 说明 |
 | --- | --- | --- |
 | GUI 布局、连接管理、分组、搜索 | ✅ 已实现 | 连接元数据持久化到应用数据目录 |
+| 工作台布局与命令面板 | ✅ 已实现 | 48px 图标栏 + 可收起连接面板 + `Ctrl+Shift+P` 命令面板 + 底部状态栏 |
+| 无边框窗口与自定义标题栏 | ✅ 已实现 | 最小化 / 最大化 / 关闭在右上角命令搜索右侧，支持拖动与边缘缩放 |
+| 统一设计系统与动效 | ✅ 已实现 | Tailwind/shadcn tokens、Sheet 推拉、弹窗动画、窗口自适应与减少动态效果支持 |
 | 多标签终端（xterm.js + 真实 PTY） | ✅ 已实现 | 每个连接一个终端页，支持切换/关闭、窗口自适应 |
 | 真实 SSH 通道 | ✅ 已实现 | `russh` + PTY，支持密码、私钥、SSH Agent |
 | SSH Agent | ✅ 已实现 | Windows OpenSSH Agent / Pageant，Unix `SSH_AUTH_SOCK` |
@@ -61,14 +64,20 @@ ShellX 面向两类使用者：
 3. 连接成功后进入真实交互式 shell；窗口缩放会同步远端 PTY 尺寸。
 4. 连接中可点击 **取消**；断线后点击 **重新连接**。
 5. 密钥变更时会拒绝连接，并提供「移除该主机密钥并重试」入口。
-6. 点击顶部 **审计日志** 查看连接、断开、失败记录。
+6. 点击左侧审计图标（或 `Ctrl+Shift+P` 搜索「审计日志」）查看连接、断开、失败记录。
 
 浏览器 Mock 模式主要用于预览 UI 和策略/审批流程，不建立任何网络连接。
+
+窗口采用工作台布局：左侧 48px 图标栏固定，连接面板可通过底部按钮或 `Ctrl+Shift+B` 收起；`Ctrl+Shift+P` 打开命令面板，可搜索连接、切换标签页，或执行新建、导入、SFTP、转发、MCP、审计和设置等操作。MCP 权限与客户端配置收在左侧盾牌图标菜单和底栏 MCP 状态里。
+
+窗口使用无边框自定义标题栏：最小化、最大化/还原和关闭按钮位于右上角命令搜索右侧；拖动顶部图标栏、连接面板标题或标签栏空白处可以移动窗口，窗口四边和四角可拖动缩放。抽屉以右侧 Sheet 滑入滑出，弹窗使用统一的遮罩、模糊与进入动画，并支持 `prefers-reduced-motion`。
 
 ### 终端快捷键
 
 | 快捷键 | 功能 |
 | --- | --- |
+| `Ctrl+Shift+P` | 打开命令面板（连接 / 标签页 / 操作） |
+| `Ctrl+Shift+B` | 收起 / 展开连接面板 |
 | `Ctrl+Shift+F` | 搜索终端输出 |
 | `Ctrl+Shift+T` | 复制当前会话（同主机新标签） |
 | `Ctrl+Shift+D` | 左右分屏 |
@@ -87,7 +96,9 @@ URL 使用系统默认浏览器打开（通过 Tauri opener 插件）。终端�
 ## 架构
 
 ```
-Tauri Frontend (React + TS + xterm.js)
+Tauri Frontend (React + TS + Tailwind CSS v4 + shadcn/ui + xterm.js)
+  ├─ components/shell   图标栏 / 连接面板 / 命令面板 / 状态栏
+  ├─ components/ui      shadcn/ui（Radix）组件
   ├─ 连接管理器 / 终端工作台 / 审批弹窗 / 审计面板
   └─ src/lib/api.ts  ── Tauri invoke ──┐
                                        v
@@ -120,10 +131,13 @@ Tauri Backend / Local Core (Rust)
 ```
 shellx/
 ├─ src/                      React 前端
-│  ├─ components/            Sidebar / TerminalPane / HostKeyDialog / 审批 / 审计 / 连接弹窗
+│  ├─ components/shell/      图标栏 / 连接面板 / 命令面板 / 状态栏 / 窗口控件
+│  ├─ components/ui/         shadcn/ui（Radix）组件
+│  ├─ components/            TerminalPane / HostKeyDialog / 审批 / 审计 / 连接弹窗
 │  ├─ lib/api.ts             Tauri 调用封装 + 浏览器 Mock 后端
 │  ├─ lib/types.ts           与 Rust serde 模型对应的类型
-│  └─ styles.css             暗色终端工作台样式
+│  ├─ index.css              Tailwind v4 + shadcn 主题 tokens
+│  └─ styles.css             终端与旧面板样式（逐步迁移中）
 ├─ src-tauri/                Rust 核心（Tauri 2）
 │  ├─ src/models.rs          领域模型（camelCase 序列化）
 │  ├─ src/ssh.rs             SSH/PTY 传输与主机密钥策略
@@ -146,7 +160,7 @@ shellx/
 
 安全控制**不依赖 Prompt 自律**，全部在 Rust 侧统一执行：
 
-- **默认最小权限**：新连接默认 `mcpAccess = disabled`。侧边栏「本地 MCP → MCP 权限设置」可以按全局/分组/连接自由调整。
+- **默认最小权限**：新连接默认 `mcpAccess = disabled`。左侧 MCP 图标菜单或底栏 MCP 状态可以按全局/分组/连接自由调整。
 - **MCP 权限策略**：全局默认 → 分组 → 连接 → 能力上限。每个节点可配置可见性、访问级别（只读 / 读写 / 完全访问）、确认阈值（关闭 / 中风险起 / 高风险起）；SFTP 与端口转发还可以单独收紧。工具可以逐个禁用，禁用后不会出现在 `tools/list`，调用也会被拒绝。
 - **手动终端**：仍按环境风险矩阵执行，不受 MCP 权限页影响。
 - **环境风险矩阵（手动终端与旧配置迁移默认值）**：
@@ -272,7 +286,7 @@ shellx --mcp-stdio --data-dir "$APPDATA/com.shellx.app"
 
 ### MCP 客户端配置
 
-侧边栏「本地 MCP → 客户端配置」会根据当前运行的可执行文件路径生成对应客户端的配置，并支持一键复制：
+左侧 MCP 图标菜单中的「客户端配置」会根据当前运行的可执行文件路径生成对应客户端的配置，并支持一键复制：
 
 Claude Code、Cursor、CodeBuddy Code CLI、ZCode、TRAE、VS Code、Windsurf、Codex、DeepSeek Harness、OpenCode、Pi、Cherry Studio、Qoder、WorkBuddy、Antigravity。
 
@@ -280,7 +294,7 @@ Claude Code、Cursor、CodeBuddy Code CLI、ZCode、TRAE、VS Code、Windsurf、
 
 ### MCP 权限设置
 
-侧边栏「本地 MCP → MCP 权限设置」打开配置抽屉，所有 MCP/Agent 调用共用一份策略：
+左侧 MCP 图标菜单中的「MCP 权限设置」或底栏 MCP 状态打开配置抽屉，所有 MCP/Agent 调用共用一份策略：
 
 - **全局默认 → 分组 → 连接** 逐级继承；每个节点可以覆盖访问级别和确认阈值。
 - **可见范围**：全部连接，或只暴露资源树中勾选的分组/连接。
@@ -341,3 +355,7 @@ Claude Code、Cursor、CodeBuddy Code CLI、ZCode、TRAE、VS Code、Windsurf、
 - 「启动时恢复工作区」默认关闭；开启后会在应用启动时使用已保存连接自动重连。
 - 「记录终端输出」默认关闭；日志可能包含敏感输出，请自行控制访问权限。
 - PTY 输出会按约 8ms / 64KiB 合并后发送到前端，减少高频小包造成的 IPC 与重绘开销；每个会话有 1MiB 未确认窗口，xterm 解析完一批后回执。UI 处理不过来时后端会暂停读取，russh 内部队列填满后由 TCP 反向节流远端进程。
+- 界面使用 Tailwind CSS v4 + shadcn/ui（Radix）+ lucide-react，Geist 字体随包本地加载，不依赖 CDN。Tailwind v4 需要支持 Safari 16.4+ / Chrome 111+ 的 WebView：Windows WebView2 无影响，macOS 建议 13.3+；需要兼容更老的 macOS 时应改用 Tailwind v3。
+- `Ctrl+Shift+P` / `Ctrl+Shift+B` 是应用级快捷键，不占用终端 shell 常用的 `Ctrl+K` / `Ctrl+B`。命令面板和连接面板的快捷键在终端获得焦点时同样生效。
+- 窗口无系统边框（`decorations: false`），因此不使用 Windows 原生的 Snap Layouts 悬停面板；仍然可以用 `Win` + 方向键或第三方窗口管理工具。窗口控制按钮走 Tauri Window API，需要在 `capabilities/default.json` 中保留 `core:window:allow-minimize`、`allow-toggle-maximize`、`allow-close`、`allow-is-maximized`、`allow-start-dragging` 与 `allow-start-resize-dragging` 权限。
+- 抽屉使用 shadcn `Sheet`，关闭时会保留约 240ms 播放滑出动画（`KeepMounted`）；旧版自定义弹窗已经统一为相同的遮罩、圆角、配色和进入动画，后续会把剩余弹窗逐步迁到 `Dialog`。

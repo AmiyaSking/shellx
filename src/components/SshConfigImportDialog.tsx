@@ -171,6 +171,14 @@ export default function SshConfigImportDialog({
     };
   }, [existingConnections]);
 
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const hosts = useMemo(() => preview?.hosts ?? [], [preview]);
   const existingCount = useMemo(
     () => hosts.filter((host) => isExisting(host)).length,

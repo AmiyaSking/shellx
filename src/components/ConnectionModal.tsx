@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   ENV_LABELS,
   MCP_ACCESS_LABELS,
@@ -77,6 +77,14 @@ export default function ConnectionModal({
   const [form, setForm] = useState<FormState>(() => initialForm(connection));
   const [saving, setSaving] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   const groups = useMemo(
     () => [...new Set(connections.map((item) => item.group).filter(Boolean))],

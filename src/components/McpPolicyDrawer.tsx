@@ -13,8 +13,10 @@ import {
   type McpRuleTarget,
   type McpToolState,
 } from "../lib/types";
+import DrawerShell from "./shell/DrawerShell";
 
 interface Props {
+  open: boolean;
   onClose: () => void;
   onSaved?: () => void;
   onOpenAudit?: (filter: string) => void;
@@ -197,6 +199,7 @@ const TOOL_GROUPS: Array<{ title: string; match: (name: string) => boolean }> = 
 ];
 
 export default function McpPolicyDrawer({
+  open,
   onClose,
   onSaved,
   onOpenAudit,
@@ -228,14 +231,6 @@ export default function McpPolicyDrawer({
   useEffect(() => {
     void load();
   }, [load]);
-
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
 
   const toggleExpanded = (id: string) => {
     setExpanded((current) => {
@@ -287,17 +282,20 @@ export default function McpPolicyDrawer({
 
   if (loading || !snapshot || !draft) {
     return (
-      <div className="drawer-backdrop" role="presentation" onClick={onClose}>
-        <aside className="drawer mcp-policy-drawer" onClick={(e) => e.stopPropagation()}>
-          <div className="drawer-head">
-            <h2>MCP 权限</h2>
-            <button className="icon-btn" onClick={onClose} aria-label="关闭">
-              ×
-            </button>
-          </div>
-          <p className="muted">{error ?? "读取权限策略中…"}</p>
-        </aside>
-      </div>
+      <DrawerShell
+        open={open}
+        onClose={onClose}
+        label="MCP 权限"
+        width="min(1120px,100vw)"
+      >
+        <div className="drawer-head">
+          <h2>MCP 权限</h2>
+          <button className="icon-btn" onClick={onClose} aria-label="关闭">
+            ×
+          </button>
+        </div>
+        <p className="muted">{error ?? "读取权限策略中…"}</p>
+      </DrawerShell>
     );
   }
 
@@ -371,14 +369,12 @@ export default function McpPolicyDrawer({
   );
 
   return (
-    <div className="drawer-backdrop" role="presentation" onClick={onClose}>
-      <aside
-        className="drawer mcp-policy-drawer"
-        role="dialog"
-        aria-modal="true"
-        aria-label="MCP 权限"
-        onClick={(event) => event.stopPropagation()}
-      >
+    <DrawerShell
+      open={open}
+      onClose={onClose}
+      label="MCP 权限"
+      width="min(1120px,100vw)"
+    >
         <div className="drawer-head">
           <div>
             <h2>MCP 权限</h2>
@@ -810,7 +806,6 @@ export default function McpPolicyDrawer({
             </button>
           </div>
         </div>
-      </aside>
-    </div>
+    </DrawerShell>
   );
 }

@@ -7,9 +7,11 @@ import type {
   ForwardRuleInput,
   ForwardStatus,
 } from "../lib/types";
+import DrawerShell from "./shell/DrawerShell";
 
 interface Props {
   connections: Connection[];
+  open: boolean;
   onClose: () => void;
 }
 
@@ -35,7 +37,7 @@ function defaultForm(connectionId: string): FormState {
   };
 }
 
-export default function ForwardDrawer({ connections, onClose }: Props) {
+export default function ForwardDrawer({ connections, open, onClose }: Props) {
   const [rules, setRules] = useState<ForwardRule[]>([]);
   const [statuses, setStatuses] = useState<Map<string, ForwardStatus>>(
     () => new Map(),
@@ -81,14 +83,6 @@ export default function ForwardDrawer({ connections, onClose }: Props) {
     }, 4000);
     return () => window.clearInterval(timer);
   }, [refresh]);
-
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !formOpen) onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [formOpen, onClose]);
 
   const openNew = () => {
     setEditingId(null);
@@ -210,14 +204,15 @@ export default function ForwardDrawer({ connections, onClose }: Props) {
   };
 
   return (
-    <div className="drawer-backdrop" role="presentation" onClick={onClose}>
-      <aside
-        className="drawer forward-drawer"
-        role="dialog"
-        aria-modal="true"
-        aria-label="端口转发"
-        onClick={(event) => event.stopPropagation()}
-      >
+    <DrawerShell
+      open={open}
+      onClose={onClose}
+      label="端口转发"
+      width="min(560px,100vw)"
+      onEscapeKeyDown={(event) => {
+        if (formOpen) event.preventDefault();
+      }}
+    >
         <div className="drawer-head">
           <div>
             <h2>端口转发</h2>
@@ -459,7 +454,6 @@ export default function ForwardDrawer({ connections, onClose }: Props) {
         <p className="muted small">
           每个运行中的规则使用独立 SSH 连接；停止规则会立即中断活动隧道。
         </p>
-      </aside>
-    </div>
+    </DrawerShell>
   );
 }

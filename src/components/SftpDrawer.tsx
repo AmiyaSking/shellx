@@ -8,10 +8,12 @@ import type {
   SftpListing,
   SftpProgressEvent,
 } from "../lib/types";
+import DrawerShell from "./shell/DrawerShell";
 
 interface Props {
   connections: Connection[];
   initialConnectionId?: string | null;
+  open: boolean;
   onClose: () => void;
 }
 
@@ -44,6 +46,7 @@ function formatDate(value?: string | null): string {
 export default function SftpDrawer({
   connections,
   initialConnectionId,
+  open,
   onClose,
 }: Props) {
   const [connectionId, setConnectionId] = useState(
@@ -82,14 +85,6 @@ export default function SftpDrawer({
     });
     return () => unlisten?.();
   }, []);
-
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
 
   const connect = useCallback(async () => {
     if (!connectionId) return;
@@ -291,14 +286,12 @@ export default function SftpDrawer({
       : null;
 
   return (
-    <div className="drawer-backdrop" role="presentation" onClick={onClose}>
-      <aside
-        className="drawer sftp-drawer"
-        role="dialog"
-        aria-modal="true"
-        aria-label="SFTP 文件浏览"
-        onClick={(event) => event.stopPropagation()}
-      >
+    <DrawerShell
+      open={open}
+      onClose={onClose}
+      label="SFTP 文件浏览"
+      width="min(880px,100vw)"
+    >
         <div className="drawer-head">
           <div>
             <h2>SFTP 文件</h2>
@@ -518,7 +511,6 @@ export default function SftpDrawer({
         <p className="muted small">
           双击目录进入，双击文件或点击「下载」保存到本机。上传会覆盖同名远端文件。
         </p>
-      </aside>
-    </div>
+    </DrawerShell>
   );
 }

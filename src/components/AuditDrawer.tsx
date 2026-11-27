@@ -6,13 +6,19 @@ import {
   RISK_LABELS,
   type AuditEntry,
 } from "../lib/types";
+import DrawerShell from "./shell/DrawerShell";
 
 interface Props {
+  open: boolean;
   onClose: () => void;
   initialFilter?: string;
 }
 
-export default function AuditDrawer({ onClose, initialFilter = "" }: Props) {
+export default function AuditDrawer({
+  open,
+  onClose,
+  initialFilter = "",
+}: Props) {
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -34,14 +40,6 @@ export default function AuditDrawer({ onClose, initialFilter = "" }: Props) {
     void load();
   }, [load]);
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   const keyword = filter.trim().toLowerCase();
   const visible = entries.filter((entry) => {
     if (!keyword) return true;
@@ -57,14 +55,7 @@ export default function AuditDrawer({ onClose, initialFilter = "" }: Props) {
   });
 
   return (
-    <div className="drawer-backdrop" role="presentation" onClick={onClose}>
-      <aside
-        className="drawer"
-        role="dialog"
-        aria-modal="true"
-        aria-label="审计日志"
-        onClick={(event) => event.stopPropagation()}
-      >
+    <DrawerShell open={open} onClose={onClose} label="审计日志">
         <div className="drawer-head">
           <div>
             <h2>审计日志</h2>
@@ -146,7 +137,6 @@ export default function AuditDrawer({ onClose, initialFilter = "" }: Props) {
             </div>
           ))}
         </div>
-      </aside>
-    </div>
+    </DrawerShell>
   );
 }

@@ -2,12 +2,14 @@ import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { writeClipboardText } from "../lib/clipboard";
 import { MCP_CLIENTS, type McpLaunchInfo } from "../lib/mcpClientConfigs";
+import DrawerShell from "./shell/DrawerShell";
 
 interface Props {
+  open: boolean;
   onClose: () => void;
 }
 
-export default function McpClientConfigDrawer({ onClose }: Props) {
+export default function McpClientConfigDrawer({ open, onClose }: Props) {
   const [launch, setLaunch] = useState<McpLaunchInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [clientId, setClientId] = useState(MCP_CLIENTS[0]?.id ?? "");
@@ -28,14 +30,6 @@ export default function McpClientConfigDrawer({ onClose }: Props) {
     };
   }, []);
 
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
   const client =
     MCP_CLIENTS.find((candidate) => candidate.id === clientId) ??
     MCP_CLIENTS[0];
@@ -49,14 +43,12 @@ export default function McpClientConfigDrawer({ onClose }: Props) {
   };
 
   return (
-    <div className="drawer-backdrop" role="presentation" onClick={onClose}>
-      <aside
-        className="drawer mcp-config-drawer"
-        role="dialog"
-        aria-modal="true"
-        aria-label="MCP 客户端配置"
-        onClick={(event) => event.stopPropagation()}
-      >
+    <DrawerShell
+      open={open}
+      onClose={onClose}
+      label="MCP 客户端配置"
+      width="min(900px,100vw)"
+    >
         <div className="drawer-head">
           <div>
             <h2>MCP 客户端配置</h2>
@@ -125,7 +117,6 @@ export default function McpClientConfigDrawer({ onClose }: Props) {
             关闭
           </button>
         </div>
-      </aside>
-    </div>
+    </DrawerShell>
   );
 }

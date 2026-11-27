@@ -8,6 +8,7 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { Plus, SquareTerminal } from "lucide-react";
 import { api, isTauri } from "./lib/api";
 import {
   loadSettings,
@@ -30,13 +31,20 @@ import McpClientConfigDrawer from "./components/McpClientConfigDrawer";
 import McpPolicyDrawer from "./components/McpPolicyDrawer";
 import SettingsDrawer from "./components/SettingsDrawer";
 import SftpDrawer from "./components/SftpDrawer";
-import Sidebar from "./components/Sidebar";
 import SshConfigImportDialog from "./components/SshConfigImportDialog";
 import TabBar, {
   type TerminalPaneState,
   type TerminalTab,
 } from "./components/TabBar";
 import TerminalPane from "./components/TerminalPane";
+import AppRail from "./components/shell/AppRail";
+import CommandPalette from "./components/shell/CommandPalette";
+import ConnectionExplorer from "./components/shell/ConnectionExplorer";
+import KeepMounted from "./components/shell/KeepMounted";
+import StatusBar from "./components/shell/StatusBar";
+import WindowResizeHandles from "./components/shell/WindowResizeHandles";
+import { Button } from "./components/ui/button";
+import { TooltipProvider } from "./components/ui/tooltip";
 
 let tabSeq = 0;
 let paneSeq = 0;
@@ -110,6 +118,8 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
   const [workspaceReady, setWorkspaceReady] = useState(false);
+  const [explorerOpen, setExplorerOpen] = useState(true);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const workspaceRestoredRef = useRef(false);
 
   const connectionById = useMemo(
@@ -586,6 +596,50 @@ export default function App() {
     [activePane, activeTab, splitPane],
   );
 
+  const toggleExplorer = useCallback(() => {
+    setExplorerOpen((open) => !open);
+  }, []);
+
+  const closeSidePanels = useCallback(() => {
+    setAuditOpen(false);
+    setSettingsOpen(false);
+    setForwardOpen(false);
+    setSftpOpen(false);
+    setMcpPolicyOpen(false);
+    setMcpConfigOpen(false);
+  }, []);
+
+  const openFiles = useCallback(() => {
+    closeSidePanels();
+    setSftpOpen(true);
+  }, [closeSidePanels]);
+
+  const openForwards = useCallback(() => {
+    closeSidePanels();
+    setForwardOpen(true);
+  }, [closeSidePanels]);
+
+  const openAudit = useCallback(() => {
+    closeSidePanels();
+    setAuditFilter("");
+    setAuditOpen(true);
+  }, [closeSidePanels]);
+
+  const openSettings = useCallback(() => {
+    closeSidePanels();
+    setSettingsOpen(true);
+  }, [closeSidePanels]);
+
+  const openMcpPolicy = useCallback(() => {
+    closeSidePanels();
+    setMcpPolicyOpen(true);
+  }, [closeSidePanels]);
+
+  const openMcpConfig = useCallback(() => {
+    closeSidePanels();
+    setMcpConfigOpen(true);
+  }, [closeSidePanels]);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const mod = event.ctrlKey || event.metaKey;
@@ -595,7 +649,11 @@ export default function App() {
         auditOpen ||
         settingsOpen ||
         forwardOpen ||
-        sftpOpen
+        sftpOpen ||
+        mcpPolicyOpen ||
+        mcpConfigOpen ||
+        importOpen ||
+        paletteOpen
       ) {
         return;
       }
@@ -609,6 +667,18 @@ export default function App() {
       if (typing) return;
 
       const key = event.key.toLowerCase();
+      if (event.shiftKey && key === "p") {
+        event.preventDefault();
+        event.stopPropagation();
+        setPaletteOpen(true);
+        return;
+      }
+      if (event.shiftKey && key === "b") {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleExplorer();
+        return;
+      }
       if (event.shiftKey && key === "t") {
         event.preventDefault();
         event.stopPropagation();
@@ -660,97 +730,45 @@ export default function App() {
     closeActivePane,
     duplicateActiveTab,
     forwardOpen,
+    importOpen,
+    mcpConfigOpen,
+    mcpPolicyOpen,
     modal,
+    paletteOpen,
     selectTab,
     settingsOpen,
     sftpOpen,
     splitActivePane,
     tabs,
+    toggleExplorer,
   ]);
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">SX</span>
-          <div>
-            <div className="brand-name">ShellX</div>
-            <div className="brand-sub">安全 MCP 终端 · 脚手架</div>
-          </div>
-        </div>
-        <div className="topbar-meta">
-          {!isTauri() && <span className="chip chip-mock">浏览器 Mock 模式</span>}
-          <span className="chip">{connections.length} 个连接</span>
-          <span className="chip">{tabs.length} 个会话页</span>
-          <button
-            className="btn btn-ghost"
-            onClick={() => {
-              setSftpOpen(true);
-              setForwardOpen(false);
-              setAuditOpen(false);
-              setSettingsOpen(false);
-            }}
-          >
-            文件
-          </button>
-          <button
-            className="btn btn-ghost"
-            onClick={() => {
-              setForwardOpen(true);
-              setSftpOpen(false);
-              setAuditOpen(false);
-              setSettingsOpen(false);
-              setMcpPolicyOpen(false);
-              setMcpConfigOpen(false);
-            }}
-          >
-            转发
-          </button>
-          <button
-            className="btn btn-ghost"
-            onClick={() => {
-              setSettingsOpen(true);
-              setAuditOpen(false);
-              setForwardOpen(false);
-              setSftpOpen(false);
-              setMcpPolicyOpen(false);
-              setMcpConfigOpen(false);
-            }}
-          >
-            设置
-          </button>
-          <button
-            className="btn btn-ghost"
-            onClick={() => {
-              setAuditFilter("");
-              setAuditOpen(true);
-              setSettingsOpen(false);
-              setForwardOpen(false);
-              setSftpOpen(false);
-              setMcpPolicyOpen(false);
-              setMcpConfigOpen(false);
-            }}
-          >
-            审计日志
-          </button>
-        </div>
-      </header>
+    <TooltipProvider delayDuration={250}>
+      <div className="flex h-screen w-screen overflow-hidden bg-background text-foreground">
+        <AppRail
+          explorerOpen={explorerOpen}
+          sftpOpen={sftpOpen}
+          forwardOpen={forwardOpen}
+          auditOpen={auditOpen}
+          settingsOpen={settingsOpen}
+          mcpPolicyOpen={mcpPolicyOpen}
+          mcpConfigOpen={mcpConfigOpen}
+          mcpInfo={mcpInfo}
+          onToggleExplorer={toggleExplorer}
+          onOpenFiles={openFiles}
+          onOpenForwards={openForwards}
+          onOpenAudit={openAudit}
+          onOpenSettings={openSettings}
+          onOpenMcpPolicy={openMcpPolicy}
+          onOpenMcpConfig={openMcpConfig}
+        />
 
-      {error && (
-        <div className="error-banner">
-          <span>{error}</span>
-          <button className="btn btn-ghost btn-sm" onClick={() => setError(null)}>
-            关闭
-          </button>
-        </div>
-      )}
-
-      <div className="app-body">
-        <Sidebar
+        <ConnectionExplorer
+          open={explorerOpen}
           connections={connections}
           activeConnectionId={activeConnection?.id ?? null}
           loading={loading}
-          mcpInfo={mcpInfo}
           onOpen={openConnection}
           onNew={() => setModal({ mode: "create" })}
           onImport={() => {
@@ -758,25 +776,23 @@ export default function App() {
             setModal(null);
           }}
           onEdit={(connection) => setModal({ mode: "edit", connection })}
-          onOpenMcpPolicy={() => {
-            setMcpPolicyOpen(true);
-            setMcpConfigOpen(false);
-            setAuditOpen(false);
-            setSettingsOpen(false);
-            setForwardOpen(false);
-            setSftpOpen(false);
-          }}
-          onOpenMcpConfig={() => {
-            setMcpConfigOpen(true);
-            setMcpPolicyOpen(false);
-            setAuditOpen(false);
-            setSettingsOpen(false);
-            setForwardOpen(false);
-            setSftpOpen(false);
-          }}
+          onCollapse={() => setExplorerOpen(false)}
         />
 
-        <main className="workspace">
+        <main className="flex min-w-0 flex-1 flex-col bg-[#090a0c]">
+          {error && (
+            <div className="flex shrink-0 items-center justify-between gap-3 border-b border-red-500/25 bg-red-500/10 px-3 py-1.5 text-xs text-red-200">
+              <span className="truncate">{error}</span>
+              <button
+                type="button"
+                onClick={() => setError(null)}
+                className="shrink-0 rounded px-2 py-0.5 text-[10.5px] text-red-100/80 transition-colors hover:bg-white/10"
+              >
+                关闭
+              </button>
+            </div>
+          )}
+
           <TabBar
             tabs={tabs}
             connections={connectionById}
@@ -786,20 +802,46 @@ export default function App() {
             onNew={duplicateActiveTab}
             onRename={renameTab}
             onMove={moveTab}
+            onOpenPalette={() => setPaletteOpen(true)}
           />
 
-          <div className="terminal-area">
+          <div className="flex min-h-0 flex-1 flex-col">
             {tabs.length === 0 && (
-              <div className="empty-state">
-                <div className="empty-icon">⌁</div>
-                <h2>没有打开的终端</h2>
-                <p>
-                  从左侧选择一个服务器开始，或先创建一条连接。新建连接默认
-                  <strong> 不对 MCP 开放</strong>。
-                </p>
-                <button className="btn btn-primary" onClick={() => setModal({ mode: "create" })}>
-                  新建连接
-                </button>
+              <div className="flex flex-1 flex-col items-center justify-center gap-4 px-6 text-center">
+                <div className="grid size-12 place-items-center rounded-xl border border-border bg-card text-primary">
+                  <SquareTerminal className="size-6" />
+                </div>
+                <div>
+                  <h2 className="m-0 text-[15px] font-semibold text-foreground">
+                    没有打开的终端
+                  </h2>
+                  <p className="m-0 mt-1.5 max-w-sm text-xs leading-relaxed text-muted-foreground">
+                    从左侧选择一个服务器开始，或先创建一条连接。新建连接默认
+                    <strong className="font-medium text-foreground">
+                      {" "}
+                      不对 MCP 开放
+                    </strong>
+                    。
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    onClick={() => setModal({ mode: "create" })}
+                    className="gap-1.5"
+                  >
+                    <Plus className="size-3.5" />
+                    新建连接
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    onClick={() => setImportOpen(true)}
+                    className="text-xs font-normal text-muted-foreground hover:text-foreground"
+                  >
+                    从 SSH config 导入
+                  </Button>
+                </div>
               </div>
             )}
 
@@ -857,77 +899,118 @@ export default function App() {
               </div>
             ))}
           </div>
+
+          <StatusBar
+            activeConnection={activeConnection}
+            mcpInfo={mcpInfo}
+            connectionCount={connections.length}
+            tabCount={tabs.length}
+            mockMode={!isTauri()}
+            onOpenMcpPolicy={openMcpPolicy}
+          />
         </main>
-      </div>
 
-      {auditOpen && (
-        <AuditDrawer
-          initialFilter={auditFilter}
-          onClose={() => setAuditOpen(false)}
-        />
-      )}
-      {mcpPolicyOpen && (
-        <McpPolicyDrawer
-          onClose={() => setMcpPolicyOpen(false)}
-          onSaved={() => void refreshMcpInfo()}
-          onOpenAudit={(filter) => {
-            setMcpPolicyOpen(false);
-            setAuditFilter(filter);
-            setAuditOpen(true);
+        <WindowResizeHandles />
+
+        <KeepMounted open={auditOpen}>
+          <AuditDrawer
+            open={auditOpen}
+            initialFilter={auditFilter}
+            onClose={() => setAuditOpen(false)}
+          />
+        </KeepMounted>
+        <KeepMounted open={mcpPolicyOpen}>
+          <McpPolicyDrawer
+            open={mcpPolicyOpen}
+            onClose={() => setMcpPolicyOpen(false)}
+            onSaved={() => void refreshMcpInfo()}
+            onOpenAudit={(filter) => {
+              setMcpPolicyOpen(false);
+              setAuditFilter(filter);
+              setAuditOpen(true);
+            }}
+          />
+        </KeepMounted>
+        <KeepMounted open={mcpConfigOpen}>
+          <McpClientConfigDrawer
+            open={mcpConfigOpen}
+            onClose={() => setMcpConfigOpen(false)}
+          />
+        </KeepMounted>
+        <KeepMounted open={settingsOpen}>
+          <SettingsDrawer
+            open={settingsOpen}
+            onClose={() => setSettingsOpen(false)}
+          />
+        </KeepMounted>
+        <KeepMounted open={forwardOpen}>
+          <ForwardDrawer
+            connections={connections}
+            open={forwardOpen}
+            onClose={() => setForwardOpen(false)}
+          />
+        </KeepMounted>
+        <KeepMounted open={sftpOpen}>
+          <SftpDrawer
+            connections={connections}
+            initialConnectionId={activeConnection?.id ?? null}
+            open={sftpOpen}
+            onClose={() => setSftpOpen(false)}
+          />
+        </KeepMounted>
+
+        {importOpen && (
+          <SshConfigImportDialog
+            existingConnections={connections}
+            onImported={handleImported}
+            onClose={() => setImportOpen(false)}
+          />
+        )}
+
+        {modal && (
+          <ConnectionModal
+            mode={modal.mode}
+            connection={modal.mode === "edit" ? modal.connection : null}
+            connections={connections}
+            onSave={handleSaved}
+            onDelete={
+              modal.mode === "edit"
+                ? () => handleDelete(modal.connection)
+                : undefined
+            }
+            onClose={() => setModal(null)}
+          />
+        )}
+
+        {authPrompts[0] && (
+          <AuthPromptDialog
+            prompt={authPrompts[0]}
+            onClose={() => setAuthPrompts((current) => current.slice(1))}
+          />
+        )}
+
+        <CommandPalette
+          open={paletteOpen}
+          onOpenChange={setPaletteOpen}
+          connections={connections}
+          tabs={tabs}
+          activeTabId={activeTabId}
+          onOpenConnection={openConnection}
+          onSelectTab={selectTab}
+          onNewConnection={() => setModal({ mode: "create" })}
+          onImport={() => {
+            setImportOpen(true);
+            setModal(null);
           }}
+          onOpenFiles={openFiles}
+          onOpenForwards={openForwards}
+          onOpenMcpPolicy={openMcpPolicy}
+          onOpenMcpConfig={openMcpConfig}
+          onOpenAudit={openAudit}
+          onOpenSettings={openSettings}
+          onToggleExplorer={toggleExplorer}
         />
-      )}
-      {mcpConfigOpen && (
-        <McpClientConfigDrawer
-          onClose={() => setMcpConfigOpen(false)}
-        />
-      )}
-      {settingsOpen && <SettingsDrawer onClose={() => setSettingsOpen(false)} />}
-      {forwardOpen && (
-        <ForwardDrawer
-          connections={connections}
-          onClose={() => setForwardOpen(false)}
-        />
-      )}
-      {sftpOpen && (
-        <SftpDrawer
-          connections={connections}
-          initialConnectionId={activeConnection?.id ?? null}
-          onClose={() => setSftpOpen(false)}
-        />
-      )}
-
-      {importOpen && (
-        <SshConfigImportDialog
-          existingConnections={connections}
-          onImported={handleImported}
-          onClose={() => setImportOpen(false)}
-        />
-      )}
-
-      {modal && (
-        <ConnectionModal
-          mode={modal.mode}
-          connection={modal.mode === "edit" ? modal.connection : null}
-          connections={connections}
-          onSave={handleSaved}
-          onDelete={
-            modal.mode === "edit"
-              ? () => handleDelete(modal.connection)
-              : undefined
-          }
-          onClose={() => setModal(null)}
-        />
-      )}
-
-      {authPrompts[0] && (
-        <AuthPromptDialog
-          prompt={authPrompts[0]}
-          onClose={() =>
-            setAuthPrompts((current) => current.slice(1))
-          }
-        />
-      )}
-    </div>
+      </div>
+    </TooltipProvider>
   );
 }

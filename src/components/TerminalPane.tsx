@@ -13,6 +13,14 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { Terminal } from "@xterm/xterm";
+import {
+  ChevronDown,
+  ChevronUp,
+  Columns2,
+  Rows2,
+  Search,
+  X,
+} from "lucide-react";
 import { api, isTauri } from "../lib/api";
 import { readClipboardText, writeClipboardText } from "../lib/clipboard";
 import {
@@ -39,6 +47,10 @@ import {
 import ApprovalDialog from "./ApprovalDialog";
 import HostKeyDialog from "./HostKeyDialog";
 import PasteConfirmDialog from "./PasteConfirmDialog";
+import { Badge } from "./ui/badge";
+import { Button } from "./ui/button";
+import { ENV_BADGE, ENV_DOT } from "./shell/env";
+import { cn } from "@/lib/utils";
 
 interface Props {
   connection: Connection;
@@ -74,6 +86,14 @@ const STATUS_LABELS: Record<PtyStatus, string> = {
   live: "已连接",
   closed: "已断开",
   error: "连接失败",
+};
+
+const STATUS_TONE: Record<PtyStatus, string> = {
+  idle: "bg-white/5 text-muted-foreground",
+  connecting: "bg-amber-400/10 text-amber-300",
+  live: "bg-emerald-400/10 text-emerald-300",
+  closed: "bg-white/5 text-muted-foreground",
+  error: "bg-red-400/10 text-red-300",
 };
 
 function isPtyOpenError(value: unknown): value is PtyOpenError {
@@ -362,19 +382,19 @@ export default function TerminalPane({
       fontFamily:
         '"JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, monospace',
       theme: {
-        background: "#0a0e13",
-        foreground: "#d8e2ec",
-        cursor: "#5eead4",
-        cursorAccent: "#0a0e13",
-        selectionBackground: "rgba(94, 234, 212, 0.25)",
-        black: "#1b2430",
+        background: "#090a0c",
+        foreground: "#d2d5da",
+        cursor: "#7c8cff",
+        cursorAccent: "#090a0c",
+        selectionBackground: "rgba(124, 140, 255, 0.25)",
+        black: "#1b1d22",
         red: "#f87171",
-        green: "#5eead4",
+        green: "#4ade80",
         yellow: "#fbbf24",
         blue: "#60a5fa",
         magenta: "#c084fc",
         cyan: "#22d3ee",
-        white: "#d8e2ec",
+        white: "#d2d5da",
       },
     });
     const fitAddon = new FitAddon();
@@ -840,101 +860,168 @@ export default function TerminalPane({
       style={style}
       onMouseDownCapture={() => onFocus?.()}
     >
-      <div className="terminal-toolbar">
-        <div className="terminal-identity">
-          <span className={`env-dot env-${connection.environment}`} />
-          <strong>{connection.alias}</strong>
-          <span className={`badge badge-${connection.environment}`}>
+      <div className="@container flex h-9 shrink-0 items-center gap-2 border-b border-border bg-[#0a0b0d] px-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <span
+            className={cn(
+              "size-1.5 shrink-0 rounded-full",
+              ENV_DOT[connection.environment],
+            )}
+          />
+          <strong className="truncate text-[12px] font-medium text-foreground">
+            {connection.alias}
+          </strong>
+          <span
+            className={cn(
+              "shrink-0 rounded px-1 py-px text-[9px] font-semibold",
+              ENV_BADGE[connection.environment],
+            )}
+          >
             {ENV_LABELS[connection.environment]}
           </span>
-          <span className="muted small">
+          <span className="truncate font-mono text-[10px] text-muted-foreground">
             {connection.username}@{connection.host}:{connection.port}
           </span>
-          {connection.jumpHost && <span className="mini-badge">经跳板机</span>}
+          {connection.jumpHost && (
+            <span className="shrink-0 rounded bg-white/5 px-1 py-px text-[9px] text-muted-foreground">
+              经跳板机
+            </span>
+          )}
         </div>
-        <div className="terminal-controls">
-          <button
+
+        <div className="ml-auto flex shrink-0 items-center gap-0.5">
+          <Button
             type="button"
-            className="btn btn-ghost btn-sm"
+            variant="ghost"
+            size="icon-xs"
             title="搜索终端输出（Ctrl+Shift+F）"
+            aria-label="搜索终端输出"
             onClick={() => setSearchOpen(true)}
+            className="text-muted-foreground hover:text-foreground"
           >
-            搜索
-          </button>
+            <Search className="size-3.5" />
+          </Button>
           {onSplitRow && (
-            <button
+            <Button
               type="button"
-              className="icon-btn"
+              variant="ghost"
+              size="icon-xs"
               disabled={!canSplit}
               title="左右分屏（Ctrl+Shift+D）"
+              aria-label="左右分屏"
               onClick={onSplitRow}
+              className="text-muted-foreground hover:text-foreground"
             >
-              ◫
-            </button>
+              <Columns2 className="size-3.5" />
+            </Button>
           )}
           {onSplitColumn && (
-            <button
+            <Button
               type="button"
-              className="icon-btn"
+              variant="ghost"
+              size="icon-xs"
               disabled={!canSplit}
               title="上下分屏（Ctrl+Shift+E）"
+              aria-label="上下分屏"
               onClick={onSplitColumn}
+              className="text-muted-foreground hover:text-foreground"
             >
-              ⬒
-            </button>
+              <Rows2 className="size-3.5" />
+            </Button>
           )}
           {onClosePane && (
-            <button
+            <Button
               type="button"
-              className="icon-btn"
+              variant="ghost"
+              size="icon-xs"
               title="关闭窗格（Ctrl+Shift+W）"
+              aria-label="关闭窗格"
               onClick={onClosePane}
+              className="text-muted-foreground hover:text-foreground"
             >
-              ×
-            </button>
+              <X className="size-3.5" />
+            </Button>
           )}
+
           {PTY_CAPABLE && (
-            <span className={`pty-status pty-${status}`}>{STATUS_LABELS[status]}</span>
+            <span
+              className={cn(
+                "ml-1 rounded-full px-1.5 py-0.5 text-[9px] font-medium",
+                STATUS_TONE[status],
+              )}
+            >
+              {STATUS_LABELS[status]}
+            </span>
           )}
           {PTY_CAPABLE && hostKey && (
-            <span className="muted small" title={`${hostKey.algorithm} ${hostKey.fingerprint}`}>
-              {hostKey.known ? "主机密钥已信任" : "首次记录主机密钥"} · {hostKey.fingerprint.slice(0, 22)}…
+            <span
+              className="ml-1 hidden max-w-40 truncate font-mono text-[9px] text-muted-foreground @3xl:inline"
+              title={`${hostKey.algorithm} ${hostKey.fingerprint}`}
+            >
+              {hostKey.known ? "密钥已信任" : "首次记录"} ·{" "}
+              {hostKey.fingerprint.slice(0, 16)}…
             </span>
           )}
           {PTY_CAPABLE && status === "connecting" && (
-            <button type="button" className="btn btn-ghost btn-sm" onClick={cancelConnect}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              onClick={cancelConnect}
+              className="ml-1 text-[10.5px] font-normal"
+            >
               取消
-            </button>
+            </Button>
           )}
           {PTY_CAPABLE && (status === "error" || status === "closed") && (
-            <button type="button" className="btn btn-ghost btn-sm" onClick={reconnect}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="xs"
+              onClick={reconnect}
+              className="ml-1 text-[10.5px] font-normal"
+            >
               重新连接
-            </button>
+            </Button>
           )}
           {!PTY_CAPABLE && (
-            <span className={`mini-badge mcp-${connection.mcpAccess}`}>
+            <Badge
+              variant="outline"
+              className="ml-1 h-5 rounded px-1.5 text-[9px] font-medium text-muted-foreground"
+            >
               MCP · {MCP_ACCESS_LABELS[connection.mcpAccess]}
-            </span>
+            </Badge>
           )}
           {!PTY_CAPABLE && (
             <button
               type="button"
-              className={`mode-switch ${agentMode ? "is-agent" : ""}`}
+              className={cn(
+                "ml-1 flex h-5 items-center gap-1 rounded-full border px-1.5 text-[9px] transition-colors",
+                agentMode
+                  ? "border-primary/40 bg-primary/15 text-primary"
+                  : "border-border bg-white/[0.03] text-muted-foreground",
+              )}
               onClick={toggleAgentMode}
               title="切换命令来源身份，用于演示 MCP 授权与审批策略"
             >
-              <span className="mode-knob" />
-              {agentMode ? "AI Agent 模式" : "手动模式"}
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  agentMode ? "bg-primary" : "bg-muted-foreground",
+                )}
+              />
+              {agentMode ? "AI Agent" : "手动"}
             </button>
           )}
         </div>
       </div>
 
       {searchOpen && (
-        <div className="terminal-search">
+        <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border bg-[#0a0b0d] px-3">
+          <Search className="size-3.5 shrink-0 text-muted-foreground" />
           <input
             ref={searchInputRef}
-            className="terminal-search-input"
+            className="h-6 min-w-0 flex-1 border-0 bg-transparent px-1 font-mono text-[11px] text-foreground outline-none placeholder:text-muted-foreground"
             value={searchQuery}
             placeholder="搜索终端输出…"
             spellCheck={false}
@@ -952,30 +1039,39 @@ export default function TerminalPane({
               }
             }}
           />
-          <button
+          <Button
             type="button"
-            className="icon-btn"
+            variant="ghost"
+            size="icon-xs"
             title="上一个（Shift+Enter）"
+            aria-label="上一个匹配"
             onClick={() => findInTerminal("previous")}
+            className="text-muted-foreground hover:text-foreground"
           >
-            ↑
-          </button>
-          <button
+            <ChevronUp className="size-3.5" />
+          </Button>
+          <Button
             type="button"
-            className="icon-btn"
+            variant="ghost"
+            size="icon-xs"
             title="下一个（Enter）"
+            aria-label="下一个匹配"
             onClick={() => findInTerminal("next")}
+            className="text-muted-foreground hover:text-foreground"
           >
-            ↓
-          </button>
-          <button
+            <ChevronDown className="size-3.5" />
+          </Button>
+          <Button
             type="button"
-            className="icon-btn"
+            variant="ghost"
+            size="icon-xs"
             title="关闭搜索（Esc）"
+            aria-label="关闭搜索"
             onClick={closeSearch}
+            className="text-muted-foreground hover:text-foreground"
           >
-            ×
-          </button>
+            <X className="size-3.5" />
+          </Button>
         </div>
       )}
 
