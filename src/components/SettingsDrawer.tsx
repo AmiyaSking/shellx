@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   DEFAULT_SETTINGS,
   loadSettings,
   saveSettings,
+  SETTINGS_EVENT,
   type AppSettings,
 } from "../lib/settings";
 import DrawerShell from "./shell/DrawerShell";
@@ -16,6 +17,14 @@ const SCROLLBACK_OPTIONS = [1000, 5000, 10000, 30000, 100000];
 
 export default function SettingsDrawer({ open, onClose }: Props) {
   const [settings, setSettings] = useState<AppSettings>(() => loadSettings());
+
+  useEffect(() => {
+    const onSettings = (event: Event) => {
+      setSettings((event as CustomEvent<AppSettings>).detail);
+    };
+    window.addEventListener(SETTINGS_EVENT, onSettings);
+    return () => window.removeEventListener(SETTINGS_EVENT, onSettings);
+  }, []);
 
   const update = (patch: Partial<AppSettings>) => {
     const next = { ...settings, ...patch };

@@ -60,7 +60,7 @@ describe("workspace", () => {
     expect(loadWorkspace()).toBeNull();
   });
 
-  it("drops malformed panes while keeping valid tabs", () => {
+  it("drops malformed panes and clamps out-of-range indexes", () => {
     window.localStorage.setItem(
       "shellx.workspace.v1",
       JSON.stringify({
@@ -80,7 +80,7 @@ describe("workspace", () => {
     const stored = loadWorkspace();
     expect(stored?.tabs).toHaveLength(1);
     expect(stored?.tabs[0].panes).toEqual([{ connectionId: "ok", size: 1 }]);
-    expect(stored?.tabs[0].activePaneIndex).toBe(5);
-    expect(stored?.activeTabIndex).toBe(99);
+    expect(stored?.tabs[0].activePaneIndex).toBe(0);
+    expect(stored?.activeTabIndex).toBe(0);
   });
 });

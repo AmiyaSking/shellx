@@ -491,44 +491,71 @@ export default function TerminalPane({
     };
 
     /* ------------------------- real SSH PTY session ------------------------- */
+    const earlyExit = new Map<string, PtyExitEvent>();
+    const earlyClosed = new Map<string, PtyClosedEvent>();
+
+    const handleExit = (payload: PtyExitEvent) => {
+      shellExited = true;
+      setStatus("closed");
+      term.write(
+        `\r\n\x1b[38;5;245m[远端 shell 已退出 · code ${payload.exitCode ?? "?"}]\x1b[0m\r\n`,
+      );
+      // Drop the backend entry so active-count and audit stay truthful.
+      void api.ptyClose(payload.sessionId).catch(() => {});
+    };
+
+    const handleClosed = (payload: PtyClosedEvent) => {
+      if (shellExited) return;
+      setStatus("closed");
+      term.write(`\r\n\x1b[38;5;245m[${payload.reason}]\x1b[0m\r\n`);
+      void api.ptyClose(payload.sessionId).catch(() => {});
+    };
+
     let listenersReady = false;
+    const addListener = async <T,>(
+      event: string,
+      handler: (event: { payload: T }) => void,
+    ) => {
+      const dispose = await listen<T>(event, handler);
+      if (disposed) {
+        dispose();
+        return;
+      }
+      unlisteners.push(dispose);
+    };
+
     const register = async () => {
       if (listenersReady) return;
       listenersReady = true;
-      unlisteners.push(
-        await listen<PtyOutputEvent>("pty:output", ({ payload }) => {
-          if (disposed) return;
-          if (!sessionId) {
-            const queued = early.get(payload.sessionId) ?? [];
-            queued.push(payload.data);
-            early.set(payload.sessionId, queued);
-            return;
-          }
-          if (payload.sessionId !== sessionId) return;
-          writeChunk(payload.sessionId, payload.data);
-        }),
-      );
-      unlisteners.push(
-        await listen<PtyExitEvent>("pty:exit", ({ payload }) => {
-          if (disposed || payload.sessionId !== sessionId) return;
-          shellExited = true;
-          setStatus("closed");
-          term.write(
-            `\r\n\x1b[38;5;245m[远端 shell 已退出 · code ${payload.exitCode ?? "?"}]\x1b[0m\r\n`,
-          );
-          // Drop the backend entry so active-count and audit stay truthful.
-          void api.ptyClose(payload.sessionId).catch(() => {});
-        }),
-      );
-      unlisteners.push(
-        await listen<PtyClosedEvent>("pty:closed", ({ payload }) => {
-          if (disposed || payload.sessionId !== sessionId) return;
-          if (shellExited) return;
-          setStatus("closed");
-          term.write(`\r\n\x1b[38;5;245m[${payload.reason}]\x1b[0m\r\n`);
-          void api.ptyClose(payload.sessionId).catch(() => {});
-        }),
-      );
+      await addListener<PtyOutputEvent>("pty:output", ({ payload }) => {
+        if (disposed) return;
+        if (!sessionId) {
+          const queued = early.get(payload.sessionId) ?? [];
+          queued.push(payload.data);
+          early.set(payload.sessionId, queued);
+          return;
+        }
+        if (payload.sessionId !== sessionId) return;
+        writeChunk(payload.sessionId, payload.data);
+      });
+      await addListener<PtyExitEvent>("pty:exit", ({ payload }) => {
+        if (disposed) return;
+        if (!sessionId) {
+          earlyExit.set(payload.sessionId, payload);
+          return;
+        }
+        if (payload.sessionId !== sessionId) return;
+        handleExit(payload);
+      });
+      await addListener<PtyClosedEvent>("pty:closed", ({ payload }) => {
+        if (disposed) return;
+        if (!sessionId) {
+          earlyClosed.set(payload.sessionId, payload);
+          return;
+        }
+        if (payload.sessionId !== sessionId) return;
+        handleClosed(payload);
+      });
     };
 
     const startPty = async () => {
@@ -540,6 +567,7 @@ export default function TerminalPane({
 
       try {
         await register();
+        if (disposed) return;
         term.writeln(
           `\x1b[38;5;245m正在连接 ${conn.username}@${conn.host}:${conn.port} …\x1b[0m`,
         );
@@ -564,6 +592,12 @@ export default function TerminalPane({
         const queued = early.get(sessionId);
         early.clear();
         if (queued) queued.forEach((data) => writeChunk(opened.sessionId, data));
+        const pendingExit = earlyExit.get(opened.sessionId);
+        const pendingClosed = earlyClosed.get(opened.sessionId);
+        earlyExit.clear();
+        earlyClosed.clear();
+        if (pendingExit) handleExit(pendingExit);
+        else if (pendingClosed) handleClosed(pendingClosed);
         safeFit();
         term.focus();
       } catch (err) {
@@ -1156,6 +1190,7 @@ export default function TerminalPane({
 
       {approval && (
         <ApprovalDialog
+          key={approval.id}
           approval={approval}
           onResolved={(outcome) => {
             setApproval(null);

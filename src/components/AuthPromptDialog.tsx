@@ -15,6 +15,14 @@ export default function AuthPromptDialog({ prompt, onClose }: Props) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // The parent reuses this component for queued prompts; never leak the
+  // previous prompt's answers or busy state into the next one.
+  useEffect(() => {
+    setAnswers(prompt.prompts.map(() => ""));
+    setBusy(false);
+    setError(null);
+  }, [prompt.promptId]);
+
   const cancel = async () => {
     if (busy) return;
     setBusy(true);
@@ -23,6 +31,7 @@ export default function AuthPromptDialog({ prompt, onClose }: Props) {
     } catch {
       // The connection will time out or be cancelled separately.
     } finally {
+      setBusy(false);
       onClose();
     }
   };
@@ -33,7 +42,7 @@ export default function AuthPromptDialog({ prompt, onClose }: Props) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  });
+  }, [busy, prompt.promptId]);
 
   const submit = async () => {
     setBusy(true);
@@ -45,6 +54,7 @@ export default function AuthPromptDialog({ prompt, onClose }: Props) {
         setBusy(false);
         return;
       }
+      setBusy(false);
       onClose();
     } catch (err) {
       setError(String(err));

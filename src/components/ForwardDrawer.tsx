@@ -77,12 +77,27 @@ export default function ForwardDrawer({ connections, open, onClose }: Props) {
   }, []);
 
   useEffect(() => {
-    void refresh();
+    if (!open) return;
+    let cancelled = false;
+    let inFlight = false;
+    const tick = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        if (!cancelled) await refresh();
+      } finally {
+        inFlight = false;
+      }
+    };
+    void tick();
     const timer = window.setInterval(() => {
-      void refresh();
+      void tick();
     }, 4000);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [open, refresh]);
 
   const openNew = () => {
     setEditingId(null);

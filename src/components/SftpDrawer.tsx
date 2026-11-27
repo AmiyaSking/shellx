@@ -64,9 +64,11 @@ export default function SftpDrawer({
   const [notice, setNotice] = useState<string | null>(null);
   const [progress, setProgress] = useState<SftpProgressEvent | null>(null);
   const sessionRef = useRef<string | null>(null);
+  const connectSeq = useRef(0);
 
   useEffect(() => {
     return () => {
+      connectSeq.current += 1;
       if (sessionRef.current) {
         void api.sftpClose(sessionRef.current).catch(() => {});
         sessionRef.current = null;
@@ -88,6 +90,7 @@ export default function SftpDrawer({
 
   const connect = useCallback(async () => {
     if (!connectionId) return;
+    const seq = ++connectSeq.current;
     if (sessionRef.current) {
       void api.sftpClose(sessionRef.current).catch(() => {});
       sessionRef.current = null;
@@ -98,14 +101,18 @@ export default function SftpDrawer({
     setNotice(null);
     try {
       const opened = await api.sftpOpen(connectionId);
+      if (seq !== connectSeq.current) {
+        void api.sftpClose(opened.sessionId).catch(() => {});
+        return;
+      }
       sessionRef.current = opened.sessionId;
       setSessionId(opened.sessionId);
       setListing(opened.listing);
       setPathInput(opened.listing.path);
     } catch (err) {
-      setError(String(err));
+      if (seq === connectSeq.current) setError(String(err));
     } finally {
-      setConnecting(false);
+      if (seq === connectSeq.current) setConnecting(false);
     }
   }, [connectionId]);
 
@@ -130,7 +137,8 @@ export default function SftpDrawer({
   );
 
   const upload = async () => {
-    if (!sessionRef.current || !listing) return;
+    const session = sessionRef.current;
+    if (!session || !listing) return;
     if (!isTauri()) {
       setError("浏览器 Mock 模式不支持系统文件对话框，请使用桌面版");
       return;
@@ -142,17 +150,13 @@ export default function SftpDrawer({
         title: "选择要上传的文件",
       });
       const localPath = Array.isArray(picked) ? picked[0] : picked;
-      if (!localPath) return;
+      if (!localPath || sessionRef.current !== session) return;
       const name = localPath.split(/[\\/]/).pop() || "upload.bin";
       const remotePath = joinRemote(listing.path, name);
       setBusyPath("__upload__");
       setError(null);
       setProgress(null);
-      const bytes = await api.sftpUpload(
-        sessionRef.current,
-        localPath,
-        remotePath,
-      );
+      const bytes = await api.sftpUpload(session, localPath, remotePath);
       await navigate(listing.path);
       setNotice(`已上传 ${name}（${bytes} 字节）`);
     } catch (err) {
@@ -164,7 +168,8 @@ export default function SftpDrawer({
   };
 
   const download = async (entry: SftpEntry) => {
-    if (!sessionRef.current) return;
+    const session = sessionRef.current;
+    if (!session) return;
     if (!isTauri()) {
       setError("浏览器 Mock 模式不支持系统文件对话框，请使用桌面版");
       return;
@@ -174,15 +179,11 @@ export default function SftpDrawer({
         defaultPath: entry.name,
         title: "保存远端文件",
       });
-      if (!localPath) return;
+      if (!localPath || sessionRef.current !== session) return;
       setBusyPath(entry.path);
       setError(null);
       setProgress(null);
-      const bytes = await api.sftpDownload(
-        sessionRef.current,
-        entry.path,
-        localPath,
-      );
+      const bytes = await api.sftpDownload(session, entry.path, localPath);
       setNotice(`已下载 ${entry.name}（${bytes} 字节）`);
     } catch (err) {
       setError(String(err));

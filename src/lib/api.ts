@@ -583,13 +583,20 @@ const LOW_RISK_PREFIX = [
   "docker logs", "kubectl get", "git status", "git log", "git diff", "echo",
 ];
 
+function matchesCommandPattern(command: string, pattern: string): boolean {
+  const escaped = pattern.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!escaped) return false;
+  // Match at a command boundary, not inside words like "perform" or "skill".
+  return new RegExp(`(^|[;&|]\\s*)${escaped}(\\s|$)`).test(command);
+}
+
 function classify(command: string): { risk: RiskLevel; reasons: string[] } {
   const cmd = command.trim().toLowerCase();
   if (!cmd) return { risk: "medium", reasons: ["空命令"] };
   if (/(rm\s+-[a-z]*[rf][a-z]*\s+\/(\s|$|\*))|mkfs|dd\s+.*of=\/dev\/|:\(\)\s*\{/.test(cmd)) {
     return { risk: "critical", reasons: ["命中极高危破坏性命令规则"] };
   }
-  const high = HIGH_RISK.find(([pattern]) => cmd.includes(pattern));
+  const high = HIGH_RISK.find(([pattern]) => matchesCommandPattern(cmd, pattern));
   if (high) return { risk: "high", reasons: [high[1]] };
   if (cmd.startsWith("sudo ")) return { risk: "high", reasons: ["请求提权执行"] };
   if (LOW_RISK_PREFIX.some((prefix) => cmd === prefix || cmd.startsWith(`${prefix} `))) {
@@ -879,6 +886,22 @@ const mock = {
       (rule) => !(rule.target.kind === "connection" && rule.target.id === id),
     );
     delete mockMcpPolicy.capabilities[id];
+    const removedRuleIds = new Set(
+      mockState.forwardRules
+        .filter((rule) => rule.connectionId === id)
+        .map((rule) => rule.id),
+    );
+    mockState.forwardRules = mockState.forwardRules.filter(
+      (rule) => rule.connectionId !== id,
+    );
+    for (const ruleId of removedRuleIds) {
+      mockState.forwardStatuses.delete(ruleId);
+    }
+    for (const [approvalId, pending] of mockState.approvals) {
+      if (pending.request.connectionId === id) {
+        mockState.approvals.delete(approvalId);
+      }
+    }
   },
 
   async mcpLaunchInfo(): Promise<McpLaunchInfo> {
@@ -958,7 +981,7 @@ const mock = {
     if (!connection) throw new Error("连接不存在");
     const command = commandOverride?.trim() || pending.command;
     if (!approve) {
-      audit({
+      const auditId = audit({
         source: pending.source,
         connectionId: connection.id,
         connectionAlias: connection.alias,
@@ -977,12 +1000,12 @@ const mock = {
           reasons: ["用户拒绝了该命令"],
           ruleId: "approval-rejected",
         },
-        auditId: nextId("audit"),
+        auditId,
         message: "用户拒绝了该命令",
       };
     }
     const decision = decide(connection, command, pending.source);
-    if (decision.risk === "critical") {
+    if (decision.action === "block") {
       const auditId = audit({
         source: pending.source,
         connectionId: connection.id,
@@ -992,9 +1015,9 @@ const mock = {
         risk: decision.risk,
         action: "block",
         approval: "approved",
-        detail: "修改后的命令命中极高危规则，拒绝执行",
+        detail: "修改后的命令未通过策略校验，拒绝执行",
       });
-      return { status: "blocked", decision, auditId, message: "修改后的命令仍命中极高危规则" };
+      return { status: "blocked", decision, auditId, message: "修改后的命令未通过策略校验" };
     }
     return execute(connection, command, pending.source, { ...decision, action: "allow" }, "approved");
   },

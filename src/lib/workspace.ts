@@ -83,7 +83,7 @@ export function loadWorkspace(): StoredWorkspace | null {
         layout: tab.layout === "column" ? "column" : "row",
         activePaneIndex:
           Number.isInteger(tab.activePaneIndex) && tab.activePaneIndex >= 0
-            ? tab.activePaneIndex
+            ? Math.min(tab.activePaneIndex, panes.length - 1)
             : 0,
         customTitle:
           typeof tab.customTitle === "string" ? tab.customTitle : undefined,
@@ -98,7 +98,7 @@ export function loadWorkspace(): StoredWorkspace | null {
         typeof activeTabIndex === "number" &&
         Number.isInteger(activeTabIndex) &&
         activeTabIndex >= 0
-          ? activeTabIndex
+          ? Math.min(activeTabIndex, tabs.length - 1)
           : 0,
       tabs,
     };

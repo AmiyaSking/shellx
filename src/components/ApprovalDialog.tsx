@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import {
   ENV_LABELS,
@@ -17,6 +17,13 @@ export default function ApprovalDialog({ approval, onResolved }: Props) {
   const [editing, setEditing] = useState(false);
   const [command, setCommand] = useState(approval.command);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setBusy(false);
+    setEditing(false);
+    setCommand(approval.command);
+    setError(null);
+  }, [approval.id, approval.command]);
 
   const decide = async (approve: boolean) => {
     if (approve && editing && !command.trim()) {
@@ -125,6 +132,7 @@ export default function ApprovalDialog({ approval, onResolved }: Props) {
               type="button"
               className="btn btn-danger"
               disabled={busy}
+              autoFocus
               onClick={() => void decide(false)}
             >
               拒绝

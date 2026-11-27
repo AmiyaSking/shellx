@@ -242,6 +242,7 @@ export default function ConnectionExplorer({
                             type="button"
                             aria-label={`${connection.alias} 的更多操作`}
                             onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => event.stopPropagation()}
                             className={cn(
                               "mt-0.5 grid size-6 shrink-0 place-items-center rounded text-muted-foreground transition-opacity hover:bg-white/10 hover:text-foreground",
                               active

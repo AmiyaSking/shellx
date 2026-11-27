@@ -47,7 +47,12 @@ export default function PasteConfirmDialog({ text, onConfirm, onCancel }: Props)
         <div className="modal-foot">
           <div className="muted small">可在设置中关闭此确认。</div>
           <div className="modal-foot-right">
-            <button type="button" className="btn btn-ghost" onClick={onCancel}>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={onCancel}
+              autoFocus
+            >
               取消
             </button>
             <button type="button" className="btn btn-primary" onClick={onConfirm}>

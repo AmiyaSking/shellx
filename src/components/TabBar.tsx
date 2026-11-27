@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Plus, Search, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -58,6 +58,7 @@ export default function TabBar({
   const [editingTabId, setEditingTabId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState("");
   const [draggingTabId, setDraggingTabId] = useState<string | null>(null);
+  const cancelEditRef = useRef(false);
 
   const displayTitle = (tab: TerminalTab, connection: Connection | undefined) =>
     tab.customTitle?.trim() ||
@@ -66,13 +67,21 @@ export default function TabBar({
     "未知连接";
 
   const startEditing = (tab: TerminalTab, connection: Connection | undefined) => {
+    cancelEditRef.current = false;
     setEditingTabId(tab.id);
     setDraftTitle(displayTitle(tab, connection));
   };
 
   const commitEditing = () => {
     if (!editingTabId) return;
-    onRename(editingTabId, draftTitle);
+    if (cancelEditRef.current) {
+      cancelEditRef.current = false;
+      setEditingTabId(null);
+      return;
+    }
+    const nextTitle = draftTitle.trim();
+    // A blank submission should keep the existing title, not clear it.
+    if (nextTitle) onRename(editingTabId, nextTitle);
     setEditingTabId(null);
   };
 
@@ -160,6 +169,7 @@ export default function TabBar({
                       commitEditing();
                     } else if (event.key === "Escape") {
                       event.preventDefault();
+                      cancelEditRef.current = true;
                       setEditingTabId(null);
                     }
                   }}

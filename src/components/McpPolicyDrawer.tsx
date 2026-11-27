@@ -309,12 +309,14 @@ export default function McpPolicyDrawer({
   };
 
   const save = async () => {
+    if (saving || !draft) return;
+    const pending = draft;
     setSaving(true);
     setError(null);
     try {
-      const next = await api.saveMcpPolicy(draft);
+      const next = await api.saveMcpPolicy(pending);
       setSnapshot(next);
-      setDraft(next.policy);
+      setDraft((current) => (current === pending ? next.policy : current));
       setNotice("权限策略已保存，MCP 进程会在下次调用时生效。");
       onSaved?.();
     } catch (err) {

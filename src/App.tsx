@@ -277,17 +277,16 @@ export default function App() {
   );
 
   const closeTab = useCallback((tabId: string) => {
-    setTabs((current) => {
-      const index = current.findIndex((tab) => tab.id === tabId);
-      const next = current.filter((tab) => tab.id !== tabId);
-      setActiveTabId((active) => {
-        if (active !== tabId) return active;
-        if (next.length === 0) return null;
-        return next[Math.max(0, index - 1)]?.id ?? next[0].id;
-      });
-      return next;
+    const index = tabs.findIndex((tab) => tab.id === tabId);
+    if (index < 0) return;
+    const next = tabs.filter((tab) => tab.id !== tabId);
+    setTabs(next);
+    setActiveTabId((active) => {
+      if (active !== tabId) return active;
+      if (next.length === 0) return null;
+      return next[Math.max(0, index - 1)]?.id ?? next[0].id;
     });
-  }, []);
+  }, [tabs]);
 
   const updateTabTitle = useCallback((tabId: string, title: string) => {
     setTabs((current) =>
@@ -527,31 +526,27 @@ export default function App() {
       }
       try {
         await api.deleteConnection(connection.id);
-        setTabs((current) => {
-          const next = current.flatMap((tab) => {
-            const kept = tab.panes
-              .map((pane, index) => ({
-                pane,
-                size: tab.paneSizes[index] ?? 1,
-              }))
-              .filter(
-                ({ pane }) => pane.connectionId !== connection.id,
-              );
-            if (kept.length === 0) return [];
-            const panes = kept.map(({ pane }) => pane);
-            const paneSizes = kept.map(({ size }) => size);
-            const activePaneId = panes.some(
-              (pane) => pane.id === tab.activePaneId,
-            )
-              ? tab.activePaneId
-              : panes[0].id;
-            return [{ ...tab, panes, paneSizes, activePaneId }];
-          });
-          setActiveTabId((active) => {
-            if (active && next.some((tab) => tab.id === active)) return active;
-            return next[next.length - 1]?.id ?? null;
-          });
-          return next;
+        const next = tabs.flatMap((tab) => {
+          const kept = tab.panes
+            .map((pane, index) => ({
+              pane,
+              size: tab.paneSizes[index] ?? 1,
+            }))
+            .filter(({ pane }) => pane.connectionId !== connection.id);
+          if (kept.length === 0) return [];
+          const panes = kept.map(({ pane }) => pane);
+          const paneSizes = kept.map(({ size }) => size);
+          const activePaneId = panes.some(
+            (pane) => pane.id === tab.activePaneId,
+          )
+            ? tab.activePaneId
+            : panes[0].id;
+          return [{ ...tab, panes, paneSizes, activePaneId }];
+        });
+        setTabs(next);
+        setActiveTabId((active) => {
+          if (active && next.some((tab) => tab.id === active)) return active;
+          return next[next.length - 1]?.id ?? null;
         });
         setModal(null);
         await refreshConnections();
@@ -560,7 +555,7 @@ export default function App() {
         setError(String(err));
       }
     },
-    [refreshConnections, refreshMcpInfo],
+    [refreshConnections, refreshMcpInfo, tabs],
   );
 
   const activeTab = tabs.find((tab) => tab.id === activeTabId) ?? null;
@@ -984,6 +979,7 @@ export default function App() {
 
         {authPrompts[0] && (
           <AuthPromptDialog
+            key={authPrompts[0].promptId}
             prompt={authPrompts[0]}
             onClose={() => setAuthPrompts((current) => current.slice(1))}
           />
