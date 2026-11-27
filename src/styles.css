@@ -2216,7 +2216,8 @@ textarea:focus-visible {
 }
 
 select {
-  height: 30px;
+  height: auto;
+  min-height: 30px;
   padding: 0 8px;
   border-radius: 7px;
   border: 1px solid var(--border-strong);
@@ -2289,13 +2290,6 @@ select {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
   }
-}
-
-.modal-foot {
-  position: sticky;
-  bottom: 0;
-  z-index: 1;
-  background: #111216;
 }
 
 input[type="checkbox"],
